@@ -52,6 +52,27 @@ pub fn build_request(target: &PromptTarget, system: &str, transcript: &Transcrip
     adapter::build_chat_request(target.model_id(), system, transcript, &options)
 }
 
+/// Build a request for a non-cleanup task (e.g. meeting notes) that still
+/// honours the target model's capabilities. When the model rejects system
+/// messages the instructions are folded into the user message so they are
+/// never silently dropped.
+pub fn build_task_request(target: &PromptTarget, instructions: &str, input: &str) -> Value {
+    let capabilities = catalog::capabilities_for(target.model_id());
+    let options = ChatRequestOptions::for_capabilities(capabilities, DEFAULT_TEMPERATURE);
+    if options.include_system_message {
+        adapter::build_chat_request(
+            target.model_id(),
+            instructions,
+            &Transcript::new(input),
+            &options,
+        )
+    } else {
+        let combined =
+            format!("{instructions}\n\n--- BEGIN TRANSCRIPT ---\n{input}\n--- END TRANSCRIPT ---");
+        adapter::build_chat_request(target.model_id(), "", &Transcript::new(&combined), &options)
+    }
+}
+
 /// Decide the typed outcome from a raw model response string.
 ///
 /// `source` is the original transcript; `raw_content` is the assistant text

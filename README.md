@@ -90,6 +90,59 @@ fallbacks, provider/credential warnings, and errors. Active recording always
 takes priority over background job status. Settings changes take effect after
 saving — no restart required.
 
+### Transcribe files and meetings
+
+Both live in the tray menu and run fully offline on the selected engine.
+
+- **Transcribe audio or video file…** opens a file picker (WAV, MP3, M4A/AAC,
+  FLAC, OGG, MP4/MOV/MKV with a supported audio track). The transcript is saved
+  next to the source as `<name>.txt`, copied to the clipboard, and revealed in
+  Explorer.
+- **Start meeting recording / Stop meeting recording** captures your
+  microphone and everything playing on the default output device (WASAPI
+  loopback) into one timeline, up to 2 hours. On stop, the transcript is saved
+  to `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` and copied to the
+  clipboard. Quitting while a meeting is recording transcribes what was
+  captured first.
+
+Long audio is split into windows of at most 30 s at the quietest nearby point
+and transcribed in order. These jobs never paste. Transcription itself never
+leaves the machine.
+
+**AI cleanup.** If text enhancement is set to anything other than **Never**
+(Settings → Text enhancement), file and meeting transcripts are also cleaned up
+by your configured provider (GitHub Copilot or an OpenAI-compatible API). The
+transcript is sent in slices of up to ~3,000 characters, split at sentence ends
+and returned as paragraphs. Each slice is checked by the same integrity
+validator as dictation; a slice that fails keeps its raw text, and if no slice
+can be cleaned the raw transcript is saved with a warning. Set enhancement to
+**Never** to keep these transcripts fully offline. Note that cleanup sends the
+transcript text to the provider you chose, so avoid it for confidential
+meetings unless that provider is acceptable.
+
+**Meeting notes.** **Start meeting notes** in the tray menu records a meeting
+exactly like *Start meeting recording*, then asks your configured AI provider
+for structured notes. The result is a Markdown file with a *Summary*, *Key
+points*, *Decisions*, *Action items* (as a `- [ ]` checklist) and *Open
+questions*, followed by the full transcript under *Transcript*. The prompt
+forbids inventing names, owners, dates or decisions, but speakers are not
+labelled and recognition errors can slip through, so review notes before
+acting on them. Notes use the provider, model and key from Settings → Text
+enhancement and work even when cleanup is set to **Never**; if no provider is
+configured the button tells you before recording starts. If the provider fails
+afterwards, the transcript is still saved and the notice says the notes are
+missing. Very long meetings are noted in parts and merged. The whole
+transcript is sent to the provider, so use it only where that is acceptable.
+
+**Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
+(Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`
+title, an italic details line (source file or meeting length), and paragraphs.
+The formatting is added by OpenWritr itself, not requested from the AI
+provider, so the cleanup integrity checks are unaffected and the same words
+are kept in both formats.
+
+Record meetings only where everyone present has agreed to it.
+
 ## Settings
 
 Tray icon → right-click → **Settings**. All fields:

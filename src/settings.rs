@@ -337,6 +337,9 @@ pub struct Settings {
     pub auto_paste: bool,
     pub overlay: bool,
     pub sounds: bool,
+    /// Save imported-file and meeting transcripts as Markdown (`.md`, with a
+    /// title and paragraphs) instead of plain `.txt`.
+    pub markdown_transcripts: bool,
     pub min_record_seconds: f32,
     pub max_record_seconds: f32,
     pub enhance: Enhance,
@@ -352,6 +355,7 @@ impl Default for Settings {
             auto_paste: true,
             overlay: true,
             sounds: true,
+            markdown_transcripts: false,
             min_record_seconds: 0.25,
             max_record_seconds: 60.0,
             enhance: Enhance::default(),

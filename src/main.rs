@@ -13,6 +13,8 @@ mod diagnostics;
 mod enhance;
 mod hotkey;
 mod key_hook;
+mod media;
+mod meeting;
 mod model_manager;
 mod overlay;
 mod paste;

@@ -37,6 +37,12 @@ pub struct JobConfig {
     settings: Settings,
     intent: RecordingIntent,
     delivery_target: Option<DeliveryTarget>,
+    /// Imported files and meetings: transcribed in silence-aligned windows
+    /// instead of one pass, never LLM-enhanced, never pasted.
+    long_form: bool,
+    /// Also ask the provider for structured meeting notes (implies
+    /// `long_form`); the notes are placed above the transcript.
+    notes: bool,
 }
 
 impl JobConfig {
@@ -50,10 +56,34 @@ impl JobConfig {
             settings,
             intent,
             delivery_target,
+            long_form: false,
+            notes: false,
+        }
+    }
+
+    pub fn long_form(settings: Settings) -> Self {
+        Self {
+            settings,
+            intent: RecordingIntent::Raw,
+            delivery_target: None,
+            long_form: true,
+            notes: false,
+        }
+    }
+
+    pub fn meeting_notes(settings: Settings) -> Self {
+        Self {
+            notes: true,
+            ..Self::long_form(settings)
         }
     }
 
     fn should_enhance(&self) -> bool {
+        if self.long_form {
+            // Imported files and meetings have no Shift key to consult, so any
+            // mode other than Never opts them into cleanup.
+            return self.settings.enhance.mode.is_enabled();
+        }
         self.intent == RecordingIntent::Enhance && self.settings.enhance.mode.is_enabled()
     }
 }
@@ -599,7 +629,20 @@ fn worker_main(
                     .as_mut()
                     .expect("validated engine generation is missing");
                 let started = Instant::now();
-                let text = match active_engine.transcribe(&job.samples, job.sample_rate) {
+                let transcription = if job.config.long_form {
+                    transcribe_long_form(
+                        &mut **active_engine,
+                        &job.samples,
+                        job.sample_rate,
+                        || {
+                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
+                                .is_some()
+                        },
+                    )
+                } else {
+                    active_engine.transcribe(&job.samples, job.sample_rate)
+                };
+                let text = match transcription {
                     Ok(text) => text,
                     Err(error) => {
                         let _transition = transition_gate.lock();
@@ -629,10 +672,15 @@ fn worker_main(
                 let (final_text, enhancement_warning) = if job.config.should_enhance() {
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
                     info!("enhancement requested");
-                    let outcome = enhance::enhance_outcome(&text, &job.config.settings, || {
+                    let still_wanted = || {
                         interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
                             .is_none()
-                    });
+                    };
+                    let outcome = if job.config.long_form {
+                        enhance::enhance_long_form(&text, &job.config.settings, || !still_wanted())
+                    } else {
+                        enhance::enhance_outcome(&text, &job.config.settings, still_wanted)
+                    };
                     let Some(outcome) = outcome else {
                         let _transition = transition_gate.lock();
                         if let Some(event) =
@@ -645,6 +693,41 @@ fn worker_main(
                     completed_cleanup(outcome)
                 } else {
                     (text, None)
+                };
+
+                let (final_text, enhancement_warning) = if job.config.notes {
+                    // Phase events are idempotent: a repeat is ignored by the
+                    // tracker when cleanup already announced the phase.
+                    let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
+                    info!("meeting notes requested");
+                    let outcome =
+                        enhance::generate_meeting_notes(&final_text, &job.config.settings, || {
+                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
+                                .is_some()
+                        });
+                    match outcome {
+                        enhance::NotesOutcome::Notes(notes) => (
+                            format!("{}\n\n## Transcript\n\n{}", notes.trim(), final_text),
+                            enhancement_warning,
+                        ),
+                        enhance::NotesOutcome::Failed(reason) => {
+                            info!(?reason, "meeting notes unavailable; saving transcript only");
+                            (final_text, Some(reason))
+                        }
+                        enhance::NotesOutcome::Interrupted => {
+                            let _transition = transition_gate.lock();
+                            if let Some(event) = interrupted_job_event(
+                                job.id,
+                                &discard_requested,
+                                &engine_cancellation,
+                            ) {
+                                let _ = event_tx.send(event);
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    (final_text, enhancement_warning)
                 };
 
                 let chars = final_text.chars().count();
@@ -673,6 +756,73 @@ fn worker_main(
             }
         }
     }
+}
+
+/// Longest window handed to the engine in one call for long-form audio.
+const LONG_FORM_WINDOW_SECONDS: usize = 30;
+/// Window cuts are placed at the quietest 100 ms inside this trailing span.
+const LONG_FORM_SEARCH_SECONDS: usize = 4;
+
+/// Split `samples` into windows of at most 30 s, cutting each at the quietest
+/// point near the end so words are rarely bisected.
+fn plan_long_form_windows(samples: &[f32], sample_rate: u32) -> Vec<std::ops::Range<usize>> {
+    let rate = sample_rate.max(1) as usize;
+    let max_len = rate * LONG_FORM_WINDOW_SECONDS;
+    let search = rate * LONG_FORM_SEARCH_SECONDS;
+    let frame = (rate / 10).max(1);
+    let mut windows = Vec::new();
+    let mut start = 0;
+    while start < samples.len() {
+        if samples.len() - start <= max_len {
+            windows.push(start..samples.len());
+            break;
+        }
+        let hard_end = start + max_len;
+        let mut cut = hard_end;
+        let mut quietest = f32::MAX;
+        let mut position = hard_end - search;
+        while position + frame <= hard_end {
+            let energy: f32 = samples[position..position + frame]
+                .iter()
+                .map(|sample| sample * sample)
+                .sum();
+            if energy < quietest {
+                quietest = energy;
+                cut = position + frame / 2;
+            }
+            position += frame;
+        }
+        windows.push(start..cut);
+        start = cut;
+    }
+    windows
+}
+
+fn transcribe_long_form(
+    engine: &mut dyn Engine,
+    samples: &[f32],
+    sample_rate: u32,
+    interrupted: impl Fn() -> bool,
+) -> Result<String> {
+    let windows = plan_long_form_windows(samples, sample_rate);
+    let total = windows.len();
+    let mut transcript = String::new();
+    for (index, window) in windows.into_iter().enumerate() {
+        // The caller re-checks interruption and discards the partial text.
+        if interrupted() {
+            break;
+        }
+        let text = engine.transcribe(&samples[window], sample_rate)?;
+        let text = text.trim();
+        if !text.is_empty() {
+            if !transcript.is_empty() {
+                transcript.push(' ');
+            }
+            transcript.push_str(text);
+        }
+        info!(window = index + 1, total, "long-form window transcribed");
+    }
+    Ok(transcript)
 }
 
 fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>) {
@@ -1408,5 +1558,37 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, WorkerEvent::JobCompleted { .. })));
+    }
+
+    #[test]
+    fn long_form_windows_cover_the_audio_and_cut_at_quiet_points() {
+        let rate = 16_000;
+        // 70 s of loud audio with a silent gap at 28.5 s (inside the first
+        // window's search span) and another at 57 s.
+        let mut samples = vec![0.5f32; 70 * rate];
+        for sample in &mut samples[28 * rate + 8_000..28 * rate + 12_000] {
+            *sample = 0.0;
+        }
+        for sample in &mut samples[57 * rate..57 * rate + 4_000] {
+            *sample = 0.0;
+        }
+        let windows = plan_long_form_windows(&samples, rate as u32);
+        assert_eq!(windows.first().unwrap().start, 0);
+        assert_eq!(windows.last().unwrap().end, samples.len());
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        assert!(windows.iter().all(|w| w.len() <= 30 * rate));
+        let first_cut = windows[0].end;
+        assert!((28 * rate + 8_000..28 * rate + 12_000).contains(&first_cut));
+    }
+
+    #[test]
+    fn short_audio_is_a_single_long_form_window() {
+        assert_eq!(
+            plan_long_form_windows(&vec![0.1; 16_000 * 10], 16_000).len(),
+            1
+        );
+        assert!(plan_long_form_windows(&[], 16_000).is_empty());
     }
 }

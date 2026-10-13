@@ -810,6 +810,18 @@ impl SettingsApp {
                 "Play recording start and stop sounds",
             )
             .changed();
+        ui.horizontal_wrapped(|ui| {
+            self.dirty |= ui
+                .checkbox(
+                    &mut self.settings.markdown_transcripts,
+                    "Save file and meeting transcripts as Markdown",
+                )
+                .changed();
+            info_button(
+                ui,
+                "Imported-file and meeting transcripts are saved as .md with a title, details line and paragraphs instead of plain .txt. AI cleanup applies to both formats.",
+            );
+        });
     }
 
     fn render_enhancement(&mut self, ui: &mut egui::Ui) {
