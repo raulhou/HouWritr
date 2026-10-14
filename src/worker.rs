@@ -886,6 +886,26 @@ const LONG_FORM_WINDOW_SECONDS: usize = 30;
 /// Window cuts are placed at the quietest 100 ms inside this trailing span.
 const LONG_FORM_SEARCH_SECONDS: usize = 4;
 
+/// Centre of the quietest `frame`-sample stretch fully inside `range`
+/// (lowest energy, first one wins ties), or `None` if no frame fits.
+fn quietest_point(samples: &[f32], range: std::ops::Range<usize>, frame: usize) -> Option<usize> {
+    let mut best = None;
+    let mut quietest = f32::MAX;
+    let mut position = range.start;
+    while position + frame <= range.end {
+        let energy: f32 = samples[position..position + frame]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum();
+        if energy < quietest {
+            quietest = energy;
+            best = Some(position + frame / 2);
+        }
+        position += frame;
+    }
+    best
+}
+
 /// Split `samples` into windows of at most 30 s, cutting each at the quietest
 /// point near the end so words are rarely bisected.
 fn plan_long_form_windows(samples: &[f32], sample_rate: u32) -> Vec<std::ops::Range<usize>> {
@@ -901,20 +921,7 @@ fn plan_long_form_windows(samples: &[f32], sample_rate: u32) -> Vec<std::ops::Ra
             break;
         }
         let hard_end = start + max_len;
-        let mut cut = hard_end;
-        let mut quietest = f32::MAX;
-        let mut position = hard_end - search;
-        while position + frame <= hard_end {
-            let energy: f32 = samples[position..position + frame]
-                .iter()
-                .map(|sample| sample * sample)
-                .sum();
-            if energy < quietest {
-                quietest = energy;
-                cut = position + frame / 2;
-            }
-            position += frame;
-        }
+        let cut = quietest_point(samples, hard_end - search..hard_end, frame).unwrap_or(hard_end);
         windows.push(start..cut);
         start = cut;
     }
@@ -956,44 +963,51 @@ fn transcribe_long_form(
 struct TurnWindow {
     range: std::ops::Range<usize>,
     speaker: usize,
-    /// Where this stretch begins in the recording, for the `[m:ss]` marker:
-    /// the turn's true start for its first window, the window start after.
+    /// Where speech in this stretch begins, for the `[m:ss]` marker.
     mark: usize,
 }
 
-/// Turn → engine windows: each turn is padded by 0.1 s (never into a
-/// neighbouring turn) and long turns are split at quiet points to stay
-/// within the 30 s engine window.
+/// Turn → engine windows that **partition the whole recording**.
+///
+/// Every sample ends up in exactly one window, so labelling can mislabel a
+/// word but never drop one: speech the diarizer could not place (a short
+/// "yes", a first word at a segmentation edge) is transcribed with the
+/// neighbouring speaker. Each cut between two turns is placed at the quietest
+/// 100 ms of the gap between them so it never splits a word, and anything
+/// longer than 30 s is split again at quiet points for the engine.
 fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -> Vec<TurnWindow> {
-    // 0.1 s of context either side so word edges survive.
-    let pad = rate as usize / 10;
+    let len = samples.len();
+    let frame = (rate as usize / 10).max(1);
+
+    // cuts[i] separates turn i from turn i + 1.
+    let mut cuts: Vec<usize> = Vec::with_capacity(turns.len().saturating_sub(1));
+    for pair in turns.windows(2) {
+        let low = pair[0].end.min(len);
+        let high = pair[1].start.max(low).min(len);
+        let mut cut = if high - low >= frame {
+            quietest_point(samples, low..high, frame).unwrap_or((low + high) / 2)
+        } else {
+            (low + high) / 2
+        };
+        if let Some(&previous) = cuts.last() {
+            cut = cut.max(previous);
+        }
+        cuts.push(cut);
+    }
+
     let mut windows = Vec::new();
     for (index, turn) in turns.iter().enumerate() {
-        // Padding may only reach into the silence between turns, and each
-        // neighbour gets half of it, so windows never overlap.
-        let floor = match index.checked_sub(1).map(|i| &turns[i]) {
-            Some(previous) => previous.end + turn.start.saturating_sub(previous.end) / 2,
-            None => 0,
-        };
-        let ceiling = match turns.get(index + 1) {
-            Some(next) => turn.end + next.start.saturating_sub(turn.end) / 2,
-            None => samples.len(),
-        };
-        let start = turn.start.saturating_sub(pad).max(floor).min(turn.start);
-        let end = (turn.end + pad)
-            .min(ceiling)
-            .max(turn.end)
-            .min(samples.len());
-        if start >= end {
+        let begin = if index == 0 { 0 } else { cuts[index - 1] };
+        let end = cuts.get(index).copied().unwrap_or(len);
+        if begin >= end {
             continue;
         }
-        for (position, sub) in plan_long_form_windows(&samples[start..end], rate)
-            .into_iter()
-            .enumerate()
-        {
-            let range = start + sub.start..start + sub.end;
-            let mark = if position == 0 {
-                turn.start
+        for sub in plan_long_form_windows(&samples[begin..end], rate) {
+            let range = begin + sub.start..begin + sub.end;
+            // The marker is when speech really starts: the turn's start for
+            // the window it begins in, the window's own start otherwise.
+            let mark = if range.end > turn.start {
+                range.start.max(turn.start)
             } else {
                 range.start
             };
@@ -1010,6 +1024,7 @@ fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -
 /// Transcribe speaker by speaker and label the result:
 /// `[m:ss] Speaker 1: …` blocks separated by blank lines; consecutive
 /// windows of the same speaker run together under the first one's time.
+/// The windows cover the whole recording (see [`plan_turn_windows`]).
 fn transcribe_turns(
     engine: &mut dyn Engine,
     samples: &[f32],
@@ -1619,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_windows_are_padded_but_never_overlap_neighbours() {
+    fn turn_windows_partition_the_recording() {
         let samples = vec![0.5f32; 16_000 * 10];
         let windows = plan_turn_windows(
             &[turn(16_000, 32_000, 0), turn(32_500, 48_000, 1)],
@@ -1627,12 +1642,73 @@ mod tests {
             16_000,
         );
         assert_eq!(windows.len(), 2);
-        // 0.1 s (1600 samples) of padding; the 500-sample gap between the
-        // turns is split down the middle.
-        assert_eq!(windows[0].range, 14_400..32_250);
-        assert_eq!(windows[1].range, 32_250..49_600);
-        assert!(windows[0].range.end <= windows[1].range.start);
+        // Audio before the first turn belongs to it; the 500-sample gap
+        // (shorter than a 100 ms frame) is split down the middle; the tail
+        // after the last turn belongs to the last turn.
+        assert_eq!(windows[0].range, 0..32_250);
+        assert_eq!(windows[1].range, 32_250..samples.len());
         assert_eq!((windows[0].speaker, windows[1].speaker), (0, 1));
+        // Markers show when speech really starts, not the window start.
+        assert_eq!((windows[0].mark, windows[1].mark), (16_000, 32_500));
+    }
+
+    #[test]
+    fn turn_cuts_land_in_the_quietest_part_of_the_gap() {
+        let mut samples = vec![0.5f32; 16_000 * 4];
+        // Silence only in 2.0 s..2.5 s of the 1 s..3 s gap.
+        for s in &mut samples[32_000..40_000] {
+            *s = 0.0;
+        }
+        let windows = plan_turn_windows(
+            &[turn(0, 16_000, 0), turn(48_000, 64_000, 1)],
+            &samples,
+            16_000,
+        );
+        assert_eq!(windows.len(), 2);
+        let cut = windows[0].range.end;
+        assert!(
+            (32_000..40_000).contains(&cut),
+            "cut {cut} is not in the silence"
+        );
+        assert_eq!(windows[1].range.start, cut);
+    }
+
+    #[test]
+    fn turn_windows_cover_every_sample_exactly_once() {
+        // Deterministic pseudo-random layouts at a 1 kHz "sample rate" keep
+        // the cases cheap while exercising 30 s splits (30 000 samples).
+        let rate = 1_000u32;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        for case in 0..300 {
+            let mut turns = Vec::new();
+            let mut position = next(20_000);
+            for _ in 0..(1 + next(12)) {
+                let length = 300 + next(60_000);
+                turns.push(turn(position, position + length, next(4)));
+                position += length + next(40_000);
+            }
+            let len = position + next(30_000);
+            let samples: Vec<f32> = (0..len).map(|_| next(2_000) as f32 / 1_000.0).collect();
+
+            let windows = plan_turn_windows(&turns, &samples, rate);
+            assert!(!windows.is_empty(), "case {case}");
+            assert_eq!(windows.first().unwrap().range.start, 0, "case {case}");
+            assert_eq!(windows.last().unwrap().range.end, len, "case {case}");
+            for pair in windows.windows(2) {
+                assert_eq!(pair[0].range.end, pair[1].range.start, "case {case}");
+            }
+            assert!(
+                windows.iter().all(|w| w.range.len() <= 30_000),
+                "case {case}"
+            );
+            assert!(windows.iter().all(|w| !w.range.is_empty()), "case {case}");
+        }
     }
 
     #[test]
@@ -1669,6 +1745,62 @@ mod tests {
         let (plain, none) = strip_timestamps("just text [with brackets] here");
         assert_eq!(plain, "just text [with brackets] here");
         assert!(none.is_empty());
+    }
+
+    struct LevelsEngine;
+
+    impl Engine for LevelsEngine {
+        fn transcribe(&mut self, samples: &[f32], _sample_rate: u32) -> Result<String> {
+            // Reports every distinct integer level present in the audio.
+            let mut levels: Vec<i32> = samples
+                .iter()
+                .map(|s| *s as i32)
+                .filter(|level| *level != 0)
+                .collect();
+            levels.sort_unstable();
+            levels.dedup();
+            Ok(levels
+                .iter()
+                .map(|level| format!("L{level}"))
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+
+        fn label(&self) -> &'static str {
+            "levels"
+        }
+    }
+
+    #[test]
+    fn speech_between_turns_is_never_dropped() {
+        let mut samples = vec![0.0f32; 16_000 * 7];
+        for (range, value) in [
+            (0..16_000, 1.0),              // speaker 1
+            (24_000..27_200, 9.0),         // an unattributed word in the gap
+            (48_000..64_000, 3.0),         // speaker 2
+            (96_000..96_000 + 1_600, 7.0), // a trailing word after the last turn
+        ] {
+            for s in &mut samples[range] {
+                *s = value;
+            }
+        }
+        let turns = [turn(0, 16_000, 0), turn(48_000, 64_000, 1)];
+        let text = transcribe_turns(
+            &mut LevelsEngine,
+            &samples,
+            16_000,
+            &turns,
+            || false,
+            |_, _| {},
+        )
+        .unwrap();
+        for level in ["L1", "L3", "L7", "L9"] {
+            assert_eq!(
+                text.matches(level).count(),
+                1,
+                "{level} must be transcribed exactly once in: {text}"
+            );
+        }
     }
 
     struct EchoEngine;

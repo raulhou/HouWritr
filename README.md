@@ -165,7 +165,10 @@ OpenWritr finds the speaker turns with two small on-device models (pyannote
 segmentation 3.0 and a WeSpeaker voice-print model, about 32 MB, downloaded the
 first time you use it), then transcribes each turn separately. It runs on the
 CPU, takes roughly a minute or two per hour of audio on a recent PC, and works
-for files and meeting recordings alike. Labels are numbered in order of first
+for files and meeting recordings alike. Labels never remove speech: audio the models can't
+attribute (a short "yes", a first word at a segment edge) is transcribed with
+the neighbouring speaker, so a labelled transcript has every word an unlabelled
+one would. Labels are numbered in order of first
 appearance and are **not** names. Accuracy drops with overlapping speech, very
 short interjections, similar voices and poor audio, and a voice is sometimes
 split into two labels. If only one speaker is found the transcript is left
