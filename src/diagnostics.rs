@@ -25,6 +25,12 @@ pub fn open_logs_dir() -> Result<()> {
     open_explorer(&directory, false)
 }
 
+/// Open `directory` in Explorer, creating it first if it does not exist yet.
+pub fn open_directory(directory: &Path) -> Result<()> {
+    fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    open_explorer(directory, false)
+}
+
 pub fn reveal(path: &Path) -> Result<()> {
     open_explorer(path, true)
 }

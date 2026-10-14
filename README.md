@@ -119,15 +119,16 @@ and transcribed in order. These jobs never paste. Transcription itself never
 leaves the machine.
 
 **Recording indicator.** While a meeting is being recorded, a pill in the
-same style as the dictation indicator stays at the top-centre of the screen:
-red `Recording 12:34` with live level bars, or amber `Paused 12:34`. It is
-separate from the dictation pill, so it stays up while you dictate and while
-notices appear. Turn it off under *Settings → Output and feedback → Show a
-recording indicator during meeting recordings*, or flip it for the current
-session with **Hide / Show recording indicator** in the tray menu (the tray
-menu does not change the saved setting). The tray icon still turns red
-(recording) or amber (paused) either way, and hiding the indicator mid-meeting
-shows a short notice so it is never silent.
+same style as the dictation indicator stays on screen, in exactly the same
+place: red `Recording 12:34` with live level bars, or amber `Paused 12:34`.
+When the dictation pill needs the spot (you dictate, a job is queued, or a
+notice appears) the meeting pill steps aside and comes straight back when it
+clears. Turn it off under *Settings → Output and feedback → Show a recording
+indicator during meeting recordings*, or flip it for the current session with
+**Hide / Show recording indicator** in the tray menu (the tray menu does not
+change the saved setting). The tray icon still turns red (recording) or amber
+(paused) either way, and hiding the indicator mid-meeting shows a short notice
+so it is never silent.
 
 **AI cleanup.** If text enhancement is set to anything other than **Never**
 (Settings → Text enhancement), file and meeting transcripts are also cleaned up
@@ -187,6 +188,17 @@ unlabelled; if the models cannot be downloaded or run, you still get the normal
 transcript and a note saying labels were unavailable. AI cleanup keeps the
 labels and markers (the markers are held back from the AI request and put back
 afterwards), and meeting notes may attribute action items to "Speaker N".
+
+**Managing the speaker-label models.** *Settings → Speaker labels* holds the
+on/off switch and the local model status: *Installed*, *Not downloaded* or
+*Incomplete*, the size, and the folder they live in. **Download and install**
+fetches them now (with a progress bar and **Cancel**) instead of waiting for
+the first labelled transcript, **Verify files** re-checks sizes and SHA-256
+hashes, and **Open model folder** opens the install location. For machines
+without direct access, expand *Install manually*: it lists each file with its
+exact name, size, hash and download link; save the files into the model folder
+and click **Verify files**. Files that do not match the pinned hashes are
+rejected.
 
 **Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
 (Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`

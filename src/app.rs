@@ -310,7 +310,8 @@ struct State {
     meeting: Option<MeetingRecorder>,
     /// Live meeting input level feeding the recording indicator.
     meeting_level: Arc<AtomicU32>,
-    /// The second pill: shown for the whole meeting recording.
+    /// The meeting pill: same position as the dictation pill, shown for the
+    /// whole recording except while the dictation pill is on screen.
     meeting_overlay: overlay::OverlayController,
     meeting_overlay_view: OverlayViewState,
     meeting_overlay_enabled: bool,
@@ -387,7 +388,6 @@ pub fn run() -> Result<()> {
             stop: hk_stop.clone(),
         },
         settings.overlay,
-        overlay::Placement::BottomCenter,
     )?;
 
     let meeting_level = Arc::new(AtomicU32::new(0));
@@ -397,7 +397,6 @@ pub fn run() -> Result<()> {
             stop: hk_stop.clone(),
         },
         settings.show_meeting_indicator,
-        overlay::Placement::TopCenter,
     )?;
     let meeting_overlay_enabled = settings.show_meeting_indicator;
 
@@ -1493,11 +1492,16 @@ impl AppHandler {
             }
             self.state.tray.set_meeting_indicator_visible(visible);
         }
+        // The meeting pill occupies the same spot as the dictation pill, so
+        // it steps aside while that one is on screen (listening, writing, or
+        // a notice) and returns as soon as it clears.
+        let dictation_pill_showing =
+            self.state.settings.overlay && !self.state.overlay_state.last_view.is_hidden();
         let desired = match &self.state.meeting {
-            Some(recorder) => {
+            Some(recorder) if !dictation_pill_showing => {
                 OverlayViewState::meeting(recorder.elapsed().as_secs(), recorder.is_paused())
             }
-            None => OverlayViewState::Hidden,
+            _ => OverlayViewState::Hidden,
         };
         if desired != self.state.meeting_overlay_view {
             match self.state.meeting_overlay.set_state(desired.clone()) {

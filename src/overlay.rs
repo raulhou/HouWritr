@@ -184,45 +184,19 @@ impl OverlayController {
     }
 }
 
-/// Where on the primary monitor a pill sits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Placement {
-    /// Dictation / job status pill.
-    BottomCenter,
-    /// Meeting recording pill, clear of the dictation pill.
-    TopCenter,
-}
-
-impl Placement {
-    fn thread_name(self) -> &'static str {
-        match self {
-            Placement::BottomCenter => "overlay",
-            Placement::TopCenter => "overlay-meeting",
-        }
-    }
-}
-
-/// Top of the meeting pill, below the edge of the primary monitor.
-const TOP_MARGIN: i32 = 40;
-
-pub fn spawn(
-    handles: OverlayHandles,
-    enabled: bool,
-    placement: Placement,
-) -> std::io::Result<OverlayController> {
+/// Spawn one pill window at the standard overlay position (bottom-centre of
+/// the primary monitor). The dictation pill and the meeting pill are both
+/// created here and so sit in exactly the same place; the app keeps only one
+/// of them visible at a time.
+pub fn spawn(handles: OverlayHandles, enabled: bool) -> std::io::Result<OverlayController> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
-        .name(placement.thread_name().into())
-        .spawn(move || overlay_main(handles, receiver, enabled, placement))?;
+        .name("overlay".into())
+        .spawn(move || overlay_main(handles, receiver, enabled))?;
     Ok(OverlayController { sender })
 }
 
-fn overlay_main(
-    handles: OverlayHandles,
-    commands: Receiver<OverlayCommand>,
-    enabled: bool,
-    placement: Placement,
-) {
+fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, enabled: bool) {
     unsafe {
         let hinst = match GetModuleHandleW(None) {
             Ok(h) => h,
@@ -245,10 +219,7 @@ fn overlay_main(
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
         let x = (sw - WIN_W) / 2;
-        let y = match placement {
-            Placement::BottomCenter => sh - WIN_H - 120,
-            Placement::TopCenter => TOP_MARGIN,
-        };
+        let y = sh - WIN_H - 120;
 
         let hwnd = match CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,

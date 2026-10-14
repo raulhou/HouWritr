@@ -187,6 +187,26 @@ impl ArtifactSource for HttpArtifactSource {
 
 type SpaceProbe = dyn Fn(&Path) -> anyhow::Result<u64> + Send + Sync;
 
+/// One file of a model, as pinned in the manifest, plus whether a file of the
+/// right size is currently on disk. Lets the UI explain a manual install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelFileDetail {
+    pub path: String,
+    pub url: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub present: bool,
+}
+
+/// Everything the UI needs to describe a model's local install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDetails {
+    pub info: ModelInfo,
+    pub version: String,
+    pub directory: PathBuf,
+    pub files: Vec<ModelFileDetail>,
+}
+
 pub struct ModelManager {
     root: PathBuf,
     manifest: ManifestRoot,
@@ -199,6 +219,21 @@ impl ModelManager {
         let manifest = parse_embedded_manifest()?;
         let root = paths::models_dir();
         cleanup_stale_workdirs(&root, &manifest)?;
+        Self::with_manifest(root, manifest)
+    }
+
+    /// Like [`ModelManager::new`] but leaves other work directories alone.
+    ///
+    /// `new()` deletes every `.staging` / `.replaced` directory because it
+    /// assumes it runs once at start-up, before anything downloads. Anything
+    /// that can run *while another download is in flight* (the Settings
+    /// window, a per-job lookup) must use this instead, or it would delete
+    /// the other download's files.
+    pub fn new_preserving_work_dirs() -> Result<Self, ModelError> {
+        Self::with_manifest(paths::models_dir(), parse_embedded_manifest()?)
+    }
+
+    fn with_manifest(root: PathBuf, manifest: ManifestRoot) -> Result<Self, ModelError> {
         Ok(Self {
             root,
             manifest,
@@ -213,6 +248,38 @@ impl ModelManager {
 
     pub fn inspect(model_id: &str) -> Result<ModelInfo, ModelError> {
         inspect_model_at(&paths::models_dir(), model_id)
+    }
+
+    /// Install state plus the pinned file list and install directory. No
+    /// hashing and no network, so it is cheap enough to call on every UI
+    /// refresh.
+    pub fn describe(model_id: &str) -> Result<ModelDetails, ModelError> {
+        describe_model_at(&paths::models_dir(), model_id)
+    }
+
+    /// Verify files that are already on disk (hash and size) without any
+    /// download, repairing a missing receipt. This is the second half of a
+    /// manual install: copy the files into the model directory, then verify.
+    pub fn verify_existing(
+        &self,
+        model_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelError> {
+        let model = self
+            .manifest
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .ok_or_else(|| anyhow!("unknown model {model_id}"))?;
+        let target = self.root.join(&model.local_dir);
+        if !target.is_dir() {
+            bail!("the model folder {} does not exist yet", target.display());
+        }
+        validate_directory(model, &target, cancellation)?;
+        if !receipt_matches(&target, self.manifest.schema_version, model) {
+            write_receipt(model, &target, self.manifest.schema_version)?;
+        }
+        Ok(())
     }
 
     pub fn ensure<F>(
@@ -495,6 +562,52 @@ fn inspect_model_at(root: &Path, model_id: &str) -> Result<ModelInfo, ModelError
         .find(|model| model.id == model_id)
         .ok_or_else(|| ModelError::from(anyhow!("unknown model {model_id}")))?;
     inspect_manifest_model(root, manifest.schema_version, model)
+}
+
+fn describe_model_at(root: &Path, model_id: &str) -> Result<ModelDetails, ModelError> {
+    let manifest = parse_embedded_manifest()?;
+    let model = manifest
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ModelError::from(anyhow!("unknown model {model_id}")))?;
+    let directory = root.join(&model.local_dir);
+    let info = inspect_manifest_model(root, manifest.schema_version, model)?;
+
+    let present = |path: &str, bytes: u64| {
+        directory
+            .join(path)
+            .metadata()
+            .map(|metadata| metadata.is_file() && metadata.len() == bytes)
+            .unwrap_or(false)
+    };
+    let mut files = Vec::new();
+    for file in &model.files {
+        files.push(ModelFileDetail {
+            path: file.path.clone(),
+            url: file.url.clone(),
+            bytes: file.bytes,
+            sha256: file.sha256.clone(),
+            present: present(&file.path, file.bytes),
+        });
+    }
+    if let Some(archive) = &model.archive {
+        for file in &archive.files {
+            files.push(ModelFileDetail {
+                path: file.path.clone(),
+                url: archive.url.clone(),
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+                present: present(&file.path, file.bytes),
+            });
+        }
+    }
+    Ok(ModelDetails {
+        info,
+        version: model.version.clone(),
+        directory,
+        files,
+    })
 }
 
 fn inspect_manifest_model(
@@ -1158,6 +1271,40 @@ mod tests {
             Arc::new(|_| Ok(u64::MAX)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn describe_lists_pinned_files_and_the_install_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let details = describe_model_at(root.path(), "diarization").unwrap();
+        assert_eq!(details.info.cache_state, ModelCacheState::Missing);
+        assert_eq!(
+            details.directory,
+            root.path().join("diarization-pyannote3-wespeaker-r34")
+        );
+        assert_eq!(details.files.len(), 2);
+        assert!(details.files.iter().all(|file| !file.present));
+        assert!(details
+            .files
+            .iter()
+            .all(|file| file.url.starts_with("https://") && file.sha256.len() == 64));
+        assert_eq!(
+            details.info.download_bytes,
+            details.files.iter().map(|file| file.bytes).sum::<u64>()
+        );
+
+        // A right-sized file shows up as present even before verification.
+        std::fs::create_dir_all(&details.directory).unwrap();
+        let first = &details.files[0];
+        std::fs::write(
+            details.directory.join(&first.path),
+            vec![0u8; first.bytes as usize],
+        )
+        .unwrap();
+        let again = describe_model_at(root.path(), "diarization").unwrap();
+        assert!(again.files[0].present);
+        assert!(!again.files[1].present);
+        assert_eq!(again.info.cache_state, ModelCacheState::Incomplete);
     }
 
     #[test]

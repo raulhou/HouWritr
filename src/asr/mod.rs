@@ -54,7 +54,10 @@ pub fn diarize_speakers(
 ) -> Result<Vec<diarize::Turn>> {
     use crate::model_manager::{CancellationToken, ModelManager};
     qnn_ffi::initialize_ort_runtime()?;
-    let models = ModelManager::new().map_err(|error| anyhow::anyhow!(error))?;
+    // Not `new()`: that deletes in-flight staging directories, and the
+    // Settings window may be downloading these same models right now.
+    let models =
+        ModelManager::new_preserving_work_dirs().map_err(|error| anyhow::anyhow!(error))?;
     let directory = models
         .ensure("diarization", &CancellationToken::default(), |_| {})
         .map_err(|error| anyhow::anyhow!(error))?;
