@@ -132,6 +132,10 @@ pub enum WorkerEvent {
     JobCompleted {
         id: u64,
         text: String,
+        /// Structured meeting notes, kept apart from the transcript so the
+        /// caller can save them as their own file. `Some` only for notes jobs
+        /// whose generation succeeded.
+        notes: Option<String>,
         auto_paste: bool,
         enhancement_warning: Option<FallbackReason>,
         delivery_target: Option<DeliveryTarget>,
@@ -741,7 +745,7 @@ fn worker_main(
                     (text, None)
                 };
 
-                let (final_text, enhancement_warning) = if job.config.notes {
+                let (final_text, enhancement_warning, notes_text) = if job.config.notes {
                     // Phase events are idempotent: a repeat is ignored by the
                     // tracker when cleanup already announced the phase.
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
@@ -753,12 +757,13 @@ fn worker_main(
                         });
                     match outcome {
                         enhance::NotesOutcome::Notes(notes) => (
-                            format!("{}\n\n## Transcript\n\n{}", notes.trim(), final_text),
+                            final_text,
                             enhancement_warning,
+                            Some(notes.trim().to_string()),
                         ),
                         enhance::NotesOutcome::Failed(reason) => {
                             info!(?reason, "meeting notes unavailable; saving transcript only");
-                            (final_text, Some(reason))
+                            (final_text, Some(reason), None)
                         }
                         enhance::NotesOutcome::Interrupted => {
                             let _transition = transition_gate.lock();
@@ -773,7 +778,7 @@ fn worker_main(
                         }
                     }
                 } else {
-                    (final_text, enhancement_warning)
+                    (final_text, enhancement_warning, None)
                 };
 
                 let chars = final_text.chars().count();
@@ -784,6 +789,7 @@ fn worker_main(
                         WorkerEvent::JobCompleted {
                             id: job.id,
                             text: final_text,
+                            notes: notes_text,
                             auto_paste: job.config.settings.auto_paste,
                             enhancement_warning,
                             delivery_target: job.config.delivery_target,
@@ -1349,6 +1355,7 @@ mod tests {
                 WorkerEvent::JobCompleted {
                     id: 41,
                     text: "done".into(),
+                    notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
                     delivery_target: None,
@@ -1365,6 +1372,7 @@ mod tests {
                 WorkerEvent::JobCompleted {
                     id: 41,
                     text: "late".into(),
+                    notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
                     delivery_target: None,

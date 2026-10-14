@@ -66,6 +66,8 @@ pub enum UserEvent {
     },
     /// The file dialog was dismissed, or decoding failed (`Some(reason)`).
     FileImportEnded(Option<String>),
+    /// Answer to "also create meeting notes?" after a recording stopped.
+    MeetingNotesChoice(bool),
     Tick,
 }
 
@@ -84,8 +86,9 @@ enum EngineState {
 struct FileJob {
     output: PathBuf,
     markdown: bool,
-    /// Structured AI notes were requested above the transcript.
+    /// Structured AI notes were requested; they go to `notes_output`.
     notes: bool,
+    notes_output: Option<PathBuf>,
     title: String,
     details: String,
     /// Popup window for this job. `None` (meetings) keeps the overlay pill.
@@ -99,6 +102,13 @@ impl FileJob {
             .as_ref()
             .is_some_and(|window| window.send(message).is_ok())
     }
+}
+
+/// A finished meeting recording waiting for the "create notes?" answer.
+struct PendingMeeting {
+    samples: Vec<f32>,
+    started: meeting::LocalTime,
+    recorded: Duration,
 }
 
 struct ActiveRecording {
@@ -297,8 +307,8 @@ struct State {
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
     meeting: Option<MeetingRecorder>,
-    /// The active meeting was started with "Start meeting notes".
-    meeting_notes: bool,
+    /// Recording finished; the notes question is open.
+    pending_meeting: Option<PendingMeeting>,
     /// Long-form jobs (imported files, meetings) mapped to their output file.
     file_jobs: HashMap<u64, FileJob>,
     file_import_running: bool,
@@ -391,7 +401,7 @@ pub fn run() -> Result<()> {
         proxy,
         diagnostics_exporting: false,
         meeting: None,
-        meeting_notes: false,
+        pending_meeting: None,
         file_jobs: HashMap::new(),
         file_import_running: false,
     };
@@ -801,6 +811,9 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                 self.state.file_import_running = false;
                 self.dispatch_file(path, samples, output, markdown, window);
             }
+            UserEvent::MeetingNotesChoice(create_notes) => {
+                self.finish_pending_meeting(create_notes);
+            }
             UserEvent::FileImportEnded(error) => {
                 self.state.file_import_running = false;
                 if let Some(error) = error {
@@ -897,7 +910,7 @@ impl AppHandler {
                         "meeting capture failed; transcribing what was captured"
                     );
                 }
-                self.stop_meeting();
+                self.stop_meeting(true);
             }
         }
 
@@ -977,18 +990,14 @@ impl AppHandler {
             }
             if ev.id == self.state.tray.menu_meeting_id {
                 if self.state.meeting.is_some() {
-                    self.stop_meeting();
+                    self.stop_meeting(true);
                 } else {
-                    self.start_meeting(false);
+                    self.start_meeting();
                 }
                 continue;
             }
-            if ev.id == self.state.tray.menu_meeting_notes_id {
-                if self.state.meeting.is_some() {
-                    self.stop_meeting();
-                } else {
-                    self.start_meeting(true);
-                }
+            if ev.id == self.state.tray.menu_meeting_pause_id {
+                self.toggle_meeting_pause();
                 continue;
             }
             if ev.id == self.state.tray.menu_settings_id {
@@ -1364,6 +1373,7 @@ impl AppHandler {
             output,
             markdown,
             notes: false,
+            notes_output: None,
             title,
             details: format!(
                 "Transcript of {name} ({}) · OpenWritr",
@@ -1424,26 +1434,24 @@ impl AppHandler {
         }
     }
 
-    fn start_meeting(&mut self, notes: bool) {
-        if !self.require_ready_engine() {
+    fn start_meeting(&mut self) {
+        if self.state.pending_meeting.is_some() {
+            self.show_overlay_notice(
+                NoticeKind::Warning,
+                "Answer the meeting notes question first",
+            );
             return;
         }
-        if notes {
-            // Fail before recording an hour of audio, not after.
-            if let Err(reason) = enhance::notes_configuration(&self.state.settings) {
-                warn!(?reason, "meeting notes provider is not configured");
-                self.show_job_warning(
-                    "Meeting notes need an AI provider: set up Text enhancement in Settings",
-                );
-                return;
-            }
+        if !self.require_ready_engine() {
+            return;
         }
         match MeetingRecorder::start() {
             Ok(recorder) => {
                 let sources = recorder.sources();
                 self.state.meeting = Some(recorder);
-                self.state.meeting_notes = notes;
-                self.state.tray.set_meeting_active(true, notes);
+                self.state
+                    .tray
+                    .set_meeting_state(tray::MeetingMenuState::Recording);
                 self.state.tray.set_status(
                     tray::IconColor::Recording,
                     &format!("OpenWritr — recording meeting ({sources})"),
@@ -1463,46 +1471,130 @@ impl AppHandler {
         }
     }
 
-    fn stop_meeting(&mut self) {
+    fn toggle_meeting_pause(&mut self) {
+        let Some(recorder) = self.state.meeting.as_mut() else {
+            return;
+        };
+        if recorder.is_paused() {
+            let resumed = recorder.resume().map(|()| recorder.sources());
+            match resumed {
+                Ok(sources) => {
+                    self.state
+                        .tray
+                        .set_meeting_state(tray::MeetingMenuState::Recording);
+                    self.state.tray.set_status(
+                        tray::IconColor::Recording,
+                        &format!("OpenWritr — recording meeting ({sources})"),
+                    );
+                    self.show_overlay_notice(NoticeKind::Success, "Meeting recording resumed");
+                }
+                Err(error) => {
+                    // Still paused: the user can retry or stop and keep what
+                    // was recorded so far.
+                    warn!(error = %error, "could not resume meeting capture");
+                    self.show_job_warning(&format!(
+                        "Could not resume the meeting: {}",
+                        short_error(&error.to_string())
+                    ));
+                }
+            }
+        } else {
+            recorder.pause();
+            self.state
+                .tray
+                .set_meeting_state(tray::MeetingMenuState::Paused);
+            self.state.tray.set_status(
+                tray::IconColor::Transcribing,
+                "OpenWritr — meeting paused (not recording); resume or stop from the tray menu",
+            );
+            self.show_overlay_notice(NoticeKind::Info, "Meeting recording paused");
+        }
+    }
+
+    /// End the recording. With `ask_for_notes`, offer to also create AI notes
+    /// (only when a provider is configured); otherwise queue the transcript.
+    fn stop_meeting(&mut self, ask_for_notes: bool) {
         let Some(recorder) = self.state.meeting.take() else {
             return;
         };
-        let notes = std::mem::take(&mut self.state.meeting_notes);
-        self.state.tray.set_meeting_active(false, notes);
-        let elapsed = recorder.elapsed();
+        self.state
+            .tray
+            .set_meeting_state(tray::MeetingMenuState::Idle);
+        let recorded = recorder.elapsed();
         let samples = recorder.finish();
         if samples.len() < media::TARGET_RATE as usize {
             self.show_job_warning("Meeting recording was too short to transcribe");
             return;
         }
-        info!(seconds = elapsed.as_secs(), "meeting capture stopped");
-        let started = meeting::LocalTime::now();
-        // Notes are Markdown by nature.
-        let markdown = self.state.settings.markdown_transcripts || notes;
+        info!(seconds = recorded.as_secs(), "meeting capture stopped");
+        let pending = PendingMeeting {
+            samples,
+            started: meeting::LocalTime::now(),
+            recorded,
+        };
+
+        let can_offer_notes =
+            ask_for_notes && enhance::notes_configuration(&self.state.settings).is_ok();
+        if !can_offer_notes {
+            if ask_for_notes {
+                self.show_overlay_notice(
+                    NoticeKind::Info,
+                    "Set up an AI provider in Settings to get meeting notes",
+                );
+            }
+            self.state.pending_meeting = Some(pending);
+            self.finish_pending_meeting(false);
+            return;
+        }
+
+        self.state.pending_meeting = Some(pending);
+        self.state.tray.set_status(
+            tray::IconColor::Transcribing,
+            "OpenWritr — meeting recorded; waiting for your answer about notes",
+        );
+        let proxy = self.state.proxy.clone();
+        let asked = thread::Builder::new()
+            .name("meeting-notes-prompt".into())
+            .spawn(move || {
+                let choice = meeting::ask_create_notes(recorded);
+                let _ = proxy.send_event(UserEvent::MeetingNotesChoice(choice));
+            });
+        if let Err(error) = asked {
+            warn!(error = %error, "could not show the notes question; saving the transcript only");
+            self.finish_pending_meeting(false);
+        }
+    }
+
+    /// Queue the transcription of the recording that was waiting on the
+    /// "create notes?" answer.
+    fn finish_pending_meeting(&mut self, create_notes: bool) {
+        let Some(pending) = self.state.pending_meeting.take() else {
+            return;
+        };
+        let started = pending.started;
+        let markdown = self.state.settings.markdown_transcripts;
         let mut output = meeting::default_output_path(started);
         if markdown {
             output.set_extension("md");
         }
+        let notes_output =
+            create_notes.then(|| media::unique_path(meeting::default_notes_path(started)));
         let job = FileJob {
             output: media::unique_path(output),
             markdown,
-            notes,
+            notes: create_notes,
+            notes_output,
             window: None,
             title: format!(
-                "{} {:04}-{:02}-{:02} {:02}:{:02}",
-                if notes { "Meeting notes" } else { "Meeting" },
-                started.year,
-                started.month,
-                started.day,
-                started.hour,
-                started.minute
+                "Meeting {:04}-{:02}-{:02} {:02}:{:02}",
+                started.year, started.month, started.day, started.hour, started.minute
             ),
             details: format!(
                 "Recorded with OpenWritr · {}",
-                format_duration(elapsed.as_secs() as usize)
+                format_duration(pending.recorded.as_secs() as usize)
             ),
         };
-        self.dispatch_long_form(samples, job, "meeting");
+        self.dispatch_long_form(pending.samples, job, "meeting");
     }
 
     /// Report a file/meeting outcome. Windowed jobs only touch the tray; the
@@ -1528,6 +1620,7 @@ impl AppHandler {
         &mut self,
         job: FileJob,
         text: &str,
+        notes: Option<String>,
         cleanup_warning: Option<FallbackReason>,
     ) {
         let windowed = job.window.is_some();
@@ -1574,7 +1667,36 @@ impl AppHandler {
             warn!(error = %error, "failed to copy transcript to clipboard");
         }
 
-        let missing = if job.notes { "AI notes" } else { "AI cleanup" };
+        // Meeting notes go next to the transcript as their own file.
+        let mut notes_saved = false;
+        if let (Some(notes_text), Some(notes_path)) = (notes.as_deref(), job.notes_output.as_ref())
+        {
+            let transcript_name = output
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let document = media::to_markdown(
+                &job.title.replacen("Meeting", "Meeting notes", 1),
+                &format!("{} · transcript: {transcript_name}", job.details),
+                notes_text,
+            );
+            let saved = notes_path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::write(notes_path, document));
+            match saved {
+                Ok(()) => notes_saved = true,
+                Err(error) => {
+                    warn!(error = %error, file = %notes_path.display(), "failed to write notes");
+                }
+            }
+        }
+
+        let missing = if job.notes && !notes_saved {
+            "AI notes"
+        } else {
+            "AI cleanup"
+        };
         let (words, chars, preview) = transcript_window::summarize(text);
         let shown = job.tell_window(WindowMsg::Done {
             output_path: output.display().to_string(),
@@ -1604,11 +1726,12 @@ impl AppHandler {
                 &format!("Saved {name} without {missing} (provider or credential problem)"),
             );
         } else {
-            self.report_long_form(
-                windowed,
-                false,
-                &format!("Saved {name} and copied to clipboard"),
-            );
+            let message = if notes_saved {
+                format!("Saved {name} and meeting notes")
+            } else {
+                format!("Saved {name} and copied to clipboard")
+            };
+            self.report_long_form(windowed, false, &message);
         }
     }
 
@@ -1746,6 +1869,7 @@ impl AppHandler {
             WorkerEvent::JobCompleted {
                 id,
                 text,
+                notes,
                 auto_paste,
                 enhancement_warning,
                 delivery_target,
@@ -1768,7 +1892,7 @@ impl AppHandler {
                     return;
                 }
                 if let Some(job) = file_output {
-                    self.deliver_file_transcript(job, &text, enhancement_warning);
+                    self.deliver_file_transcript(job, &text, notes, enhancement_warning);
                     return;
                 }
                 if text.is_empty() {
@@ -2131,7 +2255,11 @@ impl AppHandler {
         }
         // Queue the meeting recorded so far so quitting never loses it; the
         // existing "finish queued jobs?" prompt then covers it.
-        self.stop_meeting();
+        self.stop_meeting(false);
+        if self.state.pending_meeting.is_some() {
+            // Quit while the notes question was open: keep the transcript.
+            self.finish_pending_meeting(false);
+        }
         info!(pending_jobs = self.state.pending_jobs, "quit requested");
         self.state.shutting_down = true;
         self.state.hk_stop.store(true, Ordering::Relaxed);

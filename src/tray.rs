@@ -15,9 +15,16 @@ pub struct Tray {
     pub menu_retry_engine_id: MenuId,
     pub menu_transcribe_file_id: MenuId,
     pub menu_meeting_id: MenuId,
-    pub menu_meeting_notes_id: MenuId,
+    pub menu_meeting_pause_id: MenuId,
     meeting_item: MenuItem,
-    meeting_notes_item: MenuItem,
+    meeting_pause_item: MenuItem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeetingMenuState {
+    Idle,
+    Recording,
+    Paused,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +44,7 @@ impl Tray {
         let model_sep = PredefinedMenuItem::separator();
         let transcribe_file = MenuItem::new("Transcribe audio or video file…", true, None);
         let meeting = MenuItem::new("Start meeting recording", true, None);
-        let meeting_notes = MenuItem::new("Start meeting notes", true, None);
+        let meeting_pause = MenuItem::new("Pause meeting recording", false, None);
         let transcribe_sep = PredefinedMenuItem::separator();
         let open_logs = MenuItem::new("Open logs", true, None);
         let export_diagnostics = MenuItem::new("Export diagnostics…", true, None);
@@ -53,7 +60,7 @@ impl Tray {
         menu.append(&model_sep)?;
         menu.append(&transcribe_file)?;
         menu.append(&meeting)?;
-        menu.append(&meeting_notes)?;
+        menu.append(&meeting_pause)?;
         menu.append(&transcribe_sep)?;
         menu.append(&open_logs)?;
         menu.append(&export_diagnostics)?;
@@ -80,9 +87,9 @@ impl Tray {
             menu_retry_engine_id: retry_engine.id().clone(),
             menu_transcribe_file_id: transcribe_file.id().clone(),
             menu_meeting_id: meeting.id().clone(),
-            menu_meeting_notes_id: meeting_notes.id().clone(),
+            menu_meeting_pause_id: meeting_pause.id().clone(),
             meeting_item: meeting,
-            meeting_notes_item: meeting_notes,
+            meeting_pause_item: meeting_pause,
         })
     }
 
@@ -97,23 +104,22 @@ impl Tray {
         self.set_tooltip(tooltip);
     }
 
-    /// Reflect an active meeting: the item that started it becomes "Stop…",
-    /// the other is disabled so only one meeting can run.
-    pub fn set_meeting_active(&self, active: bool, notes: bool) {
-        let transcript_running = active && !notes;
-        let notes_running = active && notes;
-        self.meeting_item.set_text(if transcript_running {
+    /// Reflect the meeting recorder: the first item starts/stops, the second
+    /// pauses/resumes and is only usable while a meeting is running.
+    pub fn set_meeting_state(&self, state: MeetingMenuState) {
+        let running = state != MeetingMenuState::Idle;
+        self.meeting_item.set_text(if running {
             "Stop meeting recording"
         } else {
             "Start meeting recording"
         });
-        self.meeting_item.set_enabled(!notes_running);
-        self.meeting_notes_item.set_text(if notes_running {
-            "Stop meeting notes"
-        } else {
-            "Start meeting notes"
-        });
-        self.meeting_notes_item.set_enabled(!transcript_running);
+        self.meeting_pause_item
+            .set_text(if state == MeetingMenuState::Paused {
+                "Resume meeting recording"
+            } else {
+                "Pause meeting recording"
+            });
+        self.meeting_pause_item.set_enabled(running);
     }
 
     pub fn set_tooltip(&self, tooltip: &str) {

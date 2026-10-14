@@ -105,10 +105,14 @@ Both live in the tray menu and run fully offline on the selected engine.
   source as `<name>.txt` (or `.md`) and copied to the clipboard.
 - **Start meeting recording / Stop meeting recording** captures your
   microphone and everything playing on the default output device (WASAPI
-  loopback) into one timeline, up to 2 hours. On stop, the transcript is saved
-  to `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` and copied to the
-  clipboard. Quitting while a meeting is recording transcribes what was
-  captured first.
+  loopback) into one timeline, up to 2 hours. **Pause meeting recording**
+  stops capturing and releases the microphone (Windows' mic-in-use indicator
+  turns off); **Resume** continues the same recording with no gap, and paused
+  time is not recorded or counted. When you stop, OpenWritr asks whether to
+  **also create meeting notes** (see below). The transcript is saved to
+  `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` and copied to the
+  clipboard. Quitting while a meeting is recording, or while the question is
+  open, saves the transcript without notes.
 
 Long audio is split into windows of at most 30 s at the quietest nearby point
 and transcribed in order. These jobs never paste. Transcription itself never
@@ -125,19 +129,25 @@ can be cleaned the raw transcript is saved with a warning. Set enhancement to
 transcript text to the provider you chose, so avoid it for confidential
 meetings unless that provider is acceptable.
 
-**Meeting notes.** **Start meeting notes** in the tray menu records a meeting
-exactly like *Start meeting recording*, then asks your configured AI provider
-for structured notes. The result is a Markdown file with a *Summary*, *Key
-points*, *Decisions*, *Action items* (as a `- [ ]` checklist) and *Open
-questions*, followed by the full transcript under *Transcript*. The prompt
-forbids inventing names, owners, dates or decisions, but speakers are not
-labelled and recognition errors can slip through, so review notes before
-acting on them. Notes use the provider, model and key from Settings → Text
-enhancement and work even when cleanup is set to **Never**; if no provider is
-configured the button tells you before recording starts. If the provider fails
-afterwards, the transcript is still saved and the notice says the notes are
-missing. Very long meetings are noted in parts and merged. The whole
-transcript is sent to the provider, so use it only where that is acceptable.
+**Meeting notes.** If an AI provider is configured (Settings → Text
+enhancement), stopping a meeting recording asks *Also create meeting notes with
+AI?* **Yes** saves, next to the transcript, a separate
+`Meeting notes <date> <time>.md` with a *Summary*, *Key points*, *Decisions*,
+*Action items* (a `- [ ]` checklist) and *Open questions*. **No** saves the
+transcript only. Without a provider the question is skipped. The prompt forbids
+inventing names, owners, dates or decisions, but speakers are not labelled and
+recognition errors can slip through, so review notes before acting on them.
+Notes work even when cleanup is set to **Never**; if cleanup is on it runs
+first and the notes are built from the cleaned text. If the provider fails, the
+transcript is still saved and the notice says the notes are missing. Very long
+meetings are noted in parts and merged. The whole transcript is sent to the
+provider, so answer *No* where that is not acceptable.
+
+**In-person meetings.** Recording works without a call: with nothing playing,
+only the microphone contributes. Use the best input device Windows offers (a
+conference or USB mic beats a laptop mic), keep it near the speakers, and
+expect quieter or distant voices to be missed. Overlapping speech and room
+echo reduce accuracy, and speakers are not separated.
 
 **Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
 (Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`
