@@ -771,13 +771,21 @@ fn worker_main(
                 let (final_text, enhancement_warning) = if job.config.should_enhance() {
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
                     info!("enhancement requested");
+                    // Speaker-labelled text carries [m:ss] markers; keep them
+                    // out of the cleanup request and put them back after.
+                    let (cleanup_input, stamps) =
+                        if matches!(diarization, DiarizationOutcome::Labelled { .. }) {
+                            strip_timestamps(&text)
+                        } else {
+                            (text.clone(), Vec::new())
+                        };
                     let still_wanted = || {
                         interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
                             .is_none()
                     };
                     let outcome = if job.config.long_form {
                         enhance::enhance_long_form(
-                            &text,
+                            &cleanup_input,
                             &job.config.settings,
                             || !still_wanted(),
                             |done, total| {
@@ -790,7 +798,7 @@ fn worker_main(
                             },
                         )
                     } else {
-                        enhance::enhance_outcome(&text, &job.config.settings, still_wanted)
+                        enhance::enhance_outcome(&cleanup_input, &job.config.settings, still_wanted)
                     };
                     let Some(outcome) = outcome else {
                         let _transition = transition_gate.lock();
@@ -801,7 +809,8 @@ fn worker_main(
                         }
                         continue;
                     };
-                    completed_cleanup(outcome)
+                    let (cleaned, warning) = completed_cleanup(outcome);
+                    (restore_timestamps(&cleaned, &stamps), warning)
                 } else {
                     (text, None)
                 };
@@ -947,6 +956,9 @@ fn transcribe_long_form(
 struct TurnWindow {
     range: std::ops::Range<usize>,
     speaker: usize,
+    /// Where this stretch begins in the recording, for the `[m:ss]` marker:
+    /// the turn's true start for its first window, the window start after.
+    mark: usize,
 }
 
 /// Turn → engine windows: each turn is padded by 0.1 s (never into a
@@ -975,10 +987,20 @@ fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -
         if start >= end {
             continue;
         }
-        for sub in plan_long_form_windows(&samples[start..end], rate) {
+        for (position, sub) in plan_long_form_windows(&samples[start..end], rate)
+            .into_iter()
+            .enumerate()
+        {
+            let range = start + sub.start..start + sub.end;
+            let mark = if position == 0 {
+                turn.start
+            } else {
+                range.start
+            };
             windows.push(TurnWindow {
-                range: start + sub.start..start + sub.end,
+                range,
                 speaker: turn.speaker,
+                mark,
             });
         }
     }
@@ -986,8 +1008,8 @@ fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -
 }
 
 /// Transcribe speaker by speaker and label the result:
-/// `Speaker 1: …` blocks separated by blank lines; consecutive windows of
-/// the same speaker run together.
+/// `[m:ss] Speaker 1: …` blocks separated by blank lines; consecutive
+/// windows of the same speaker run together under the first one's time.
 fn transcribe_turns(
     engine: &mut dyn Engine,
     samples: &[f32],
@@ -1016,13 +1038,62 @@ fn transcribe_turns(
                 if !transcript.is_empty() {
                     transcript.push_str("\n\n");
                 }
-                transcript.push_str(&format!("Speaker {}: {text}", window.speaker + 1));
+                let clock = crate::transcript_window::format_clock(
+                    (window.mark / sample_rate.max(1) as usize) as u64,
+                );
+                transcript.push_str(&format!("[{clock}] Speaker {}: {text}", window.speaker + 1));
                 current = Some(window.speaker);
             }
         }
         progress(index + 1, total);
     }
     Ok(transcript)
+}
+
+/// Split `[m:ss]` markers off the start of each block, returning the text
+/// without them and the markers in block order.
+///
+/// AI cleanup must not see timestamps: its integrity check treats digits as
+/// facts, so a reformatted `[12:03]` would reject the whole slice.
+fn strip_timestamps(text: &str) -> (String, Vec<String>) {
+    let mut stamps = Vec::new();
+    let blocks: Vec<&str> = text
+        .split("\n\n")
+        .map(|block| {
+            if let Some(rest) = block.strip_prefix('[') {
+                if let Some((stamp, tail)) = rest.split_once("] ") {
+                    let looks_like_clock = !stamp.is_empty()
+                        && stamp.len() <= 8
+                        && stamp.chars().all(|c| c.is_ascii_digit() || c == ':');
+                    if looks_like_clock {
+                        stamps.push(stamp.to_string());
+                        return tail;
+                    }
+                }
+            }
+            block
+        })
+        .collect();
+    (blocks.join("\n\n"), stamps)
+}
+
+/// Put markers back in front of the blocks of cleaned text. If cleanup
+/// changed the number of blocks the markers can no longer be matched
+/// reliably, so the labelled text is returned without them.
+fn restore_timestamps(cleaned: &str, stamps: &[String]) -> String {
+    if stamps.is_empty() {
+        return cleaned.to_string();
+    }
+    let blocks: Vec<&str> = cleaned.split("\n\n").collect();
+    if blocks.len() != stamps.len() {
+        return cleaned.to_string();
+    }
+    blocks
+        .iter()
+        .zip(stamps)
+        .map(|(block, stamp)| format!("[{stamp}] {block}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Short, single-line version of an error for user-facing notices.
@@ -1573,6 +1644,33 @@ mod tests {
         assert!(windows.iter().all(|w| w.speaker == 2));
     }
 
+    #[test]
+    fn timestamps_survive_cleanup_by_block_position() {
+        let labelled = "[0:00] Speaker 1: hello there\n\n[1:02:05] Speaker 2: hi";
+        let (plain, stamps) = strip_timestamps(labelled);
+        assert_eq!(plain, "Speaker 1: hello there\n\nSpeaker 2: hi");
+        assert_eq!(stamps, vec!["0:00", "1:02:05"]);
+        assert_eq!(restore_timestamps(&plain, &stamps), labelled);
+
+        // Cleanup that edits words inside blocks keeps the markers aligned.
+        let cleaned = "Speaker 1: Hello there.\n\nSpeaker 2: Hi!";
+        assert_eq!(
+            restore_timestamps(cleaned, &stamps),
+            "[0:00] Speaker 1: Hello there.\n\n[1:02:05] Speaker 2: Hi!"
+        );
+    }
+
+    #[test]
+    fn timestamps_are_dropped_when_cleanup_changes_the_block_count() {
+        let stamps = vec!["0:00".to_string(), "0:05".to_string()];
+        let merged = "Speaker 1: one two";
+        assert_eq!(restore_timestamps(merged, &stamps), merged);
+        // No markers to strip from ordinary text.
+        let (plain, none) = strip_timestamps("just text [with brackets] here");
+        assert_eq!(plain, "just text [with brackets] here");
+        assert!(none.is_empty());
+    }
+
     struct EchoEngine;
 
     impl Engine for EchoEngine {
@@ -1618,7 +1716,10 @@ mod tests {
             |done, total| seen.push((done, total)),
         )
         .unwrap();
-        assert_eq!(text, "Speaker 1: w1 w2\n\nSpeaker 2: w3\n\nSpeaker 1: w4");
+        assert_eq!(
+            text,
+            "[0:00] Speaker 1: w1 w2\n\n[0:03] Speaker 2: w3\n\n[0:05] Speaker 1: w4"
+        );
         assert_eq!(seen.first(), Some(&(0, 4)));
         assert_eq!(seen.last(), Some(&(4, 4)));
     }

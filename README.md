@@ -153,10 +153,13 @@ echo reduce accuracy, and speakers are not separated.
 (Settings → Output and feedback) and transcripts are split by who is talking:
 
 ```
-Speaker 1: Thanks everyone for joining…
+[0:00] Speaker 1: Thanks everyone for joining…
 
-Speaker 2: Happy to be here. Can we start with the roadmap?
+[0:12] Speaker 2: Happy to be here. Can we start with the roadmap?
 ```
+
+The `[m:ss]` marker is the time into the recording where that person starts
+talking (paused time in a meeting is not counted).
 
 OpenWritr finds the speaker turns with two small on-device models (pyannote
 segmentation 3.0 and a WeSpeaker voice-print model, about 32 MB, downloaded the
@@ -167,8 +170,9 @@ appearance and are **not** names. Accuracy drops with overlapping speech, very
 short interjections, similar voices and poor audio, and a voice is sometimes
 split into two labels. If only one speaker is found the transcript is left
 unlabelled; if the models cannot be downloaded or run, you still get the normal
-transcript and a note saying labels were unavailable. AI cleanup and meeting
-notes keep the labels, and notes may attribute action items to "Speaker N".
+transcript and a note saying labels were unavailable. AI cleanup keeps the
+labels and markers (the markers are held back from the AI request and put back
+afterwards), and meeting notes may attribute action items to "Speaker N".
 
 **Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
 (Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`

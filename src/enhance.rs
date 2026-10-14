@@ -375,7 +375,7 @@ Write concise Markdown in the transcript's language using exactly these sections
 ## Decisions\nBullet list, or \"None noted.\"\n\
 ## Action items\nChecklist lines like `- [ ] task (owner, due date)`; include owner and due date only when stated; or \"None noted.\"\n\
 ## Open questions\nBullet list, or \"None noted.\"\n\
-Lines may start with 'Speaker N:' labels from automatic speaker separation (labels can be wrong); \
+Blocks may start with a '[m:ss]' time marker (time into the recording) and 'Speaker N:' labels from automatic speaker separation (labels can be wrong); \
 you may attribute items to 'Speaker N' but never guess real names. \
 Use only facts stated in the transcript. Never invent names, owners, dates, numbers or decisions; leave something out when unsure. \
 Output only the Markdown, with no preamble.";
