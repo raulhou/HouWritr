@@ -105,7 +105,8 @@ Both live in the tray menu and run fully offline on the selected engine.
   source as `<name>.txt` (or `.md`) and copied to the clipboard.
 - **Start meeting recording / Stop meeting recording** captures your
   microphone and everything playing on the default output device (WASAPI
-  loopback) into one timeline, up to 2 hours. **Pause meeting recording**
+  loopback) into one timeline, up to 5 hours (about 600 MB of memory while
+  recording). **Pause meeting recording**
   stops capturing and releases the microphone (Windows' mic-in-use indicator
   turns off); **Resume** continues the same recording with no gap, and paused
   time is not recorded or counted. When you stop, OpenWritr asks whether to

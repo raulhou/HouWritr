@@ -2,7 +2,7 @@
 //! one 16 kHz mono timeline.
 //!
 //! Both sources are downsampled inside their audio callbacks and summed into
-//! a single shared `i16` buffer, so a two-hour meeting costs ~230 MB instead
+//! a single shared `i16` buffer, so a five-hour meeting costs ~576 MB instead
 //! of two full-rate f32 copies. Loopback devices deliver nothing while the
 //! system is silent, so each track re-synchronises to the wall clock when it
 //! falls behind; otherwise the two sources would drift apart.
@@ -21,10 +21,87 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const MAX_MEETING_SECONDS: usize = 2 * 3600;
+const MAX_MEETING_SECONDS: usize = 5 * 3600;
 const MAX_SAMPLES: usize = MAX_MEETING_SECONDS * TARGET_RATE as usize;
 /// Resync a track once it lags the wall clock by more than this.
 const RESYNC_GAP_SAMPLES: usize = TARGET_RATE as usize / 2;
+
+/// Recording buffer size step: ten minutes of 16 kHz samples (~19 MB).
+const CHUNK_SAMPLES: usize = 10 * 60 * TARGET_RATE as usize;
+
+/// The mixed recording, stored as fixed ten-minute chunks of `i16`.
+///
+/// One growing `Vec` would reallocate and copy hundreds of megabytes inside
+/// the audio callback on a long meeting (stalling capture) and double its
+/// footprint at the end. Chunks are allocated once, never moved, and are
+/// freed one by one as the recording is converted for transcription.
+struct Mix {
+    chunks: Vec<Vec<i16>>,
+    len: usize,
+}
+
+impl Mix {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Sum `samples` (clamped to [-1, 1]) into the timeline at `position`,
+    /// saturating instead of wrapping.
+    fn add(&mut self, position: usize, samples: &[f32]) {
+        let end = position + samples.len();
+        while self.chunks.len() * CHUNK_SAMPLES < end {
+            self.chunks.push(vec![0; CHUNK_SAMPLES]);
+        }
+        let (mut at, mut done) = (position, 0);
+        while done < samples.len() {
+            let offset = at % CHUNK_SAMPLES;
+            let count = (CHUNK_SAMPLES - offset).min(samples.len() - done);
+            let chunk = &mut self.chunks[at / CHUNK_SAMPLES];
+            for (slot, &sample) in chunk[offset..offset + count]
+                .iter_mut()
+                .zip(&samples[done..done + count])
+            {
+                let value = (sample.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                *slot = slot.saturating_add(value);
+            }
+            at += count;
+            done += count;
+        }
+        self.len = self.len.max(end);
+    }
+
+    /// The recording as f32, releasing each chunk as soon as it is read.
+    fn into_f32(self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.len);
+        let mut remaining = self.len;
+        for chunk in self.chunks {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(chunk.len());
+            out.extend(chunk[..take].iter().map(|&s| s as f32 / 32_768.0));
+            remaining -= take;
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<i16> {
+        self.chunks
+            .iter()
+            .flatten()
+            .copied()
+            .take(self.len)
+            .collect()
+    }
+}
 
 struct Track {
     downsampler: Downsampler,
@@ -57,7 +134,7 @@ impl Clock {
 }
 
 struct Shared {
-    mix: Mutex<Vec<i16>>,
+    mix: Mutex<Mix>,
     clock: Mutex<Clock>,
     /// Live input level (RMS x 10 000, same scale as dictation) for the
     /// recording indicator; the louder of the microphone and system audio.
@@ -79,7 +156,7 @@ impl MeetingRecorder {
     pub fn start(level_x10000: Arc<AtomicU32>) -> Result<Self> {
         level_x10000.store(0, Ordering::Relaxed);
         let shared = Arc::new(Shared {
-            mix: Mutex::new(Vec::new()),
+            mix: Mutex::new(Mix::new()),
             clock: Mutex::new(Clock::new()),
             level_x10000,
             limit_reached: AtomicBool::new(false),
@@ -157,10 +234,8 @@ impl MeetingRecorder {
         } = self;
         drop(streams);
         shared.level_x10000.store(0, Ordering::Relaxed);
-        let mix = std::mem::take(&mut *shared.mix.lock());
-        mix.into_iter()
-            .map(|sample| sample as f32 / 32_768.0)
-            .collect()
+        let mix = std::mem::replace(&mut *shared.mix.lock(), Mix::new());
+        mix.into_f32()
     }
 }
 
@@ -320,14 +395,7 @@ fn write(shared: &Shared, track: &mut Track) {
         shared.limit_reached.store(true, Ordering::Relaxed);
         return;
     }
-    let mut mix = shared.mix.lock();
-    if mix.len() < track.position + incoming {
-        mix.resize(track.position + incoming, 0);
-    }
-    for (slot, &sample) in mix[track.position..].iter_mut().zip(&track.resampled) {
-        let value = (sample.clamp(-1.0, 1.0) * 32_767.0) as i16;
-        *slot = slot.saturating_add(value);
-    }
+    shared.mix.lock().add(track.position, &track.resampled);
     track.position += incoming;
 }
 
@@ -417,7 +485,7 @@ mod tests {
 
     fn shared() -> Shared {
         Shared {
-            mix: Mutex::new(Vec::new()),
+            mix: Mutex::new(Mix::new()),
             clock: Mutex::new(Clock::new()),
             level_x10000: Arc::new(AtomicU32::new(0)),
             limit_reached: AtomicBool::new(false),
@@ -441,7 +509,31 @@ mod tests {
         write(&shared, &mut track(vec![0.25; 100]));
         let mix = shared.mix.lock();
         assert_eq!(mix.len(), 100);
-        assert!(mix.iter().all(|&s| (s - 16_383).abs() <= 2));
+        assert!(mix.to_vec().iter().all(|&s| (s - 16_383).abs() <= 2));
+    }
+
+    #[test]
+    fn mix_spans_chunk_boundaries_without_gaps() {
+        let mut mix = Mix::new();
+        // 100 samples straddling the end of the first chunk.
+        let start = CHUNK_SAMPLES - 40;
+        mix.add(start, &[0.5; 100]);
+        assert_eq!(mix.len(), CHUNK_SAMPLES + 60);
+        assert_eq!(mix.chunks.len(), 2);
+        let all = mix.to_vec();
+        assert_eq!(all[start - 1], 0);
+        assert!(all[start..start + 100].iter().all(|&s| s == 16_383));
+        assert_eq!(all[start + 100 - 1], 16_383);
+
+        let floats = mix.into_f32();
+        assert_eq!(floats.len(), CHUNK_SAMPLES + 60);
+        assert!((floats[CHUNK_SAMPLES] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_cap_is_five_hours_of_audio() {
+        assert_eq!(MAX_MEETING_SECONDS, 5 * 3600);
+        assert_eq!(MAX_SAMPLES, 288_000_000);
     }
 
     #[test]
@@ -449,7 +541,7 @@ mod tests {
         let shared = shared();
         write(&shared, &mut track(vec![1.0; 10]));
         write(&shared, &mut track(vec![1.0; 10]));
-        assert!(shared.mix.lock().iter().all(|&s| s == i16::MAX));
+        assert!(shared.mix.lock().to_vec().iter().all(|&s| s == i16::MAX));
     }
 
     #[test]
