@@ -22,8 +22,9 @@ use symphonia::core::probe::Hint;
 pub const TARGET_RATE: u32 = 16_000;
 
 /// Hard cap so a mislabelled or enormous file cannot exhaust memory
-/// (4 hours of 16 kHz f32 mono is ~920 MB).
-const MAX_FILE_SECONDS: usize = 4 * 3600;
+/// (5 hours of 16 kHz f32 mono is ~1.15 GB). Matches the meeting recording
+/// limit so anything you can record you can also import.
+const MAX_FILE_SECONDS: usize = 5 * 3600;
 
 /// Streaming mono downsampler (box filter over fractional input spans).
 ///
@@ -323,6 +324,11 @@ mod tests {
         let body = "First para.\n\nSecond para.";
         let md = to_markdown("T", "d", body);
         assert!(md.ends_with("First para.\n\nSecond para.\n"));
+    }
+
+    #[test]
+    fn file_cap_matches_the_meeting_recording_cap() {
+        assert_eq!(MAX_FILE_SECONDS, 5 * 3600);
     }
 
     #[test]
