@@ -16,7 +16,7 @@ use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -59,6 +59,9 @@ impl Clock {
 struct Shared {
     mix: Mutex<Vec<i16>>,
     clock: Mutex<Clock>,
+    /// Live input level (RMS x 10 000, same scale as dictation) for the
+    /// recording indicator; the louder of the microphone and system audio.
+    level_x10000: Arc<AtomicU32>,
     limit_reached: AtomicBool,
     failed: Mutex<Option<String>>,
 }
@@ -73,10 +76,12 @@ pub struct MeetingRecorder {
 impl MeetingRecorder {
     /// Start capturing. Succeeds if at least one of microphone / system audio
     /// could be opened; `sources()` reports which.
-    pub fn start() -> Result<Self> {
+    pub fn start(level_x10000: Arc<AtomicU32>) -> Result<Self> {
+        level_x10000.store(0, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             mix: Mutex::new(Vec::new()),
             clock: Mutex::new(Clock::new()),
+            level_x10000,
             limit_reached: AtomicBool::new(false),
             failed: Mutex::new(None),
         });
@@ -97,6 +102,7 @@ impl MeetingRecorder {
         }
         // Dropping the streams stops the callbacks and releases the devices.
         self.streams.clear();
+        self.shared.level_x10000.store(0, Ordering::Relaxed);
         self.shared.clock.lock().paused_at = Some(Instant::now());
         self.paused = true;
         info!("meeting capture paused");
@@ -150,6 +156,7 @@ impl MeetingRecorder {
             streams, shared, ..
         } = self;
         drop(streams);
+        shared.level_x10000.store(0, Ordering::Relaxed);
         let mix = std::mem::take(&mut *shared.mix.lock());
         mix.into_iter()
             .map(|sample| sample as f32 / 32_768.0)
@@ -249,6 +256,7 @@ where
             track.mono.extend(data.chunks_exact(channels).map(|frame| {
                 frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
             }));
+            publish_level(&shared.level_x10000, &track.mono, channels);
             track.resampled.clear();
             let Track {
                 downsampler,
@@ -266,6 +274,34 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// RMS of one callback's mono samples on dictation's 0..10 000 scale.
+fn scaled_level(mono: &[f32], channels: usize) -> u32 {
+    if mono.is_empty() {
+        return 0;
+    }
+    let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+    // Averaging channels to mono lowers the level; compensate like audio.rs.
+    let gain = if channels <= 1 {
+        1.0
+    } else {
+        (channels as f32).sqrt()
+    };
+    ((rms * gain).min(1.0) * 10_000.0) as u32
+}
+
+/// Publish a level without letting the quieter of the two sources (which
+/// report from separate callbacks) wipe out the louder one: new peaks win
+/// at once, otherwise the displayed level decays by an eighth per callback.
+fn next_level(current: u32, measured: u32) -> u32 {
+    measured.max(current - current.div_ceil(8))
+}
+
+fn publish_level(level: &AtomicU32, mono: &[f32], channels: usize) {
+    let measured = scaled_level(mono, channels);
+    let current = level.load(Ordering::Relaxed);
+    level.store(next_level(current, measured), Ordering::Relaxed);
 }
 
 fn write(shared: &Shared, track: &mut Track) {
@@ -383,6 +419,7 @@ mod tests {
         Shared {
             mix: Mutex::new(Vec::new()),
             clock: Mutex::new(Clock::new()),
+            level_x10000: Arc::new(AtomicU32::new(0)),
             limit_reached: AtomicBool::new(false),
             failed: Mutex::new(None),
         }
@@ -413,6 +450,31 @@ mod tests {
         write(&shared, &mut track(vec![1.0; 10]));
         write(&shared, &mut track(vec![1.0; 10]));
         assert!(shared.mix.lock().iter().all(|&s| s == i16::MAX));
+    }
+
+    #[test]
+    fn level_matches_dictation_scale_and_compensates_channels() {
+        assert_eq!(scaled_level(&[], 2), 0);
+        assert_eq!(scaled_level(&[0.0; 64], 1), 0);
+        let near = |actual: u32, expected: u32| actual.abs_diff(expected) <= 2;
+        // Constant 0.1 -> RMS 0.1 -> 1000 (f32 truncation may cost a unit).
+        assert!(near(scaled_level(&[0.1; 64], 1), 1_000));
+        // Stereo gets sqrt(2) gain, and is clamped at full scale.
+        assert!(near(scaled_level(&[0.1; 64], 2), 1_414));
+        assert_eq!(scaled_level(&[0.9; 64], 4), 10_000);
+    }
+
+    #[test]
+    fn level_decays_but_loud_peaks_win_immediately() {
+        assert_eq!(next_level(0, 0), 0);
+        assert_eq!(next_level(800, 100), 700); // decays by an eighth
+        assert_eq!(next_level(5, 0), 4); // and always makes progress
+        assert_eq!(next_level(800, 5_000), 5_000); // a new peak is immediate
+        let mut level = 8_000;
+        for _ in 0..200 {
+            level = next_level(level, 0);
+        }
+        assert_eq!(level, 0, "the meter must settle at zero");
     }
 
     #[test]

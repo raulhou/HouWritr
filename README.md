@@ -118,6 +118,17 @@ Long audio is split into windows of at most 30 s at the quietest nearby point
 and transcribed in order. These jobs never paste. Transcription itself never
 leaves the machine.
 
+**Recording indicator.** While a meeting is being recorded, a pill in the
+same style as the dictation indicator stays at the top-centre of the screen:
+red `Recording 12:34` with live level bars, or amber `Paused 12:34`. It is
+separate from the dictation pill, so it stays up while you dictate and while
+notices appear. Turn it off under *Settings → Output and feedback → Show a
+recording indicator during meeting recordings*, or flip it for the current
+session with **Hide / Show recording indicator** in the tray menu (the tray
+menu does not change the saved setting). The tray icon still turns red
+(recording) or amber (paused) either way, and hiding the indicator mid-meeting
+shows a short notice so it is never silent.
+
 **AI cleanup.** If text enhancement is set to anything other than **Never**
 (Settings → Text enhancement), file and meeting transcripts are also cleaned up
 by your configured provider (GitHub Copilot or an OpenAI-compatible API). The

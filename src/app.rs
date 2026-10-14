@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::thread;
@@ -308,6 +308,15 @@ struct State {
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
     meeting: Option<MeetingRecorder>,
+    /// Live meeting input level feeding the recording indicator.
+    meeting_level: Arc<AtomicU32>,
+    /// The second pill: shown for the whole meeting recording.
+    meeting_overlay: overlay::OverlayController,
+    meeting_overlay_view: OverlayViewState,
+    meeting_overlay_enabled: bool,
+    /// Tray toggle for this session only. `None` follows the saved setting;
+    /// the tray process never rewrites settings.json itself.
+    meeting_indicator_override: Option<bool>,
     /// Recording finished; the notes question is open.
     pending_meeting: Option<PendingMeeting>,
     /// Long-form jobs (imported files, meetings) mapped to their output file.
@@ -352,6 +361,7 @@ pub fn run() -> Result<()> {
     );
     let recorder = Recorder::new()?;
     let tray = tray::Tray::new(&settings)?;
+    tray.set_meeting_indicator_visible(settings.show_meeting_indicator);
     let worker = Worker::spawn()?;
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -377,7 +387,19 @@ pub fn run() -> Result<()> {
             stop: hk_stop.clone(),
         },
         settings.overlay,
+        overlay::Placement::BottomCenter,
     )?;
+
+    let meeting_level = Arc::new(AtomicU32::new(0));
+    let meeting_overlay = overlay::spawn(
+        overlay::OverlayHandles {
+            level_x10000: meeting_level.clone(),
+            stop: hk_stop.clone(),
+        },
+        settings.show_meeting_indicator,
+        overlay::Placement::TopCenter,
+    )?;
+    let meeting_overlay_enabled = settings.show_meeting_indicator;
 
     let state = State {
         settings,
@@ -402,6 +424,11 @@ pub fn run() -> Result<()> {
         proxy,
         diagnostics_exporting: false,
         meeting: None,
+        meeting_level,
+        meeting_overlay,
+        meeting_overlay_view: OverlayViewState::Hidden,
+        meeting_overlay_enabled,
+        meeting_indicator_override: None,
         pending_meeting: None,
         file_jobs: HashMap::new(),
         file_import_running: false,
@@ -845,6 +872,7 @@ impl AppHandler {
             self.handle_worker_event(el, event);
         }
         self.sync_overlay();
+        self.sync_meeting_indicator();
 
         if self.state.active_recording.is_some() {
             let stream_failed = self.state.recorder.stream_failed();
@@ -1001,6 +1029,10 @@ impl AppHandler {
                 self.toggle_meeting_pause();
                 continue;
             }
+            if ev.id == self.state.tray.menu_meeting_indicator_id {
+                self.toggle_meeting_indicator();
+                continue;
+            }
             if ev.id == self.state.tray.menu_settings_id {
                 info!("opening settings UI subprocess");
                 // CRITICAL: spawn from a background thread. CreateProcessW on
@@ -1057,8 +1089,14 @@ impl AppHandler {
                             } else {
                                 let old_engine = self.state.settings.engine.clone();
                                 let old_overlay = self.state.settings.overlay;
+                                let old_indicator = self.state.settings.show_meeting_indicator;
                                 self.state.settings = loaded.settings;
                                 self.state.settings_error = None;
+                                if self.state.settings.show_meeting_indicator != old_indicator {
+                                    // A saved change replaces any tray toggle.
+                                    self.state.meeting_indicator_override = None;
+                                    self.sync_meeting_indicator();
+                                }
                                 if self.state.settings.overlay != old_overlay {
                                     if let Err(error) =
                                         self.state.overlay.set_enabled(self.state.settings.overlay)
@@ -1435,6 +1473,56 @@ impl AppHandler {
         }
     }
 
+    /// Whether the meeting recording indicator should be on screen: the saved
+    /// setting, unless the tray menu overrode it for this session.
+    fn meeting_indicator_visible(&self) -> bool {
+        self.state
+            .meeting_indicator_override
+            .unwrap_or(self.state.settings.show_meeting_indicator)
+    }
+
+    /// Push the indicator's visibility and current view to its pill. Cheap:
+    /// only sends a command when something changed (about once a second
+    /// while recording, for the clock).
+    fn sync_meeting_indicator(&mut self) {
+        let visible = self.meeting_indicator_visible();
+        if visible != self.state.meeting_overlay_enabled {
+            match self.state.meeting_overlay.set_enabled(visible) {
+                Ok(()) => self.state.meeting_overlay_enabled = visible,
+                Err(error) => warn!(error, "failed to update meeting indicator"),
+            }
+            self.state.tray.set_meeting_indicator_visible(visible);
+        }
+        let desired = match &self.state.meeting {
+            Some(recorder) => {
+                OverlayViewState::meeting(recorder.elapsed().as_secs(), recorder.is_paused())
+            }
+            None => OverlayViewState::Hidden,
+        };
+        if desired != self.state.meeting_overlay_view {
+            match self.state.meeting_overlay.set_state(desired.clone()) {
+                Ok(()) => self.state.meeting_overlay_view = desired,
+                Err(error) => warn!(error, "failed to update meeting indicator"),
+            }
+        }
+    }
+
+    fn toggle_meeting_indicator(&mut self) {
+        let show = !self.meeting_indicator_visible();
+        self.state.meeting_indicator_override = Some(show);
+        self.state.tray.set_meeting_indicator_visible(show);
+        self.sync_meeting_indicator();
+        if self.state.meeting.is_some() {
+            // Hiding must never be silent while a recording is running.
+            let message = if show {
+                "Recording indicator shown"
+            } else {
+                "Indicator hidden · still recording (tray icon is red)"
+            };
+            self.show_overlay_notice(NoticeKind::Info, message);
+        }
+    }
+
     fn start_meeting(&mut self) {
         if self.state.pending_meeting.is_some() {
             self.show_overlay_notice(
@@ -1446,7 +1534,7 @@ impl AppHandler {
         if !self.require_ready_engine() {
             return;
         }
-        match MeetingRecorder::start() {
+        match MeetingRecorder::start(self.state.meeting_level.clone()) {
             Ok(recorder) => {
                 let sources = recorder.sources();
                 self.state.meeting = Some(recorder);
@@ -1457,9 +1545,14 @@ impl AppHandler {
                     tray::IconColor::Recording,
                     &format!("OpenWritr — recording meeting ({sources})"),
                 );
+                let hidden_note = if self.meeting_indicator_visible() {
+                    ""
+                } else {
+                    " (indicator hidden)"
+                };
                 self.show_overlay_notice(
                     NoticeKind::Success,
-                    format!("Recording meeting: {sources}"),
+                    format!("Recording meeting: {sources}{hidden_note}"),
                 );
             }
             Err(error) => {

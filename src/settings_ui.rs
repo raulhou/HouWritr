@@ -806,6 +806,12 @@ impl SettingsApp {
             .changed();
         self.dirty |= ui
             .checkbox(
+                &mut self.settings.show_meeting_indicator,
+                "Show a recording indicator during meeting recordings",
+            )
+            .changed();
+        self.dirty |= ui
+            .checkbox(
                 &mut self.settings.sounds,
                 "Play recording start and stop sounds",
             )

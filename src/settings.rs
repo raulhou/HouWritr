@@ -336,6 +336,9 @@ pub struct Settings {
     pub engine: String,
     pub auto_paste: bool,
     pub overlay: bool,
+    /// Keep a "Recording 12:34" pill on screen for the whole meeting
+    /// recording (independent of the dictation overlay).
+    pub show_meeting_indicator: bool,
     pub sounds: bool,
     /// Save imported-file and meeting transcripts as Markdown (`.md`, with a
     /// title and paragraphs) instead of plain `.txt`.
@@ -357,6 +360,7 @@ impl Default for Settings {
             engine: "parakeet_cpu".into(),
             auto_paste: true,
             overlay: true,
+            show_meeting_indicator: true,
             sounds: true,
             markdown_transcripts: false,
             diarize_speakers: false,
@@ -989,6 +993,21 @@ mod tests {
         assert_eq!(enabled.enhance.mode, EnhanceMode::WithShift);
         assert_eq!(enabled.enhance.provider, "openai_compatible");
         assert_eq!(enabled.enhance.model, "claude-haiku-4.5");
+    }
+
+    #[test]
+    fn meeting_indicator_defaults_on_and_old_files_keep_it() {
+        assert!(Settings::default().show_meeting_indicator);
+        // A settings file from before the option existed.
+        let old: Settings = serde_json::from_str(r#"{ "overlay": false }"#).unwrap();
+        assert!(old.show_meeting_indicator);
+        assert!(!old.overlay);
+
+        let mut hidden = Settings::default();
+        hidden.show_meeting_indicator = false;
+        let reloaded: Settings =
+            serde_json::from_value(serde_json::to_value(&hidden).unwrap()).unwrap();
+        assert!(!reloaded.show_meeting_indicator);
     }
 
     #[test]

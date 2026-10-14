@@ -16,8 +16,10 @@ pub struct Tray {
     pub menu_transcribe_file_id: MenuId,
     pub menu_meeting_id: MenuId,
     pub menu_meeting_pause_id: MenuId,
+    pub menu_meeting_indicator_id: MenuId,
     meeting_item: MenuItem,
     meeting_pause_item: MenuItem,
+    meeting_indicator_item: MenuItem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +47,7 @@ impl Tray {
         let transcribe_file = MenuItem::new("Transcribe audio or video file…", true, None);
         let meeting = MenuItem::new("Start meeting recording", true, None);
         let meeting_pause = MenuItem::new("Pause meeting recording", false, None);
+        let meeting_indicator = MenuItem::new("Hide recording indicator", true, None);
         let transcribe_sep = PredefinedMenuItem::separator();
         let open_logs = MenuItem::new("Open logs", true, None);
         let export_diagnostics = MenuItem::new("Export diagnostics…", true, None);
@@ -61,6 +64,7 @@ impl Tray {
         menu.append(&transcribe_file)?;
         menu.append(&meeting)?;
         menu.append(&meeting_pause)?;
+        menu.append(&meeting_indicator)?;
         menu.append(&transcribe_sep)?;
         menu.append(&open_logs)?;
         menu.append(&export_diagnostics)?;
@@ -88,8 +92,10 @@ impl Tray {
             menu_transcribe_file_id: transcribe_file.id().clone(),
             menu_meeting_id: meeting.id().clone(),
             menu_meeting_pause_id: meeting_pause.id().clone(),
+            menu_meeting_indicator_id: meeting_indicator.id().clone(),
             meeting_item: meeting,
             meeting_pause_item: meeting_pause,
+            meeting_indicator_item: meeting_indicator,
         })
     }
 
@@ -120,6 +126,15 @@ impl Tray {
                 "Pause meeting recording"
             });
         self.meeting_pause_item.set_enabled(running);
+    }
+
+    /// Menu text for the meeting recording indicator toggle.
+    pub fn set_meeting_indicator_visible(&self, visible: bool) {
+        self.meeting_indicator_item.set_text(if visible {
+            "Hide recording indicator"
+        } else {
+            "Show recording indicator"
+        });
     }
 
     pub fn set_tooltip(&self, tooltip: &str) {
