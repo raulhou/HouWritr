@@ -1087,7 +1087,13 @@ mod tests {
         );
         let resolved = settings.resolve_prompt(&target);
         assert_eq!(resolved.source, cleanup::PromptSource::CustomOverride);
-        assert_eq!(resolved.system, "custom cleanup prompt");
+        assert_eq!(
+            resolved.system,
+            format!(
+                "custom cleanup prompt\n\n{}",
+                crate::cleanup::prompt::TRANSCRIPT_ONLY_POLICY
+            )
+        );
     }
 
     #[test]

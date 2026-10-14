@@ -2103,7 +2103,13 @@ mod tests {
         assert_eq!(active.settings.prompt_target().unwrap(), target);
         let resolved = active.settings.resolve_prompt(&target);
         assert_eq!(resolved.source, PromptSource::CustomOverride);
-        assert_eq!(resolved.system, "snapshot prompt");
+        assert_eq!(
+            resolved.system,
+            format!(
+                "snapshot prompt\n\n{}",
+                crate::cleanup::prompt::TRANSCRIPT_ONLY_POLICY
+            )
+        );
         assert_eq!(active.intent, RecordingIntent::Enhance);
     }
 
