@@ -284,13 +284,17 @@ fn split_for_cleanup(text: &str, max_chars: usize) -> Vec<&str> {
             break;
         };
         let window = &rest[..limit];
+        // Speaker-labelled transcripts: never cut inside a speaker block when
+        // a block boundary is available.
+        let block_end = window.rfind("\n\n").filter(|&end| end > limit / 2);
         let sentence_end = window
             .char_indices()
             .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
             .map(|(index, c)| index + c.len_utf8())
             .filter(|&end| end > limit / 2)
             .last();
-        let cut = sentence_end
+        let cut = block_end
+            .or(sentence_end)
             .or_else(|| window.rfind(char::is_whitespace).filter(|&end| end > 0))
             .unwrap_or(limit);
         let (head, tail) = rest.split_at(cut);
@@ -371,6 +375,8 @@ Write concise Markdown in the transcript's language using exactly these sections
 ## Decisions\nBullet list, or \"None noted.\"\n\
 ## Action items\nChecklist lines like `- [ ] task (owner, due date)`; include owner and due date only when stated; or \"None noted.\"\n\
 ## Open questions\nBullet list, or \"None noted.\"\n\
+Lines may start with 'Speaker N:' labels from automatic speaker separation (labels can be wrong); \
+you may attribute items to 'Speaker N' but never guess real names. \
 Use only facts stated in the transcript. Never invent names, owners, dates, numbers or decisions; leave something out when unsure. \
 Output only the Markdown, with no preamble.";
 
@@ -677,6 +683,19 @@ mod long_form_tests {
         assert!(slices.iter().all(|slice| slice.ends_with('.')));
         let words = |parts: &[&str]| parts.iter().flat_map(|p| p.split_whitespace()).count();
         assert_eq!(words(&slices), words(&[text.as_str()]));
+    }
+
+    #[test]
+    fn labelled_blocks_are_not_cut_in_the_middle() {
+        let block = format!("Speaker 1: {}.", "word ".repeat(12).trim_end());
+        let text = vec![block.clone(); 12].join("\n\n");
+        let slices = split_for_cleanup(&text, 400);
+        assert!(slices.len() > 1);
+        for slice in &slices {
+            for part in slice.split("\n\n") {
+                assert_eq!(part, block, "a slice cut a speaker block in two");
+            }
+        }
     }
 
     #[test]

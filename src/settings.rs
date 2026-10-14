@@ -340,6 +340,9 @@ pub struct Settings {
     /// Save imported-file and meeting transcripts as Markdown (`.md`, with a
     /// title and paragraphs) instead of plain `.txt`.
     pub markdown_transcripts: bool,
+    /// Label speakers ("Speaker 1: …") in file and meeting transcripts using
+    /// the on-device diarization models.
+    pub diarize_speakers: bool,
     pub min_record_seconds: f32,
     pub max_record_seconds: f32,
     pub enhance: Enhance,
@@ -356,6 +359,7 @@ impl Default for Settings {
             overlay: true,
             sounds: true,
             markdown_transcripts: false,
+            diarize_speakers: false,
             min_record_seconds: 0.25,
             max_record_seconds: 60.0,
             enhance: Enhance::default(),

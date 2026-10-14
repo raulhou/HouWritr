@@ -6,7 +6,12 @@
 //! Send + Sync) fails. We provide a small extension trait that drops the
 //! payload and converts to a simple string-based anyhow error.
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context, Result};
+use ort::session::{
+    builder::{AutoDevicePolicy, GraphOptimizationLevel},
+    Session,
+};
+use std::path::Path;
 
 pub trait OrtResultExt<T> {
     fn ortx(self) -> anyhow::Result<T>;
@@ -16,4 +21,35 @@ impl<T, R> OrtResultExt<T> for std::result::Result<T, ort::Error<R>> {
     fn ortx(self) -> anyhow::Result<T> {
         self.map_err(|e| anyhow!("ort: {e}"))
     }
+}
+
+/// CPU worker threads for ONNX sessions: all cores up to 8.
+pub fn num_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
+}
+
+/// A session pinned to the CPU execution provider.
+///
+/// Automatic device selection is pinned to CPU so that later session builds
+/// stay CPU-only even after the QNN provider has been registered
+/// process-wide.
+pub fn build_cpu_session(path: &Path) -> Result<Session> {
+    use ort::ep::CPU;
+    Session::builder()
+        .ortx()?
+        .with_auto_device(AutoDevicePolicy::PreferCPU)
+        .ortx()?
+        .with_no_environment_execution_providers()
+        .ortx()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .ortx()?
+        .with_intra_threads(num_threads())
+        .ortx()?
+        .with_execution_providers([CPU::default().build()])
+        .ortx()?
+        .commit_from_file(path)
+        .ortx()
+        .with_context(|| format!("load {}", path.display()))
 }

@@ -175,6 +175,26 @@
           "sha256": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
         }
       ]
+    },
+    {
+      "id": "diarization",
+      "version": "csukuangfj-9403a690+csukuangfj-0743f301",
+      "local_dir": "diarization-pyannote3-wespeaker-r34",
+      "architecture": "any",
+      "files": [
+        {
+          "path": "segmentation-3.0.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.onnx",
+          "bytes": 5992913,
+          "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+        },
+        {
+          "path": "wespeaker-voxceleb-resnet34-LM.onnx",
+          "url": "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/wespeaker_en_voxceleb_resnet34_LM.onnx",
+          "bytes": 26530550,
+          "sha256": "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012"
+        }
+      ]
     }
   ]
 }

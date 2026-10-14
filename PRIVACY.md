@@ -26,7 +26,11 @@ OpenWritr connects to the internet only for:
 1. **One-time model download** from Hugging Face (`huggingface.co`) on first
    launch — this fetches the speech-recognition model files. No personal
    data is sent; this is a plain file download.
-2. **Optional text cleanup ("Enhance")** — *off by default*. You can run it
+2. **Optional speaker labels** — *off by default*. If you turn on *Label
+   speakers in file and meeting transcripts*, two small models (about 32 MB)
+   are downloaded once from Hugging Face. The labelling itself runs entirely
+   on your device; no audio or text is sent anywhere for it.
+3. **Optional text cleanup ("Enhance")** — *off by default*. You can run it
    only when Shift is additionally held or for every recording. If enabled,
    the **recognized text** (never audio) is sent to GitHub Copilot or your
    configured OpenAI-compatible API for grammar and punctuation cleanup using

@@ -4,7 +4,7 @@
 //! provider library at runtime and pick the NPU per-session. If no NPU is
 //! available the selected engine fails visibly; fallback is never implicit.
 
-use super::ort_helpers::OrtResultExt;
+use super::ort_helpers::{build_cpu_session, OrtResultExt};
 use super::qnn_ffi::{
     acquire_qnn_provider, enumerate_qnn_npu_devices, initialize_ort_runtime, QnnSession,
     SessionContract, TensorElementType, TensorInput, TensorSpec,
@@ -14,10 +14,7 @@ use super::{resample, tokenizer::Vocab};
 use crate::asr::Engine;
 use anyhow::{anyhow, Context, Result};
 use ndarray::{Array1, Array3, Ix3};
-use ort::session::{
-    builder::{AutoDevicePolicy, GraphOptimizationLevel},
-    Session,
-};
+use ort::session::Session;
 use ort::value::Value;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -400,25 +397,6 @@ fn scale_valid_frames(valid_input: usize, total_input: usize, total_output: usiz
     numerator.div_ceil(total_input).min(total_output)
 }
 
-fn build_cpu_session(path: &Path) -> Result<Session> {
-    use ort::ep::CPU;
-    Session::builder()
-        .ortx()?
-        .with_auto_device(AutoDevicePolicy::PreferCPU)
-        .ortx()?
-        .with_no_environment_execution_providers()
-        .ortx()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .ortx()?
-        .with_intra_threads(num_threads())
-        .ortx()?
-        .with_execution_providers([CPU::default().build()])
-        .ortx()?
-        .commit_from_file(path)
-        .ortx()
-        .with_context(|| format!("load {}", path.display()))
-}
-
 #[cfg(test)]
 mod tail_merge_tests {
     use super::{merge_overlapping_chunks, scale_valid_frames};
@@ -507,10 +485,4 @@ fn build_npu_ffi(path: &Path) -> Result<QnnSession> {
     )?;
     QnnSession::load(env_ptr, &npu_devs, path, contract, provider_lease)
         .with_context(|| format!("load NPU {}", path.display()))
-}
-
-fn num_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4)
 }

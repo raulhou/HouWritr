@@ -813,6 +813,18 @@ impl SettingsApp {
         ui.horizontal_wrapped(|ui| {
             self.dirty |= ui
                 .checkbox(
+                    &mut self.settings.diarize_speakers,
+                    "Label speakers in file and meeting transcripts",
+                )
+                .changed();
+            info_button(
+                ui,
+                "Adds \"Speaker 1:\", \"Speaker 2:\" … labels using small on-device models (about 32 MB, downloaded the first time you use it, run on the CPU). Nothing is sent anywhere; accuracy drops with overlapping talk or poor audio.",
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            self.dirty |= ui
+                .checkbox(
                     &mut self.settings.markdown_transcripts,
                     "Save file and meeting transcripts as Markdown",
                 )

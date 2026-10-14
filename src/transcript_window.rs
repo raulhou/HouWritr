@@ -28,6 +28,7 @@ pub const PREVIEW_CHARS: usize = 2_000;
 pub enum Stage {
     Decoding,
     Queued,
+    Diarizing,
     Transcribing,
     CleaningUp,
 }
@@ -37,6 +38,7 @@ impl Stage {
         match self {
             Stage::Decoding => "Reading audio…",
             Stage::Queued => "Waiting for the engine…",
+            Stage::Diarizing => "Identifying speakers",
             Stage::Transcribing => "Transcribing",
             Stage::CleaningUp => "Cleaning up with AI",
         }
@@ -67,6 +69,9 @@ pub enum WindowMsg {
         chars: usize,
         preview: String,
         warning: Option<String>,
+        /// Number of labelled speakers; `None` when not labelled.
+        #[serde(default)]
+        speakers: Option<usize>,
     },
     Failed {
         error: String,
@@ -100,6 +105,7 @@ pub struct Finished {
     pub chars: usize,
     pub preview: String,
     pub warning: Option<String>,
+    pub speakers: Option<usize>,
 }
 
 impl WindowState {
@@ -156,6 +162,7 @@ impl WindowState {
                 chars,
                 preview,
                 warning,
+                speakers,
             } => {
                 self.output_path = output_path;
                 self.finished = Some(Finished {
@@ -163,6 +170,7 @@ impl WindowState {
                     chars,
                     preview,
                     warning,
+                    speakers,
                 });
                 self.error = None;
             }
@@ -456,6 +464,9 @@ impl eframe::App for TranscriptWindow {
                             "Size",
                             &format!("{} words · {} characters", done.words, done.chars),
                         );
+                        if let Some(speakers) = done.speakers {
+                            row(ui, "Speakers", &format!("{speakers} identified"));
+                        }
                     }
                 });
 
@@ -532,6 +543,7 @@ mod tests {
                 chars: 55,
                 preview: "line\nbreak".into(),
                 warning: Some("no cleanup".into()),
+                speakers: Some(2),
             },
             WindowMsg::Failed {
                 error: "boom".into(),
@@ -597,6 +609,7 @@ mod tests {
                 chars: 11,
                 preview: "a b c".into(),
                 warning: None,
+                speakers: None,
             },
             base,
         );

@@ -7,6 +7,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+pub mod diarize;
 mod hardware;
 mod ort_helpers;
 mod parakeet;
@@ -41,6 +42,23 @@ pub fn whisper_hardware_status() -> Result<String> {
         }
         EngineSupport::Unsupported { reason } => format!("unavailable: {reason}"),
     })
+}
+
+/// Diarize `samples` (16 kHz mono) with the pinned diarization models,
+/// downloading them on first use. Runs on the CPU, so it works on every
+/// build, independent of the selected transcription engine.
+pub fn diarize_speakers(
+    samples: &[f32],
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<Vec<diarize::Turn>> {
+    use crate::model_manager::{CancellationToken, ModelManager};
+    qnn_ffi::initialize_ort_runtime()?;
+    let models = ModelManager::new().map_err(|error| anyhow::anyhow!(error))?;
+    let directory = models
+        .ensure("diarization", &CancellationToken::default(), |_| {})
+        .map_err(|error| anyhow::anyhow!(error))?;
+    diarize::Diarizer::load(&directory)?.diarize(samples, cancelled, progress)
 }
 
 pub fn load_from_dir(name: &str, model_dir: PathBuf) -> Result<Box<dyn Engine>> {

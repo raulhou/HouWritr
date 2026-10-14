@@ -20,7 +20,8 @@ use crate::{
     transcript_window::{self, WindowMsg},
     tray,
     worker::{
-        DeliveryTarget, JobConfig, JobStage, RecordingIntent, ShutdownMode, Worker, WorkerEvent,
+        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, ShutdownMode,
+        Worker, WorkerEvent,
     },
 };
 use anyhow::Result;
@@ -1621,6 +1622,7 @@ impl AppHandler {
         job: FileJob,
         text: &str,
         notes: Option<String>,
+        diarization: DiarizationOutcome,
         cleanup_warning: Option<FallbackReason>,
     ) {
         let windowed = job.window.is_some();
@@ -1698,14 +1700,27 @@ impl AppHandler {
             "AI cleanup"
         };
         let (words, chars, preview) = transcript_window::summarize(text);
+        // Warnings for the popup: AI problems and unavailable speaker labels.
+        let mut warnings = Vec::new();
+        if cleanup_warning.is_some() {
+            warnings.push(format!(
+                "Saved without {missing}: provider or credential problem."
+            ));
+        }
+        if let DiarizationOutcome::Failed(reason) = &diarization {
+            warnings.push(format!("Speaker labels unavailable: {reason}"));
+        }
+        let speakers = match &diarization {
+            DiarizationOutcome::Labelled { speakers } => Some(*speakers),
+            _ => None,
+        };
         let shown = job.tell_window(WindowMsg::Done {
             output_path: output.display().to_string(),
             words,
             chars,
             preview,
-            warning: cleanup_warning
-                .as_ref()
-                .map(|_| format!("Saved without {missing}: provider or credential problem.")),
+            warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+            speakers,
         });
         // The popup has "Show in folder"; only pop Explorer open ourselves
         // when nothing is showing the result (meetings, or popup closed).
@@ -1725,12 +1740,24 @@ impl AppHandler {
                 true,
                 &format!("Saved {name} without {missing} (provider or credential problem)"),
             );
+        } else if let DiarizationOutcome::Failed(reason) = &diarization {
+            self.report_long_form(
+                windowed,
+                true,
+                &format!(
+                    "Saved {name} without speaker labels ({})",
+                    short_error(reason)
+                ),
+            );
         } else {
-            let message = if notes_saved {
+            let mut message = if notes_saved {
                 format!("Saved {name} and meeting notes")
             } else {
                 format!("Saved {name} and copied to clipboard")
             };
+            if let DiarizationOutcome::Labelled { speakers } = &diarization {
+                message.push_str(&format!(" · {speakers} speakers"));
+            }
             self.report_long_form(windowed, false, &message);
         }
     }
@@ -1838,6 +1865,7 @@ impl AppHandler {
                 total,
             } => {
                 let stage = match stage {
+                    JobStage::Diarizing => transcript_window::Stage::Diarizing,
                     JobStage::Transcribing => transcript_window::Stage::Transcribing,
                     JobStage::CleaningUp => transcript_window::Stage::CleaningUp,
                 };
@@ -1869,6 +1897,7 @@ impl AppHandler {
             WorkerEvent::JobCompleted {
                 id,
                 text,
+                diarization,
                 notes,
                 auto_paste,
                 enhancement_warning,
@@ -1892,7 +1921,13 @@ impl AppHandler {
                     return;
                 }
                 if let Some(job) = file_output {
-                    self.deliver_file_transcript(job, &text, notes, enhancement_warning);
+                    self.deliver_file_transcript(
+                        job,
+                        &text,
+                        notes,
+                        diarization,
+                        enhancement_warning,
+                    );
                     return;
                 }
                 if text.is_empty() {

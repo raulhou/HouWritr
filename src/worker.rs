@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownMode {
@@ -40,6 +40,8 @@ pub struct JobConfig {
     /// Imported files and meetings: transcribed in silence-aligned windows
     /// instead of one pass, never LLM-enhanced, never pasted.
     long_form: bool,
+    /// Label speakers (long-form jobs only; needs the diarization models).
+    diarize: bool,
     /// Also ask the provider for structured meeting notes (implies
     /// `long_form`); the notes are placed above the transcript.
     notes: bool,
@@ -57,12 +59,14 @@ impl JobConfig {
             intent,
             delivery_target,
             long_form: false,
+            diarize: false,
             notes: false,
         }
     }
 
     pub fn long_form(settings: Settings) -> Self {
         Self {
+            diarize: settings.diarize_speakers,
             settings,
             intent: RecordingIntent::Raw,
             delivery_target: None,
@@ -91,8 +95,22 @@ impl JobConfig {
 /// Which long-running phase a [`WorkerEvent::JobProgress`] belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobStage {
+    Diarizing,
     Transcribing,
     CleaningUp,
+}
+
+/// What happened to the optional "label the speakers" step of a job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiarizationOutcome {
+    /// Not requested (dictation, or the setting is off).
+    NotRequested,
+    /// The transcript carries `Speaker N:` labels for this many speakers.
+    Labelled { speakers: usize },
+    /// Only one speaker was found, so nothing was labelled.
+    SingleSpeaker,
+    /// Diarization failed; the transcript is unlabelled. Content-free reason.
+    Failed(String),
 }
 
 pub enum WorkerEvent {
@@ -132,6 +150,7 @@ pub enum WorkerEvent {
     JobCompleted {
         id: u64,
         text: String,
+        diarization: DiarizationOutcome,
         /// Structured meeting notes, kept apart from the transcript so the
         /// caller can save them as their own file. `Some` only for notes jobs
         /// whose generation succeeded.
@@ -659,24 +678,66 @@ fn worker_main(
                     .as_mut()
                     .expect("validated engine generation is missing");
                 let started = Instant::now();
+                let mut diarization = DiarizationOutcome::NotRequested;
                 let transcription = if job.config.long_form {
-                    transcribe_long_form(
-                        &mut **active_engine,
-                        &job.samples,
-                        job.sample_rate,
-                        || {
-                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                                .is_some()
-                        },
-                        |done, total| {
-                            let _ = event_tx.send(WorkerEvent::JobProgress {
-                                id: job.id,
-                                stage: JobStage::Transcribing,
-                                done,
-                                total,
-                            });
-                        },
-                    )
+                    let interrupted = || {
+                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
+                            .is_some()
+                    };
+                    let send_progress = |stage: JobStage, done: usize, total: usize| {
+                        let _ = event_tx.send(WorkerEvent::JobProgress {
+                            id: job.id,
+                            stage,
+                            done,
+                            total,
+                        });
+                    };
+                    let turns = if job.config.diarize {
+                        send_progress(JobStage::Diarizing, 0, 0);
+                        match asr::diarize_speakers(
+                            &job.samples,
+                            &interrupted,
+                            &mut |done, total| send_progress(JobStage::Diarizing, done, total),
+                        ) {
+                            Ok(turns) => {
+                                let speakers = asr::diarize::speaker_count(&turns);
+                                if speakers >= 2 {
+                                    diarization = DiarizationOutcome::Labelled { speakers };
+                                    Some(turns)
+                                } else {
+                                    diarization = DiarizationOutcome::SingleSpeaker;
+                                    None
+                                }
+                            }
+                            Err(error) => {
+                                // An interruption is handled right below by
+                                // the transcription step's own checks.
+                                warn!(error = %error, "speaker diarization failed; continuing without labels");
+                                diarization =
+                                    DiarizationOutcome::Failed(short_reason(&error.to_string()));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match turns {
+                        Some(turns) => transcribe_turns(
+                            &mut **active_engine,
+                            &job.samples,
+                            job.sample_rate,
+                            &turns,
+                            interrupted,
+                            |done, total| send_progress(JobStage::Transcribing, done, total),
+                        ),
+                        None => transcribe_long_form(
+                            &mut **active_engine,
+                            &job.samples,
+                            job.sample_rate,
+                            interrupted,
+                            |done, total| send_progress(JobStage::Transcribing, done, total),
+                        ),
+                    }
                 } else {
                     active_engine.transcribe(&job.samples, job.sample_rate)
                 };
@@ -789,6 +850,7 @@ fn worker_main(
                         WorkerEvent::JobCompleted {
                             id: job.id,
                             text: final_text,
+                            diarization,
                             notes: notes_text,
                             auto_paste: job.config.settings.auto_paste,
                             enhancement_warning,
@@ -878,6 +940,99 @@ fn transcribe_long_form(
         info!(window = index + 1, total, "long-form window transcribed");
     }
     Ok(transcript)
+}
+
+/// One engine call: a stretch of audio spoken by one speaker.
+#[derive(Debug, PartialEq, Eq)]
+struct TurnWindow {
+    range: std::ops::Range<usize>,
+    speaker: usize,
+}
+
+/// Turn → engine windows: each turn is padded by 0.1 s (never into a
+/// neighbouring turn) and long turns are split at quiet points to stay
+/// within the 30 s engine window.
+fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -> Vec<TurnWindow> {
+    // 0.1 s of context either side so word edges survive.
+    let pad = rate as usize / 10;
+    let mut windows = Vec::new();
+    for (index, turn) in turns.iter().enumerate() {
+        // Padding may only reach into the silence between turns, and each
+        // neighbour gets half of it, so windows never overlap.
+        let floor = match index.checked_sub(1).map(|i| &turns[i]) {
+            Some(previous) => previous.end + turn.start.saturating_sub(previous.end) / 2,
+            None => 0,
+        };
+        let ceiling = match turns.get(index + 1) {
+            Some(next) => turn.end + next.start.saturating_sub(turn.end) / 2,
+            None => samples.len(),
+        };
+        let start = turn.start.saturating_sub(pad).max(floor).min(turn.start);
+        let end = (turn.end + pad)
+            .min(ceiling)
+            .max(turn.end)
+            .min(samples.len());
+        if start >= end {
+            continue;
+        }
+        for sub in plan_long_form_windows(&samples[start..end], rate) {
+            windows.push(TurnWindow {
+                range: start + sub.start..start + sub.end,
+                speaker: turn.speaker,
+            });
+        }
+    }
+    windows
+}
+
+/// Transcribe speaker by speaker and label the result:
+/// `Speaker 1: …` blocks separated by blank lines; consecutive windows of
+/// the same speaker run together.
+fn transcribe_turns(
+    engine: &mut dyn Engine,
+    samples: &[f32],
+    sample_rate: u32,
+    turns: &[asr::diarize::Turn],
+    interrupted: impl Fn() -> bool,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<String> {
+    let windows = plan_turn_windows(turns, samples, sample_rate);
+    let total = windows.len();
+    let mut transcript = String::new();
+    let mut current: Option<usize> = None;
+    progress(0, total);
+    for (index, window) in windows.into_iter().enumerate() {
+        // The caller re-checks interruption and discards the partial text.
+        if interrupted() {
+            break;
+        }
+        let text = engine.transcribe(&samples[window.range], sample_rate)?;
+        let text = text.trim();
+        if !text.is_empty() {
+            if current == Some(window.speaker) {
+                transcript.push(' ');
+                transcript.push_str(text);
+            } else {
+                if !transcript.is_empty() {
+                    transcript.push_str("\n\n");
+                }
+                transcript.push_str(&format!("Speaker {}: {text}", window.speaker + 1));
+                current = Some(window.speaker);
+            }
+        }
+        progress(index + 1, total);
+    }
+    Ok(transcript)
+}
+
+/// Short, single-line version of an error for user-facing notices.
+fn short_reason(error: &str) -> String {
+    let first_line = error.lines().next().unwrap_or_default();
+    let mut text: String = first_line.chars().take(120).collect();
+    if first_line.chars().count() > 120 {
+        text.push('…');
+    }
+    text
 }
 
 fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>) {
@@ -1355,6 +1510,7 @@ mod tests {
                 WorkerEvent::JobCompleted {
                     id: 41,
                     text: "done".into(),
+                    diarization: DiarizationOutcome::NotRequested,
                     notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
@@ -1372,6 +1528,7 @@ mod tests {
                 WorkerEvent::JobCompleted {
                     id: 41,
                     text: "late".into(),
+                    diarization: DiarizationOutcome::NotRequested,
                     notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
@@ -1380,6 +1537,90 @@ mod tests {
                 false,
             )
             .is_none());
+    }
+
+    fn turn(start: usize, end: usize, speaker: usize) -> asr::diarize::Turn {
+        asr::diarize::Turn {
+            start,
+            end,
+            speaker,
+        }
+    }
+
+    #[test]
+    fn turn_windows_are_padded_but_never_overlap_neighbours() {
+        let samples = vec![0.5f32; 16_000 * 10];
+        let windows = plan_turn_windows(
+            &[turn(16_000, 32_000, 0), turn(32_500, 48_000, 1)],
+            &samples,
+            16_000,
+        );
+        assert_eq!(windows.len(), 2);
+        // 0.1 s (1600 samples) of padding; the 500-sample gap between the
+        // turns is split down the middle.
+        assert_eq!(windows[0].range, 14_400..32_250);
+        assert_eq!(windows[1].range, 32_250..49_600);
+        assert!(windows[0].range.end <= windows[1].range.start);
+        assert_eq!((windows[0].speaker, windows[1].speaker), (0, 1));
+    }
+
+    #[test]
+    fn long_turns_are_split_for_the_engine() {
+        let samples = vec![0.5f32; 16_000 * 90];
+        let windows = plan_turn_windows(&[turn(0, 16_000 * 80, 2)], &samples, 16_000);
+        assert!(windows.len() >= 3);
+        assert!(windows.iter().all(|w| w.range.len() <= 16_000 * 30));
+        assert!(windows.iter().all(|w| w.speaker == 2));
+    }
+
+    struct EchoEngine;
+
+    impl Engine for EchoEngine {
+        fn transcribe(&mut self, samples: &[f32], _sample_rate: u32) -> Result<String> {
+            // The loudest sample encodes which turn this is (windows include
+            // a little silence of padding).
+            let peak = samples.iter().copied().fold(0.0f32, f32::max);
+            Ok(format!("w{}", peak as i32))
+        }
+
+        fn label(&self) -> &'static str {
+            "echo"
+        }
+    }
+
+    #[test]
+    fn turn_transcripts_are_labelled_and_merge_same_speaker_runs() {
+        let mut samples = vec![0.0f32; 16_000 * 6];
+        // Turns: spk0 [0,1s), spk0 [1.2s,2s), spk1 [3s,4s), spk0 [5s,6s)
+        for (range, value) in [
+            (0..16_000, 1.0),
+            (19_200..32_000, 2.0),
+            (48_000..64_000, 3.0),
+            (80_000..96_000, 4.0),
+        ] {
+            for s in &mut samples[range] {
+                *s = value;
+            }
+        }
+        let turns = [
+            turn(0, 16_000, 0),
+            turn(19_200, 32_000, 0),
+            turn(48_000, 64_000, 1),
+            turn(80_000, 96_000, 0),
+        ];
+        let mut seen = Vec::new();
+        let text = transcribe_turns(
+            &mut EchoEngine,
+            &samples,
+            16_000,
+            &turns,
+            || false,
+            |done, total| seen.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(text, "Speaker 1: w1 w2\n\nSpeaker 2: w3\n\nSpeaker 1: w4");
+        assert_eq!(seen.first(), Some(&(0, 4)));
+        assert_eq!(seen.last(), Some(&(4, 4)));
     }
 
     #[test]
