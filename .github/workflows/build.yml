@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -71,55 +71,16 @@ jobs:
           & target\release\package.exe --arch x64
           if ($LASTEXITCODE -ne 0) { throw "x64 ZIP packaging failed" }
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Build installers
-        shell: pwsh
-        run: |
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = $metadata.packages[0].version
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc /Qp "/DAppVersion=$version" installer\openwritr.iss
-          if ($LASTEXITCODE -ne 0) { throw "ARM64 installer build failed" }
-          & $iscc /Qp "/DAppVersion=$version" installer\openwritr-x64.iss
-          if ($LASTEXITCODE -ne 0) { throw "x64 installer build failed" }
-
-      - name: Build and verify MSIX packages
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') || (vars.MSIX_IDENTITY_NAME != '' && vars.MSIX_PUBLISHER != '') }}
-        shell: pwsh
-        env:
-          MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
-          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
-          IS_TAGGED_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        run: |
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = "$($metadata.packages[0].version).0"
-          if ($env:IS_TAGGED_RELEASE -eq "true") {
-            .\scripts\build_msix.ps1 -Version $version `
-              -IdentityName $env:MSIX_IDENTITY_NAME `
-              -Publisher $env:MSIX_PUBLISHER `
-              -RequireStoreIdentity
-          } else {
-            .\scripts\build_msix.ps1 -Version $version
-          }
-          python scripts\verify_artifact.py --arch arm64 --artifact "target\dist\openwritr-arm64-$version.msix" --format msix
-          python scripts\verify_artifact.py --arch x64 --artifact "target\dist\openwritr-x64-$version.msix" --format msix
-
-      - name: Report skipped Store package
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && (vars.MSIX_IDENTITY_NAME == '' || vars.MSIX_PUBLISHER == '') }}
-        shell: pwsh
-        run: |
-          Write-Warning "Skipping the Store bundle because MSIX_IDENTITY_NAME and MSIX_PUBLISHER are not configured."
-
-      # Store packages are signed during Partner Center ingestion. GitHub
-      # releases publish only the directly installable ZIP and Inno artifacts.
+      # Installer (Inno Setup), MSIX / Microsoft Store, and GitHub release
+      # publishing are intentionally disabled for now: the pipeline stops at
+      # the verified ZIP packages. Restore the steps from git history
+      # (before this change) to bring them back.
       - name: Generate SHA256SUMS
         shell: pwsh
         run: |
           Set-Location target\dist
           $files = Get-ChildItem openwritr-* -File |
-            Where-Object { $_.Extension -in ".exe", ".zip" } |
+            Where-Object { $_.Extension -eq ".zip" } |
             Sort-Object Name
           $lines = foreach ($file in $files) {
             "{0}  {1}" -f (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower(), $file.Name
@@ -133,42 +94,5 @@ jobs:
           name: openwritr-dist
           path: |
             target/dist/openwritr-windows-*.zip
-            target/dist/openwritr-windows-*-setup.exe
-            target/dist/openwritr-*.msix
-            target/dist/openwritr-*.msixbundle
             target/dist/SHA256SUMS.txt
           if-no-files-found: error
-
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            target/dist/openwritr-windows-*.zip
-            target/dist/openwritr-windows-*-setup.exe
-            target/dist/SHA256SUMS.txt
-
-      - name: Install Microsoft Store CLI
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: microsoft/microsoft-store-apppublisher@v1.1
-
-      - name: Publish update to Microsoft Store
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        env:
-          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
-          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
-          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
-          SELLER_ID: ${{ secrets.SELLER_ID }}
-          STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
-        run: |
-          msstore reconfigure `
-            --tenantId $env:AZURE_AD_TENANT_ID `
-            --sellerId $env:SELLER_ID `
-            --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID `
-            --clientSecret $env:AZURE_AD_APPLICATION_SECRET
-
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = "$($metadata.packages[0].version).0"
-          $bundle = Join-Path $PWD "target\dist\openwritr-$version.msixbundle"
-          msstore publish $bundle --appId $env:STORE_PRODUCT_ID
