@@ -100,6 +100,10 @@ struct FileJob {
     /// Meeting membership, with the settings snapshotted when the meeting
     /// began so every part is processed the same way.
     session: Option<(SessionPart, Settings)>,
+    /// The in-progress transcript of a meeting. Background parts append to it
+    /// (it is their `output`); the final job deletes it once the finished
+    /// transcript is saved.
+    partial: Option<PathBuf>,
 }
 
 impl FileJob {
@@ -121,6 +125,8 @@ impl FileJob {
 struct MeetingSession {
     id: u64,
     started: meeting::LocalTime,
+    /// The transcript so far, kept on disk while recording continues.
+    partial: PathBuf,
     /// Settings as they were when the meeting began.
     settings: Settings,
 }
@@ -1488,6 +1494,7 @@ impl AppHandler {
             window: Some(window),
             background: false,
             session: None,
+            partial: None,
         };
         self.dispatch_long_form(samples, job, "file");
     }
@@ -1613,9 +1620,11 @@ impl AppHandler {
                 let sources = recorder.sources();
                 let id = self.state.next_meeting_session;
                 self.state.next_meeting_session += 1;
+                let started = meeting::LocalTime::now();
                 self.state.meeting_session = Some(MeetingSession {
                     id,
-                    started: meeting::LocalTime::now(),
+                    started,
+                    partial: media::unique_path(meeting::partial_output_path(started)),
                     settings: self.state.settings.clone(),
                 });
                 self.state.meeting = Some(recorder);
@@ -1708,7 +1717,11 @@ impl AppHandler {
         let Some(session) = &self.state.meeting_session else {
             return;
         };
-        let (id, settings) = (session.id, session.settings.clone());
+        let (id, settings, partial) = (
+            session.id,
+            session.settings.clone(),
+            session.partial.clone(),
+        );
         let pieces = media::plan_windows(
             &segment.samples,
             media::TARGET_RATE,
@@ -1722,7 +1735,8 @@ impl AppHandler {
                 last: false,
             };
             let job = FileJob {
-                output: PathBuf::new(),
+                // Where this part's text is appended as soon as it is ready.
+                output: partial.clone(),
                 markdown: false,
                 notes: false,
                 notes_output: None,
@@ -1731,6 +1745,7 @@ impl AppHandler {
                 window: None,
                 background: true,
                 session: Some((part, settings.clone())),
+                partial: None,
             };
             self.dispatch_long_form(segment.samples[range].to_vec(), job, "meeting part");
         }
@@ -1829,6 +1844,7 @@ impl AppHandler {
             notes_output,
             window: None,
             background: false,
+            partial: Some(pending.session.partial),
             session: Some((part, pending.session.settings)),
             title: format!(
                 "Meeting {:04}-{:02}-{:02} {:02}:{:02}",
@@ -1909,6 +1925,11 @@ impl AppHandler {
             return;
         }
         info!(file = %output.display(), chars = text.chars().count(), "transcript saved");
+        // The finished transcript supersedes the in-progress one. (If saving
+        // failed above we returned earlier and the partial file is kept.)
+        if let Some(partial) = &job.partial {
+            let _ = std::fs::remove_file(partial);
+        }
         if let Err(error) = paste::deliver(text, paste::DeliveryMode::Clipboard) {
             warn!(error = %error, "failed to copy transcript to clipboard");
         }
@@ -2166,8 +2187,12 @@ impl AppHandler {
                 }
                 if let Some(job) = file_output {
                     if job.background {
-                        // A non-final meeting part: its text lives in the
-                        // worker until the final part stitches the meeting.
+                        // A non-final meeting part. The worker keeps its text
+                        // for the final stitch; here it only extends the
+                        // in-progress transcript on disk.
+                        if let Err(error) = meeting::append_partial(&job.output, &text) {
+                            warn!(error = %error, "could not extend the in-progress transcript");
+                        }
                         return;
                     }
                     self.deliver_file_transcript(
@@ -2736,6 +2761,7 @@ mod tests {
             window: window.then(|| std::sync::mpsc::channel().0),
             background,
             session: None,
+            partial: None,
         }
     }
 

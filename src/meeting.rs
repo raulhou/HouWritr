@@ -7,7 +7,7 @@
 //! system is silent, so each track re-synchronises to the wall clock when it
 //! falls behind; otherwise the two sources would drift apart.
 //!
-//! Audio is handed out as it is recorded: every hour, and whenever the
+//! Audio is handed out as it is recorded: every five minutes, and whenever the
 //! recording is paused, the finished part is detached from the front of the
 //! buffer for transcription while capture carries on. Positions are global
 //! sample indices on the whole meeting's timeline, so cutting a part never
@@ -28,14 +28,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Hard limit on one meeting. Memory no longer grows with it: finished hours
+/// Hard limit on one meeting. Memory no longer grows with it: finished parts
 /// are handed to the transcriber and released.
 const MAX_MEETING_SECONDS: usize = 12 * 3600;
 const MAX_SAMPLES: usize = MAX_MEETING_SECONDS * TARGET_RATE as usize;
 /// Audio is cut off for transcription once this much is waiting. The
 /// `OPENWRITR_ROLL_SECONDS` environment variable shortens it so the rolling
-/// behaviour can be tried in minutes instead of hours.
-const ROLL_SECONDS: usize = 3600;
+/// behaviour can be tried with shorter parts.
+const ROLL_SECONDS: usize = 5 * 60;
 /// A pause only hands out a part if at least this much was recorded since
 /// the previous cut.
 pub const MIN_PAUSE_SEGMENT_SAMPLES: usize = 5 * TARGET_RATE as usize;
@@ -324,7 +324,7 @@ impl MeetingRecorder {
     }
 
     /// Whether enough audio is waiting to be handed out for transcription
-    /// (one hour, or `OPENWRITR_ROLL_SECONDS`).
+    /// (five minutes, or `OPENWRITR_ROLL_SECONDS`).
     pub fn roll_due(&self) -> bool {
         self.shared.mix.lock().pending() >= roll_samples()
     }
@@ -573,6 +573,40 @@ pub fn default_output_path(local_time: LocalTime) -> std::path::PathBuf {
     ))
 }
 
+/// Where the transcript of a meeting in progress is kept while it is being
+/// recorded: `Meeting YYYY-MM-DD HH-MM (in progress).txt`. Each finished part
+/// is appended; it is deleted once the final transcript has been saved.
+pub fn partial_output_path(local_time: LocalTime) -> std::path::PathBuf {
+    let mut path = default_output_path(local_time);
+    path.set_file_name(format!(
+        "Meeting {:04}-{:02}-{:02} {:02}-{:02} (in progress).txt",
+        local_time.year, local_time.month, local_time.day, local_time.hour, local_time.minute
+    ));
+    path
+}
+
+/// Append one finished part to the in-progress transcript, blank-line
+/// separated. Empty text is ignored.
+pub fn append_partial(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let has_content = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if has_content {
+        file.write_all(b"\n\n")?;
+    }
+    file.write_all(text.as_bytes())
+}
+
 /// Notes path next to the transcript:
 /// `Documents\OpenWritr\Meetings\Meeting notes YYYY-MM-DD HH-MM.md`.
 pub fn default_notes_path(local_time: LocalTime) -> std::path::PathBuf {
@@ -803,10 +837,37 @@ mod tests {
     }
 
     #[test]
-    fn the_roll_threshold_defaults_to_an_hour() {
+    fn the_in_progress_transcript_grows_part_by_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("Meetings")
+            .join("Meeting (in progress).txt");
+        append_partial(&path, "  first part ").unwrap();
+        append_partial(&path, "").unwrap(); // ignored
+        append_partial(&path, "second part").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first part\n\nsecond part"
+        );
+
+        let time = LocalTime {
+            year: 2026,
+            month: 3,
+            day: 9,
+            hour: 14,
+            minute: 5,
+        };
+        let partial = partial_output_path(time);
+        assert!(partial.ends_with("Meetings/Meeting 2026-03-09 14-05 (in progress).txt"));
+        assert_eq!(partial.parent(), default_output_path(time).parent());
+    }
+
+    #[test]
+    fn the_roll_threshold_defaults_to_five_minutes() {
         // (The override is read from the environment, which tests don't set.)
         if std::env::var_os("OPENWRITR_ROLL_SECONDS").is_none() {
-            assert_eq!(roll_samples(), 3_600 * TARGET_RATE as usize);
+            assert_eq!(roll_samples(), 300 * TARGET_RATE as usize);
         }
         assert_eq!(MIN_PAUSE_SEGMENT_SAMPLES, 5 * TARGET_RATE as usize);
     }

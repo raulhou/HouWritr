@@ -708,17 +708,17 @@ fn worker_main(
                             let completed = if part.last {
                                 let state = sessions.remove(&part.id).unwrap_or_default();
                                 let (text, diarization, warning) = state.finish(
-                                    placeholder,
+                                    placeholder.clone(),
                                     None,
                                     DiarizationOutcome::NotRequested,
                                 );
                                 Some((text, diarization, warning))
                             } else {
-                                state.parts.push(placeholder);
+                                state.parts.push(placeholder.clone());
                                 None
                             };
                             let (text, diarization, warning) = completed.unwrap_or_else(|| {
-                                (String::new(), DiarizationOutcome::NotRequested, None)
+                                (placeholder, DiarizationOutcome::NotRequested, None)
                             });
                             let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
                             let _ = event_tx.send(WorkerEvent::JobCompleted {
@@ -929,15 +929,18 @@ fn worker_main(
                                 state.finish(final_text, enhancement_warning, diarization);
                             (text, warning, outcome)
                         } else {
-                            state.parts.push(final_text);
+                            state.parts.push(final_text.clone());
                             let _transition = transition_gate.lock();
+                            // The part's text goes along so the app can keep
+                            // an in-progress transcript on disk; the final
+                            // delivery still comes from the stitched whole.
                             let event = terminal_job_event(
                                 job.id,
                                 &discard_requested,
                                 &engine_cancellation,
                                 || WorkerEvent::JobCompleted {
                                     id: job.id,
-                                    text: String::new(),
+                                    text: final_text,
                                     diarization: DiarizationOutcome::NotRequested,
                                     notes: None,
                                     auto_paste: false,
@@ -2181,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_parts_complete_quietly_and_the_last_one_carries_the_transcript() {
+    fn rolling_parts_report_their_own_text_and_the_last_one_carries_the_transcript() {
         let (mut worker, _, _, _) = worker(&[], None);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
@@ -2220,8 +2223,8 @@ mod tests {
         assert_eq!(
             completed,
             vec![
-                (ids[0], String::new()),
-                (ids[1], String::new()),
+                (ids[0], "1".to_string()),
+                (ids[1], "2".to_string()),
                 (ids[2], "1 2 3".to_string()),
             ]
         );

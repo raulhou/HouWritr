@@ -115,22 +115,25 @@ Both live in the tray menu and run fully offline on the selected engine.
   meeting is recording, or while the question is open, saves the transcript
   without notes.
 
-  **Rolling transcription.** Long meetings are transcribed while they are
-  being recorded: whenever an hour of audio has built up, and whenever you
-  pause, the finished part is cut off (at a quiet moment, so words are not
-  split) and transcribed in the background while recording continues. When
-  you stop, only the last stretch is left to transcribe, and the parts are
-  stuck together into one transcript. Memory use stays around one hour of
-  audio however long the meeting runs, and the tray icon and recording
-  indicator keep showing that you are recording (the tray tooltip mentions
-  that earlier parts are being transcribed). Dictating with the hotkey still
-  works during a meeting; background parts are processed in pieces of at most
-  five minutes so a dictation never waits behind a whole hour. Speaker labels
-  stay consistent across parts (Speaker 1 in the first hour is Speaker 1 in
-  the last), and `[m:ss]` markers count from the start of the meeting. If a
-  part cannot be transcribed, the transcript says so at that point and the
-  rest is still delivered. If the engine is much slower than real time the
-  backlog of untranscribed audio grows in memory (about 230 MB per hour).
+  **Rolling transcription.** Meetings are transcribed while they are being
+  recorded: every five minutes of audio, and whenever you pause, the finished
+  part is cut off (at a quiet moment, so words are not split) and transcribed
+  in the background while recording continues. As each part is ready its text
+  is appended to `Meeting <date> <time> (in progress).txt` next to the final
+  transcript, so you can read the meeting so far, and nothing is lost if the
+  app or the PC dies mid-meeting. When you stop, only the last few minutes are
+  left to transcribe; the parts are stuck together into one transcript, saved
+  as the normal transcript file, and the in-progress file is deleted. Memory
+  use stays around five minutes of audio however long the meeting runs, and
+  the tray icon and recording indicator keep showing that you are recording
+  (the tray tooltip mentions that earlier parts are being transcribed).
+  Dictating with the hotkey still works during a meeting: it waits at most for
+  the part being transcribed. Speaker labels stay consistent across parts
+  (Speaker 1 in the first part is Speaker 1 in the last), and `[m:ss]` markers
+  count from the start of the meeting. If a part cannot be transcribed, the
+  transcript says so at that point and the rest is still delivered. If the
+  engine is much slower than real time the backlog of untranscribed audio
+  grows in memory (about 230 MB per hour of audio).
 
 Long audio is split into windows of at most 30 s at the quietest nearby point
 and transcribed in order. These jobs never paste. Transcription itself never
