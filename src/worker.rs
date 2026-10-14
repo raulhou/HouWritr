@@ -1,6 +1,7 @@
 use crate::asr::{self, Engine};
 use crate::cleanup::{EnhanceOutcome, FallbackReason};
 use crate::enhance;
+use crate::media;
 use crate::model_manager::{CancellationToken, ModelManager, ModelState};
 use crate::settings::Settings;
 use anyhow::{anyhow, Context, Result};
@@ -42,6 +43,8 @@ pub struct JobConfig {
     long_form: bool,
     /// Label speakers (long-form jobs only; needs the diarization models).
     diarize: bool,
+    /// Set for the parts of a rolling meeting transcription.
+    session: Option<SessionPart>,
     /// Also ask the provider for structured meeting notes (implies
     /// `long_form`); the notes are placed above the transcript.
     notes: bool,
@@ -60,6 +63,7 @@ impl JobConfig {
             delivery_target,
             long_form: false,
             diarize: false,
+            session: None,
             notes: false,
         }
     }
@@ -71,7 +75,17 @@ impl JobConfig {
             intent: RecordingIntent::Raw,
             delivery_target: None,
             long_form: true,
+            session: None,
             notes: false,
+        }
+    }
+
+    /// A meeting part: transcribed like a file, never delivered on its own.
+    pub fn meeting_part(settings: Settings, part: SessionPart, notes: bool) -> Self {
+        Self {
+            session: Some(part),
+            notes: notes && part.last,
+            ..Self::long_form(settings)
         }
     }
 
@@ -98,6 +112,19 @@ pub enum JobStage {
     Diarizing,
     Transcribing,
     CleaningUp,
+}
+
+/// One piece of a meeting recording that is being transcribed in parts while
+/// recording continues. All parts of a meeting share an `id`; the worker
+/// keeps their texts and speaker identities until the `last` part arrives
+/// and stitches everything together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionPart {
+    pub id: u64,
+    /// Where this part starts on the meeting's timeline (16 kHz samples), so
+    /// `[m:ss]` markers are meeting-global.
+    pub offset_samples: usize,
+    pub last: bool,
 }
 
 /// What happened to the optional "label the speakers" step of a job.
@@ -579,6 +606,9 @@ fn worker_main(
     let mut engine: Option<Box<dyn Engine>> = None;
     let mut engine_generation: Option<u64> = None;
     let mut engine_cancellation: Option<CancellationToken> = None;
+    // Rolling meeting transcriptions in progress. Jobs run one at a time on
+    // this thread, so the map needs no locking.
+    let mut sessions: HashMap<u64, SessionState> = HashMap::new();
     while let Ok(command) = command_rx.recv() {
         match command {
             Command::Load {
@@ -666,6 +696,42 @@ fn worker_main(
                             .map(CancellationToken::is_cancelled)
                             .unwrap_or(true)
                     {
+                        if let Some(part) = job.config.session {
+                            // Never lose a whole meeting because one part
+                            // met a reloading engine.
+                            let state = sessions.entry(part.id).or_default();
+                            let placeholder = failed_part_text(
+                                part.offset_samples,
+                                job.sample_rate,
+                                "the speech engine was not ready",
+                            );
+                            let completed = if part.last {
+                                let state = sessions.remove(&part.id).unwrap_or_default();
+                                let (text, diarization, warning) = state.finish(
+                                    placeholder,
+                                    None,
+                                    DiarizationOutcome::NotRequested,
+                                );
+                                Some((text, diarization, warning))
+                            } else {
+                                state.parts.push(placeholder);
+                                None
+                            };
+                            let (text, diarization, warning) = completed.unwrap_or_else(|| {
+                                (String::new(), DiarizationOutcome::NotRequested, None)
+                            });
+                            let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
+                            let _ = event_tx.send(WorkerEvent::JobCompleted {
+                                id: job.id,
+                                text,
+                                diarization,
+                                notes: None,
+                                auto_paste: false,
+                                enhancement_warning: warning,
+                                delivery_target: None,
+                            });
+                            continue;
+                        }
                         let _ = event_tx.send(WorkerEvent::JobFailed {
                             id: job.id,
                             error: "selected engine is not ready".into(),
@@ -692,23 +758,47 @@ fn worker_main(
                             total,
                         });
                     };
-                    let turns = if job.config.diarize {
+                    // Too little audio to identify anyone (e.g. the empty tail
+                    // of a meeting that was stopped right after a cut).
+                    let enough_audio = job.samples.len() >= job.sample_rate as usize;
+                    let turns = if job.config.diarize && enough_audio {
                         send_progress(JobStage::Diarizing, 0, 0);
                         match asr::diarize_speakers(
                             &job.samples,
                             &interrupted,
                             &mut |done, total| send_progress(JobStage::Diarizing, done, total),
                         ) {
-                            Ok(turns) => {
-                                let speakers = asr::diarize::speaker_count(&turns);
-                                if speakers >= 2 {
-                                    diarization = DiarizationOutcome::Labelled { speakers };
-                                    Some(turns)
-                                } else {
-                                    diarization = DiarizationOutcome::SingleSpeaker;
-                                    None
+                            Ok(result) => match job.config.session {
+                                // A part of a rolling meeting: speakers are
+                                // matched to everyone heard so far, and the
+                                // part is always labelled (the final job
+                                // strips labels if only one voice was ever
+                                // heard).
+                                Some(part) => {
+                                    let state = sessions.entry(part.id).or_default();
+                                    let mapping = state.speakers.assign(&result.centroids);
+                                    let mut turns = result.turns;
+                                    asr::diarize::remap_speakers(&mut turns, &mapping);
+                                    if turns.is_empty() {
+                                        None
+                                    } else {
+                                        diarization = DiarizationOutcome::Labelled {
+                                            speakers: state.speakers.len(),
+                                        };
+                                        Some(turns)
+                                    }
                                 }
-                            }
+                                None => {
+                                    let speakers = asr::diarize::speaker_count(&result.turns);
+                                    if speakers >= 2 {
+                                        diarization = DiarizationOutcome::Labelled { speakers };
+                                        Some(result.turns)
+                                    } else {
+                                        diarization = DiarizationOutcome::SingleSpeaker;
+                                        None
+                                    }
+                                }
+                            },
                             Err(error) => {
                                 // An interruption is handled right below by
                                 // the transcription step's own checks.
@@ -727,6 +817,7 @@ fn worker_main(
                             &job.samples,
                             job.sample_rate,
                             &turns,
+                            job.config.session.map_or(0, |part| part.offset_samples),
                             interrupted,
                             |done, total| send_progress(JobStage::Transcribing, done, total),
                         ),
@@ -741,8 +832,17 @@ fn worker_main(
                 } else {
                     active_engine.transcribe(&job.samples, job.sample_rate)
                 };
+                let mut transcription_failed = false;
                 let text = match transcription {
                     Ok(text) => text,
+                    // A failed part of a meeting becomes a visible gap; the
+                    // other parts are still delivered.
+                    Err(error) if job.config.session.is_some() => {
+                        warn!(error = %error, "meeting part failed; leaving a gap");
+                        transcription_failed = true;
+                        let offset = job.config.session.map_or(0, |part| part.offset_samples);
+                        failed_part_text(offset, job.sample_rate, &error.to_string())
+                    }
                     Err(error) => {
                         let _transition = transition_gate.lock();
                         let event = terminal_job_event(
@@ -768,7 +868,9 @@ fn worker_main(
                     }
                 }
 
-                let (final_text, enhancement_warning) = if job.config.should_enhance() {
+                let (final_text, enhancement_warning) = if job.config.should_enhance()
+                    && !transcription_failed
+                {
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
                     info!("enhancement requested");
                     // Speaker-labelled text carries [m:ss] markers; keep them
@@ -813,6 +915,41 @@ fn worker_main(
                     (restore_timestamps(&cleaned, &stamps), warning)
                 } else {
                     (text, None)
+                };
+
+                // Parts of a rolling meeting: remember everything but the last
+                // part's text; the last part carries the whole transcript.
+                let (final_text, enhancement_warning, diarization) = match job.config.session {
+                    Some(part) => {
+                        let state = sessions.entry(part.id).or_default();
+                        state.note_part(&diarization, &enhancement_warning);
+                        if part.last {
+                            let state = sessions.remove(&part.id).unwrap_or_default();
+                            let (text, outcome, warning) =
+                                state.finish(final_text, enhancement_warning, diarization);
+                            (text, warning, outcome)
+                        } else {
+                            state.parts.push(final_text);
+                            let _transition = transition_gate.lock();
+                            let event = terminal_job_event(
+                                job.id,
+                                &discard_requested,
+                                &engine_cancellation,
+                                || WorkerEvent::JobCompleted {
+                                    id: job.id,
+                                    text: String::new(),
+                                    diarization: DiarizationOutcome::NotRequested,
+                                    notes: None,
+                                    auto_paste: false,
+                                    enhancement_warning: None,
+                                    delivery_target: None,
+                                },
+                            );
+                            let _ = event_tx.send(event);
+                            continue;
+                        }
+                    }
+                    None => (final_text, enhancement_warning, diarization),
                 };
 
                 let (final_text, enhancement_warning, notes_text) = if job.config.notes {
@@ -886,46 +1023,15 @@ const LONG_FORM_WINDOW_SECONDS: usize = 30;
 /// Window cuts are placed at the quietest 100 ms inside this trailing span.
 const LONG_FORM_SEARCH_SECONDS: usize = 4;
 
-/// Centre of the quietest `frame`-sample stretch fully inside `range`
-/// (lowest energy, first one wins ties), or `None` if no frame fits.
-fn quietest_point(samples: &[f32], range: std::ops::Range<usize>, frame: usize) -> Option<usize> {
-    let mut best = None;
-    let mut quietest = f32::MAX;
-    let mut position = range.start;
-    while position + frame <= range.end {
-        let energy: f32 = samples[position..position + frame]
-            .iter()
-            .map(|sample| sample * sample)
-            .sum();
-        if energy < quietest {
-            quietest = energy;
-            best = Some(position + frame / 2);
-        }
-        position += frame;
-    }
-    best
-}
-
 /// Split `samples` into windows of at most 30 s, cutting each at the quietest
 /// point near the end so words are rarely bisected.
 fn plan_long_form_windows(samples: &[f32], sample_rate: u32) -> Vec<std::ops::Range<usize>> {
-    let rate = sample_rate.max(1) as usize;
-    let max_len = rate * LONG_FORM_WINDOW_SECONDS;
-    let search = rate * LONG_FORM_SEARCH_SECONDS;
-    let frame = (rate / 10).max(1);
-    let mut windows = Vec::new();
-    let mut start = 0;
-    while start < samples.len() {
-        if samples.len() - start <= max_len {
-            windows.push(start..samples.len());
-            break;
-        }
-        let hard_end = start + max_len;
-        let cut = quietest_point(samples, hard_end - search..hard_end, frame).unwrap_or(hard_end);
-        windows.push(start..cut);
-        start = cut;
-    }
-    windows
+    media::plan_windows(
+        samples,
+        sample_rate,
+        LONG_FORM_WINDOW_SECONDS,
+        LONG_FORM_SEARCH_SECONDS,
+    )
 }
 
 fn transcribe_long_form(
@@ -985,7 +1091,7 @@ fn plan_turn_windows(turns: &[asr::diarize::Turn], samples: &[f32], rate: u32) -
         let low = pair[0].end.min(len);
         let high = pair[1].start.max(low).min(len);
         let mut cut = if high - low >= frame {
-            quietest_point(samples, low..high, frame).unwrap_or((low + high) / 2)
+            media::quietest_point(samples, low..high, frame).unwrap_or((low + high) / 2)
         } else {
             (low + high) / 2
         };
@@ -1030,6 +1136,7 @@ fn transcribe_turns(
     samples: &[f32],
     sample_rate: u32,
     turns: &[asr::diarize::Turn],
+    offset_samples: usize,
     interrupted: impl Fn() -> bool,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<String> {
@@ -1054,7 +1161,7 @@ fn transcribe_turns(
                     transcript.push_str("\n\n");
                 }
                 let clock = crate::transcript_window::format_clock(
-                    (window.mark / sample_rate.max(1) as usize) as u64,
+                    ((window.mark + offset_samples) / sample_rate.max(1) as usize) as u64,
                 );
                 transcript.push_str(&format!("[{clock}] Speaker {}: {text}", window.speaker + 1));
                 current = Some(window.speaker);
@@ -1119,6 +1226,102 @@ fn short_reason(error: &str) -> String {
         text.push('…');
     }
     text
+}
+
+/// Worker-side memory of one rolling meeting transcription.
+#[derive(Default)]
+struct SessionState {
+    speakers: asr::diarize::SpeakerBook,
+    /// Finished (cleaned) texts of the earlier parts, in order.
+    parts: Vec<String>,
+    /// At least one part came back speaker-labelled.
+    labelled: bool,
+    diarization_failure: Option<String>,
+    cleanup_warning: Option<FallbackReason>,
+}
+
+impl SessionState {
+    /// Remember what a finished part contributed besides its text.
+    fn note_part(&mut self, diarization: &DiarizationOutcome, warning: &Option<FallbackReason>) {
+        match diarization {
+            DiarizationOutcome::Labelled { .. } => self.labelled = true,
+            DiarizationOutcome::Failed(reason) => {
+                self.diarization_failure
+                    .get_or_insert_with(|| reason.clone());
+            }
+            _ => {}
+        }
+        if self.cleanup_warning.is_none() {
+            self.cleanup_warning = warning.clone();
+        }
+    }
+
+    /// Stitch every earlier part and `own` (the last part's text) together.
+    fn finish(
+        self,
+        own: String,
+        own_warning: Option<FallbackReason>,
+        own_diarization: DiarizationOutcome,
+    ) -> (String, DiarizationOutcome, Option<FallbackReason>) {
+        let labelled =
+            self.labelled || matches!(own_diarization, DiarizationOutcome::Labelled { .. });
+        let speakers = self.speakers.len();
+        let mut pieces = self.parts;
+        pieces.push(own);
+        pieces.retain(|piece| !piece.trim().is_empty());
+        // Labelled transcripts are blocks; plain ones are one run-on string
+        // that the Markdown writer later breaks into paragraphs itself.
+        let separator = if labelled { "\n\n" } else { " " };
+        let mut text = pieces.join(separator);
+        let outcome = if labelled && speakers >= 2 {
+            DiarizationOutcome::Labelled { speakers }
+        } else if labelled {
+            // One person for the whole meeting: leave it unlabelled, exactly
+            // like a single-speaker file.
+            text = unlabel(&text);
+            DiarizationOutcome::SingleSpeaker
+        } else if let Some(reason) = self.diarization_failure {
+            DiarizationOutcome::Failed(reason)
+        } else {
+            own_diarization
+        };
+        (text, outcome, own_warning.or(self.cleanup_warning))
+    }
+}
+
+/// Remove `[m:ss] Speaker N: ` prefixes and join the blocks into one run of
+/// text (the shape an unlabelled transcript has).
+fn unlabel(text: &str) -> String {
+    let (without_stamps, _) = strip_timestamps(text);
+    without_stamps
+        .split("\n\n")
+        .map(|block| {
+            let block = block.trim();
+            if let Some(rest) = block.strip_prefix("Speaker ") {
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                if digits > 0 {
+                    if let Some(tail) = rest[digits..].strip_prefix(": ") {
+                        return tail;
+                    }
+                }
+            }
+            block
+        })
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Visible stand-in for a part that could not be transcribed, so the rest of
+/// the meeting is still delivered.
+fn failed_part_text(offset_samples: usize, sample_rate: u32, reason: &str) -> String {
+    let clock = crate::transcript_window::format_clock(
+        (offset_samples / sample_rate.max(1) as usize) as u64,
+    );
+    format!(
+        "[The part of the recording starting at {clock} could not be transcribed: {}]",
+        short_reason(reason)
+    )
 }
 
 fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>) {
@@ -1790,6 +1993,7 @@ mod tests {
             &samples,
             16_000,
             &turns,
+            0,
             || false,
             |_, _| {},
         )
@@ -1844,6 +2048,7 @@ mod tests {
             &samples,
             16_000,
             &turns,
+            0,
             || false,
             |done, total| seen.push((done, total)),
         )
@@ -1854,6 +2059,172 @@ mod tests {
         );
         assert_eq!(seen.first(), Some(&(0, 4)));
         assert_eq!(seen.last(), Some(&(4, 4)));
+    }
+
+    fn state_with_speakers(count: usize) -> SessionState {
+        let mut state = SessionState::default();
+        // Orthogonal voice prints are always distinct people.
+        let voices: Vec<Vec<f32>> = (0..count)
+            .map(|i| {
+                let mut v = vec![0.0f32; count.max(1)];
+                v[i] = 1.0;
+                v
+            })
+            .collect();
+        state.speakers.assign(&voices);
+        state
+    }
+
+    #[test]
+    fn session_stitches_labelled_parts_as_blocks_with_global_speakers() {
+        let mut state = state_with_speakers(2);
+        state.labelled = true;
+        state.parts = vec!["[0:00] Speaker 1: hello".into(), String::new()];
+        let (text, outcome, warning) = state.finish(
+            "[1:00:00] Speaker 2: hi again".into(),
+            None,
+            DiarizationOutcome::Labelled { speakers: 2 },
+        );
+        assert_eq!(
+            text,
+            "[0:00] Speaker 1: hello\n\n[1:00:00] Speaker 2: hi again"
+        );
+        assert_eq!(outcome, DiarizationOutcome::Labelled { speakers: 2 });
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn a_meeting_with_one_voice_comes_out_unlabelled() {
+        let mut state = state_with_speakers(1);
+        state.labelled = true;
+        state.parts = vec!["[0:00] Speaker 1: one two".into()];
+        let (text, outcome, _) = state.finish(
+            "[1:00:00] Speaker 1: three".into(),
+            None,
+            DiarizationOutcome::Labelled { speakers: 1 },
+        );
+        assert_eq!(text, "one two three");
+        assert_eq!(outcome, DiarizationOutcome::SingleSpeaker);
+    }
+
+    #[test]
+    fn unlabelled_parts_run_together_and_empty_parts_vanish() {
+        let state = SessionState {
+            parts: vec!["one two".into(), "   ".into(), "three".into()],
+            ..Default::default()
+        };
+        let (text, outcome, _) =
+            state.finish("four".into(), None, DiarizationOutcome::NotRequested);
+        assert_eq!(text, "one two three four");
+        assert_eq!(outcome, DiarizationOutcome::NotRequested);
+
+        // A silent tail adds nothing.
+        let state = SessionState {
+            parts: vec!["only part".into()],
+            ..Default::default()
+        };
+        let (text, _, _) = state.finish(String::new(), None, DiarizationOutcome::NotRequested);
+        assert_eq!(text, "only part");
+    }
+
+    #[test]
+    fn session_reports_diarization_failure_and_keeps_the_first_warning() {
+        let mut state = SessionState::default();
+        state.note_part(
+            &DiarizationOutcome::Failed("model missing".into()),
+            &Some(FallbackReason::RequestFailed),
+        );
+        state.note_part(
+            &DiarizationOutcome::Failed("later".into()),
+            &Some(FallbackReason::MissingCredential),
+        );
+        let (_, outcome, warning) =
+            state.finish("x".into(), None, DiarizationOutcome::Failed("last".into()));
+        assert_eq!(outcome, DiarizationOutcome::Failed("model missing".into()));
+        assert_eq!(warning, Some(FallbackReason::RequestFailed));
+    }
+
+    #[test]
+    fn unlabel_removes_markers_and_labels() {
+        assert_eq!(
+            unlabel("[0:00] Speaker 1: hi\n\nSpeaker 12: there\n\n[1:02:05] Speaker 3: you"),
+            "hi there you"
+        );
+        assert_eq!(unlabel("no labels here"), "no labels here");
+        // Text that merely starts with the word is left alone.
+        assert_eq!(
+            unlabel("Speaker notes: important"),
+            "Speaker notes: important"
+        );
+    }
+
+    #[test]
+    fn failed_parts_leave_a_visible_gap_with_the_meeting_time() {
+        let text = failed_part_text(16_000 * 3_725, 16_000, "engine exploded\nsecond line");
+        assert_eq!(
+            text,
+            "[The part of the recording starting at 1:02:05 could not be transcribed: engine exploded]"
+        );
+    }
+
+    #[test]
+    fn meeting_part_configs_only_ask_for_notes_on_the_last_part() {
+        let part = |last| SessionPart {
+            id: 1,
+            offset_samples: 0,
+            last,
+        };
+        let settings = Settings::default();
+        assert!(!JobConfig::meeting_part(settings.clone(), part(false), true).notes);
+        assert!(JobConfig::meeting_part(settings.clone(), part(true), true).notes);
+        assert!(!JobConfig::meeting_part(settings, part(true), false).notes);
+    }
+
+    #[test]
+    fn rolling_parts_complete_quietly_and_the_last_one_carries_the_transcript() {
+        let (mut worker, _, _, _) = worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+
+        let mut ids = Vec::new();
+        for (index, level) in [1.0f32, 2.0, 3.0].into_iter().enumerate() {
+            let part = SessionPart {
+                id: 7,
+                offset_samples: index * 16_000,
+                last: index == 2,
+            };
+            ids.push(
+                worker
+                    .enqueue(
+                        vec![level; 16_000],
+                        16_000,
+                        JobConfig::meeting_part(settings.clone(), part, false),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == ids[2]),
+        );
+        let completed: Vec<(u64, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                WorkerEvent::JobCompleted { id, text, .. } => Some((*id, text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![
+                (ids[0], String::new()),
+                (ids[1], String::new()),
+                (ids[2], "1 2 3".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -2,10 +2,16 @@
 //! one 16 kHz mono timeline.
 //!
 //! Both sources are downsampled inside their audio callbacks and summed into
-//! a single shared `i16` buffer, so a five-hour meeting costs ~576 MB instead
-//! of two full-rate f32 copies. Loopback devices deliver nothing while the
+//! a single shared `i16` buffer (about 115 MB per hour) instead of two
+//! full-rate f32 copies. Loopback devices deliver nothing while the
 //! system is silent, so each track re-synchronises to the wall clock when it
 //! falls behind; otherwise the two sources would drift apart.
+//!
+//! Audio is handed out as it is recorded: every hour, and whenever the
+//! recording is paused, the finished part is detached from the front of the
+//! buffer for transcription while capture carries on. Positions are global
+//! sample indices on the whole meeting's timeline, so cutting a part never
+//! changes where later audio lands.
 //!
 //! Pausing closes the capture streams (so Windows' "microphone in use"
 //! indicator turns off) and stops the recording clock; resuming reopens the
@@ -16,13 +22,29 @@ use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const MAX_MEETING_SECONDS: usize = 5 * 3600;
+/// Hard limit on one meeting. Memory no longer grows with it: finished hours
+/// are handed to the transcriber and released.
+const MAX_MEETING_SECONDS: usize = 12 * 3600;
 const MAX_SAMPLES: usize = MAX_MEETING_SECONDS * TARGET_RATE as usize;
+/// Audio is cut off for transcription once this much is waiting. The
+/// `OPENWRITR_ROLL_SECONDS` environment variable shortens it so the rolling
+/// behaviour can be tried in minutes instead of hours.
+const ROLL_SECONDS: usize = 3600;
+/// A pause only hands out a part if at least this much was recorded since
+/// the previous cut.
+pub const MIN_PAUSE_SEGMENT_SAMPLES: usize = 5 * TARGET_RATE as usize;
+/// A rolling cut looks for the quietest 100 ms in this trailing window …
+const CUT_SEARCH_SAMPLES: usize = 10 * TARGET_RATE as usize;
+/// … ending this far before the newest audio, so a track that lags the
+/// others by a few hundred milliseconds never writes into released audio.
+const CUT_GUARD_SAMPLES: usize = TARGET_RATE as usize;
+const CUT_FRAME_SAMPLES: usize = TARGET_RATE as usize / 10;
 /// Resync a track once it lags the wall clock by more than this.
 const RESYNC_GAP_SAMPLES: usize = TARGET_RATE as usize / 2;
 
@@ -32,38 +54,54 @@ const CHUNK_SAMPLES: usize = 10 * 60 * TARGET_RATE as usize;
 /// The mixed recording, stored as fixed ten-minute chunks of `i16`.
 ///
 /// One growing `Vec` would reallocate and copy hundreds of megabytes inside
-/// the audio callback on a long meeting (stalling capture) and double its
-/// footprint at the end. Chunks are allocated once, never moved, and are
-/// freed one by one as the recording is converted for transcription.
+/// the audio callback on a long meeting (stalling capture). Chunks are
+/// allocated once and never moved; finished audio is detached from the front
+/// (whole chunks are moved out, not copied) and released.
 struct Mix {
-    chunks: Vec<Vec<i16>>,
+    /// Chunk `i` holds global samples `(base + i) * CHUNK ..`.
+    chunks: VecDeque<Vec<i16>>,
+    /// Chunks already released from the front.
+    base: usize,
+    /// Global samples already handed out.
+    taken: usize,
+    /// Global high-water mark of written samples.
     len: usize,
 }
 
 impl Mix {
     fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: VecDeque::new(),
+            base: 0,
+            taken: 0,
             len: 0,
         }
     }
 
-    fn len(&self) -> usize {
-        self.len
+    /// Samples recorded but not yet handed out.
+    fn pending(&self) -> usize {
+        self.len.saturating_sub(self.taken)
     }
 
     /// Sum `samples` (clamped to [-1, 1]) into the timeline at `position`,
-    /// saturating instead of wrapping.
+    /// saturating instead of wrapping. Anything that falls before audio that
+    /// was already handed out is dropped.
     fn add(&mut self, position: usize, samples: &[f32]) {
+        let skip = self.taken.saturating_sub(position).min(samples.len());
+        let position = position + skip;
+        let samples = &samples[skip..];
+        if samples.is_empty() {
+            return;
+        }
         let end = position + samples.len();
-        while self.chunks.len() * CHUNK_SAMPLES < end {
-            self.chunks.push(vec![0; CHUNK_SAMPLES]);
+        while (self.base + self.chunks.len()) * CHUNK_SAMPLES < end {
+            self.chunks.push_back(vec![0; CHUNK_SAMPLES]);
         }
         let (mut at, mut done) = (position, 0);
         while done < samples.len() {
             let offset = at % CHUNK_SAMPLES;
             let count = (CHUNK_SAMPLES - offset).min(samples.len() - done);
-            let chunk = &mut self.chunks[at / CHUNK_SAMPLES];
+            let chunk = &mut self.chunks[at / CHUNK_SAMPLES - self.base];
             for (slot, &sample) in chunk[offset..offset + count]
                 .iter_mut()
                 .zip(&samples[done..done + count])
@@ -77,30 +115,105 @@ impl Mix {
         self.len = self.len.max(end);
     }
 
-    /// The recording as f32, releasing each chunk as soon as it is read.
-    fn into_f32(self) -> Vec<f32> {
-        let mut out = Vec::with_capacity(self.len);
-        let mut remaining = self.len;
-        for chunk in self.chunks {
-            if remaining == 0 {
-                break;
+    /// The quietest `frame`-sample stretch inside `from..to` (lowest energy,
+    /// first one wins ties), as its centre sample.
+    fn quietest_point(&self, from: usize, to: usize, frame: usize) -> Option<usize> {
+        let from = from.max(self.taken);
+        let to = to.min(self.len);
+        let mut best = None;
+        let mut quietest = u64::MAX;
+        let mut position = from;
+        while position + frame <= to {
+            let mut energy = 0u64;
+            let mut at = position;
+            while at < position + frame {
+                let offset = at % CHUNK_SAMPLES;
+                let count = (CHUNK_SAMPLES - offset).min(position + frame - at);
+                let chunk = &self.chunks[at / CHUNK_SAMPLES - self.base];
+                energy += chunk[offset..offset + count]
+                    .iter()
+                    .map(|&s| (s as i64 * s as i64) as u64)
+                    .sum::<u64>();
+                at += count;
             }
-            let take = remaining.min(chunk.len());
-            out.extend(chunk[..take].iter().map(|&s| s as f32 / 32_768.0));
-            remaining -= take;
+            if energy < quietest {
+                quietest = energy;
+                best = Some(position + frame / 2);
+            }
+            position += frame;
         }
-        out
+        best
+    }
+
+    /// Hand out `taken..until`. Whole chunks are *moved* out (no copy) and a
+    /// partly used chunk is copied; chunks that are fully consumed are
+    /// released. Cheap enough to do under the lock the audio callbacks use.
+    fn detach(&mut self, until: usize) -> Vec<Vec<i16>> {
+        let until = until.min(self.len);
+        let mut parts = Vec::new();
+        let mut at = self.taken;
+        while at < until {
+            let offset = at % CHUNK_SAMPLES;
+            let count = (CHUNK_SAMPLES - offset).min(until - at);
+            let index = at / CHUNK_SAMPLES - self.base;
+            if offset == 0 && count == CHUNK_SAMPLES && index == 0 {
+                if let Some(chunk) = self.chunks.pop_front() {
+                    parts.push(chunk);
+                    self.base += 1;
+                }
+            } else {
+                parts.push(self.chunks[index][offset..offset + count].to_vec());
+                if offset + count == CHUNK_SAMPLES && index == 0 {
+                    self.chunks.pop_front();
+                    self.base += 1;
+                }
+            }
+            at += count;
+        }
+        self.taken = until.max(self.taken);
+        parts
+    }
+
+    /// Everything not yet handed out, as f32.
+    #[cfg(test)]
+    fn into_f32(mut self) -> Vec<f32> {
+        let until = self.len;
+        pieces_to_f32(self.detach(until))
     }
 
     #[cfg(test)]
     fn to_vec(&self) -> Vec<i16> {
-        self.chunks
-            .iter()
-            .flatten()
-            .copied()
-            .take(self.len)
+        (self.taken..self.len)
+            .map(|at| self.chunks[at / CHUNK_SAMPLES - self.base][at % CHUNK_SAMPLES])
             .collect()
     }
+}
+
+/// Convert detached pieces to f32, releasing each piece as it is read.
+fn pieces_to_f32(pieces: Vec<Vec<i16>>) -> Vec<f32> {
+    let total = pieces.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for piece in pieces {
+        out.extend(piece.iter().map(|&s| s as f32 / 32_768.0));
+    }
+    out
+}
+
+fn roll_samples() -> usize {
+    std::env::var("OPENWRITR_ROLL_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|seconds| *seconds >= 10)
+        .unwrap_or(ROLL_SECONDS)
+        * TARGET_RATE as usize
+}
+
+/// A finished stretch of the meeting, ready for transcription.
+pub struct Segment {
+    /// 16 kHz mono.
+    pub samples: Vec<f32>,
+    /// Where this part starts on the meeting's timeline, in samples.
+    pub start: usize,
 }
 
 struct Track {
@@ -210,6 +323,46 @@ impl MeetingRecorder {
         self.paused
     }
 
+    /// Whether enough audio is waiting to be handed out for transcription
+    /// (one hour, or `OPENWRITR_ROLL_SECONDS`).
+    pub fn roll_due(&self) -> bool {
+        self.shared.mix.lock().pending() >= roll_samples()
+    }
+
+    /// Detach the finished part of the recording while capture continues.
+    ///
+    /// With `quiet_cut` the part ends at the quietest 100 ms shortly before
+    /// the newest audio, so a word is rarely split between two parts. Without
+    /// it (a pause: nothing more is being recorded) everything recorded so
+    /// far is handed out. Returns `None` if less than `at_least` samples are
+    /// waiting.
+    pub fn take_segment(&mut self, quiet_cut: bool, at_least: usize) -> Option<Segment> {
+        let (parts, start) = {
+            let mut mix = self.shared.mix.lock();
+            if mix.pending() < at_least.max(1) {
+                return None;
+            }
+            let start = mix.taken;
+            let until = if quiet_cut {
+                let newest = mix.len.saturating_sub(CUT_GUARD_SAMPLES);
+                let from = newest.saturating_sub(CUT_SEARCH_SAMPLES);
+                mix.quietest_point(from, newest, CUT_FRAME_SAMPLES)
+                    .unwrap_or(newest)
+            } else {
+                mix.len
+            };
+            if until <= start {
+                return None;
+            }
+            (mix.detach(until), start)
+        };
+        // The conversion (tens of MB) happens outside the lock.
+        Some(Segment {
+            samples: pieces_to_f32(parts),
+            start,
+        })
+    }
+
     pub fn sources(&self) -> String {
         self.sources.join(" + ")
     }
@@ -227,15 +380,24 @@ impl MeetingRecorder {
         self.shared.failed.lock().clone()
     }
 
-    /// Stop capture and return the mixed 16 kHz mono recording.
-    pub fn finish(self) -> Vec<f32> {
+    /// Stop capture and return the remaining (not yet handed out) 16 kHz
+    /// mono audio with its start position on the meeting's timeline.
+    pub fn finish(self) -> Segment {
         let Self {
             streams, shared, ..
         } = self;
         drop(streams);
         shared.level_x10000.store(0, Ordering::Relaxed);
-        let mix = std::mem::replace(&mut *shared.mix.lock(), Mix::new());
-        mix.into_f32()
+        let (parts, start) = {
+            let mut mix = shared.mix.lock();
+            let start = mix.taken;
+            let until = mix.len;
+            (mix.detach(until), start)
+        };
+        Segment {
+            samples: pieces_to_f32(parts),
+            start,
+        }
     }
 }
 
@@ -508,7 +670,7 @@ mod tests {
         write(&shared, &mut track(vec![0.25; 100]));
         write(&shared, &mut track(vec![0.25; 100]));
         let mix = shared.mix.lock();
-        assert_eq!(mix.len(), 100);
+        assert_eq!(mix.len, 100);
         assert!(mix.to_vec().iter().all(|&s| (s - 16_383).abs() <= 2));
     }
 
@@ -518,7 +680,7 @@ mod tests {
         // 100 samples straddling the end of the first chunk.
         let start = CHUNK_SAMPLES - 40;
         mix.add(start, &[0.5; 100]);
-        assert_eq!(mix.len(), CHUNK_SAMPLES + 60);
+        assert_eq!(mix.len, CHUNK_SAMPLES + 60);
         assert_eq!(mix.chunks.len(), 2);
         let all = mix.to_vec();
         assert_eq!(all[start - 1], 0);
@@ -531,9 +693,122 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_is_five_hours_of_audio() {
-        assert_eq!(MAX_MEETING_SECONDS, 5 * 3600);
-        assert_eq!(MAX_SAMPLES, 288_000_000);
+    fn the_cap_is_twelve_hours_of_audio() {
+        assert_eq!(MAX_MEETING_SECONDS, 12 * 3600);
+        assert_eq!(MAX_SAMPLES, 691_200_000);
+    }
+
+    /// Value written at global sample `at`: distinct and recoverable, so a
+    /// test can check exactly which samples came out where.
+    fn marker(at: usize) -> f32 {
+        ((at % 20_000) as f32 + 1.0) / 40_000.0
+    }
+
+    fn fill(mix: &mut Mix, from: usize, to: usize) {
+        let samples: Vec<f32> = (from..to).map(marker).collect();
+        mix.add(from, &samples);
+    }
+
+    fn expected_i16(at: usize) -> i16 {
+        (marker(at).clamp(-1.0, 1.0) * 32_767.0) as i16
+    }
+
+    #[test]
+    fn detach_hands_out_exactly_the_written_audio_and_releases_chunks() {
+        let mut mix = Mix::new();
+        // Two and a bit chunks.
+        let total = 2 * CHUNK_SAMPLES + 5_000;
+        fill(&mut mix, 0, total);
+        assert_eq!(mix.chunks.len(), 3);
+
+        // Cut in the middle of the second chunk.
+        let cut = CHUNK_SAMPLES + 12_345;
+        let first = pieces_flat(mix.detach(cut));
+        assert_eq!(first.len(), cut);
+        assert!((0..cut)
+            .step_by(997)
+            .all(|at| first[at] == expected_i16(at)));
+        // The first chunk was moved out and released; the second is kept
+        // because audio after the cut still lives in it.
+        assert_eq!(mix.base, 1);
+        assert_eq!(mix.chunks.len(), 2);
+        assert_eq!(mix.taken, cut);
+        assert_eq!(mix.pending(), total - cut);
+
+        // The rest comes out with nothing lost or repeated.
+        let rest = pieces_flat(mix.detach(total));
+        assert_eq!(rest.len(), total - cut);
+        assert!((0..rest.len())
+            .step_by(1_009)
+            .all(|i| rest[i] == expected_i16(cut + i)));
+        assert_eq!(mix.base, 2);
+        assert_eq!(mix.pending(), 0);
+    }
+
+    fn pieces_flat(pieces: Vec<Vec<i16>>) -> Vec<i16> {
+        pieces.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn writes_after_a_cut_keep_their_global_position() {
+        let mut mix = Mix::new();
+        fill(&mut mix, 0, 30_000);
+        let _ = mix.detach(20_000);
+        // A later write lands where the global timeline says, leaving the
+        // samples in between silent.
+        fill(&mut mix, 35_000, 50_000);
+        let rest = mix.to_vec();
+        assert_eq!(rest.len(), 30_000);
+        assert_eq!(rest[0], expected_i16(20_000));
+        assert_eq!(rest[9_999], expected_i16(29_999));
+        assert_eq!(rest[12_000], 0, "the gap between writes stays silent");
+        assert_eq!(rest[15_000], expected_i16(35_000));
+        assert_eq!(rest[29_999], expected_i16(49_999));
+    }
+
+    #[test]
+    fn late_samples_for_released_audio_are_dropped_not_misplaced() {
+        let mut mix = Mix::new();
+        fill(&mut mix, 0, 10_000);
+        let _ = mix.detach(10_000);
+        // A lagging track writes 500 samples that straddle the cut.
+        let late: Vec<f32> = vec![0.5; 1_000];
+        mix.add(9_500, &late);
+        assert_eq!(mix.len, 10_500);
+        let rest = mix.to_vec();
+        assert_eq!(rest.len(), 500);
+        assert!(rest.iter().all(|&s| s == 16_383));
+    }
+
+    #[test]
+    fn quiet_point_is_found_in_the_silent_stretch() {
+        let mut mix = Mix::new();
+        let loud = vec![0.4f32; 60_000];
+        mix.add(0, &loud);
+        // 0.4 s of silence in the middle.
+        let silence = vec![0.0f32; 6_400];
+        let mut quiet = loud.clone();
+        quiet[30_000..36_400].copy_from_slice(&silence);
+        let mut mix2 = Mix::new();
+        mix2.add(0, &quiet);
+        let point = mix2
+            .quietest_point(0, 60_000, CUT_FRAME_SAMPLES)
+            .expect("a frame fits");
+        assert!((30_000..36_400).contains(&point), "cut {point}");
+        // Unchanged for the all-loud buffer: first frame wins.
+        assert_eq!(
+            mix.quietest_point(0, 60_000, CUT_FRAME_SAMPLES),
+            Some(CUT_FRAME_SAMPLES / 2)
+        );
+    }
+
+    #[test]
+    fn the_roll_threshold_defaults_to_an_hour() {
+        // (The override is read from the environment, which tests don't set.)
+        if std::env::var_os("OPENWRITR_ROLL_SECONDS").is_none() {
+            assert_eq!(roll_samples(), 3_600 * TARGET_RATE as usize);
+        }
+        assert_eq!(MIN_PAUSE_SEGMENT_SAMPLES, 5 * TARGET_RATE as usize);
     }
 
     #[test]

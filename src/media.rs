@@ -26,6 +26,58 @@ pub const TARGET_RATE: u32 = 16_000;
 /// limit so anything you can record you can also import.
 const MAX_FILE_SECONDS: usize = 5 * 3600;
 
+/// Centre of the quietest `frame`-sample stretch fully inside `range`
+/// (lowest energy, first one wins ties), or `None` if no frame fits.
+pub fn quietest_point(
+    samples: &[f32],
+    range: std::ops::Range<usize>,
+    frame: usize,
+) -> Option<usize> {
+    let mut best = None;
+    let mut quietest = f32::MAX;
+    let mut position = range.start;
+    while position + frame <= range.end {
+        let energy: f32 = samples[position..position + frame]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum();
+        if energy < quietest {
+            quietest = energy;
+            best = Some(position + frame / 2);
+        }
+        position += frame;
+    }
+    best
+}
+
+/// Split `samples` into consecutive windows of at most `max_seconds`, each cut
+/// at the quietest 100 ms in the trailing `search_seconds` so a word is rarely
+/// bisected. The windows tile the input exactly.
+pub fn plan_windows(
+    samples: &[f32],
+    sample_rate: u32,
+    max_seconds: usize,
+    search_seconds: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let rate = sample_rate.max(1) as usize;
+    let max_len = (rate * max_seconds).max(1);
+    let search = (rate * search_seconds).min(max_len.saturating_sub(1));
+    let frame = (rate / 10).max(1);
+    let mut windows = Vec::new();
+    let mut start = 0;
+    while start < samples.len() {
+        if samples.len() - start <= max_len {
+            windows.push(start..samples.len());
+            break;
+        }
+        let hard_end = start + max_len;
+        let cut = quietest_point(samples, hard_end - search..hard_end, frame).unwrap_or(hard_end);
+        windows.push(start..cut);
+        start = cut;
+    }
+    windows
+}
+
 /// Streaming mono downsampler (box filter over fractional input spans).
 ///
 /// Good enough for speech recognition, allocation-free per sample, and
@@ -324,6 +376,38 @@ mod tests {
         let body = "First para.\n\nSecond para.";
         let md = to_markdown("T", "d", body);
         assert!(md.ends_with("First para.\n\nSecond para.\n"));
+    }
+
+    #[test]
+    fn plan_windows_tile_the_input_and_respect_the_limit() {
+        // 100 "seconds" at 100 Hz with a limit of 30 s: every window <= 30 s.
+        let samples: Vec<f32> = (0..10_000).map(|i| ((i % 17) as f32) / 17.0).collect();
+        let windows = plan_windows(&samples, 100, 30, 4);
+        assert_eq!(windows.first().unwrap().start, 0);
+        assert_eq!(windows.last().unwrap().end, samples.len());
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        assert!(windows.iter().all(|w| w.len() <= 3_000 && !w.is_empty()));
+        assert!(windows.len() >= 4);
+        // Shorter than the limit stays whole; empty stays empty.
+        assert_eq!(plan_windows(&samples[..500], 100, 30, 4), vec![0..500]);
+        assert!(plan_windows(&[], 100, 30, 4).is_empty());
+    }
+
+    #[test]
+    fn plan_windows_cut_in_the_silence_before_the_limit() {
+        let rate = 1_000;
+        let mut samples = vec![0.5f32; 70_000];
+        // Silence at 28.0 s..28.4 s, inside the 4 s search before 30 s.
+        for s in &mut samples[28_000..28_400] {
+            *s = 0.0;
+        }
+        let windows = plan_windows(&samples, rate, 30, 4);
+        assert!((28_000..28_400).contains(&windows[0].end));
+        // A 5-minute limit works the same way.
+        let long = plan_windows(&vec![0.1f32; 700_000], rate, 300, 10);
+        assert!(long.iter().all(|w| w.len() <= 300_000));
     }
 
     #[test]

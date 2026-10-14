@@ -51,7 +51,7 @@ pub fn diarize_speakers(
     samples: &[f32],
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(usize, usize),
-) -> Result<Vec<diarize::Turn>> {
+) -> Result<diarize::Diarization> {
     use crate::model_manager::{CancellationToken, ModelManager};
     qnn_ffi::initialize_ort_runtime()?;
     // Not `new()`: that deletes in-flight staging directories, and the

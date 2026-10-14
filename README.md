@@ -105,15 +105,32 @@ Both live in the tray menu and run fully offline on the selected engine.
   source as `<name>.txt` (or `.md`) and copied to the clipboard.
 - **Start meeting recording / Stop meeting recording** captures your
   microphone and everything playing on the default output device (WASAPI
-  loopback) into one timeline, up to 5 hours (about 600 MB of memory while
-  recording). **Pause meeting recording**
+  loopback) into one timeline, up to 12 hours. **Pause meeting recording**
   stops capturing and releases the microphone (Windows' mic-in-use indicator
   turns off); **Resume** continues the same recording with no gap, and paused
   time is not recorded or counted. When you stop, OpenWritr asks whether to
   **also create meeting notes** (see below). The transcript is saved to
-  `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` and copied to the
-  clipboard. Quitting while a meeting is recording, or while the question is
-  open, saves the transcript without notes.
+  `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` (named after when
+  the meeting *started*) and copied to the clipboard. Quitting while a
+  meeting is recording, or while the question is open, saves the transcript
+  without notes.
+
+  **Rolling transcription.** Long meetings are transcribed while they are
+  being recorded: whenever an hour of audio has built up, and whenever you
+  pause, the finished part is cut off (at a quiet moment, so words are not
+  split) and transcribed in the background while recording continues. When
+  you stop, only the last stretch is left to transcribe, and the parts are
+  stuck together into one transcript. Memory use stays around one hour of
+  audio however long the meeting runs, and the tray icon and recording
+  indicator keep showing that you are recording (the tray tooltip mentions
+  that earlier parts are being transcribed). Dictating with the hotkey still
+  works during a meeting; background parts are processed in pieces of at most
+  five minutes so a dictation never waits behind a whole hour. Speaker labels
+  stay consistent across parts (Speaker 1 in the first hour is Speaker 1 in
+  the last), and `[m:ss]` markers count from the start of the meeting. If a
+  part cannot be transcribed, the transcript says so at that point and the
+  rest is still delivered. If the engine is much slower than real time the
+  backlog of untranscribed audio grows in memory (about 230 MB per hour).
 
 Long audio is split into windows of at most 30 s at the quietest nearby point
 and transcribed in order. These jobs never paste. Transcription itself never

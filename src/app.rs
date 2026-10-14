@@ -20,8 +20,8 @@ use crate::{
     transcript_window::{self, WindowMsg},
     tray,
     worker::{
-        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, ShutdownMode,
-        Worker, WorkerEvent,
+        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, SessionPart,
+        ShutdownMode, Worker, WorkerEvent,
     },
 };
 use anyhow::Result;
@@ -94,9 +94,21 @@ struct FileJob {
     details: String,
     /// Popup window for this job. `None` (meetings) keeps the overlay pill.
     window: Option<mpsc::Sender<WindowMsg>>,
+    /// A non-final part of a rolling meeting transcription: it only feeds the
+    /// worker's session and is never shown or delivered on its own.
+    background: bool,
+    /// Meeting membership, with the settings snapshotted when the meeting
+    /// began so every part is processed the same way.
+    session: Option<(SessionPart, Settings)>,
 }
 
 impl FileJob {
+    /// Jobs that must stay out of the dictation overlay's job queue: the
+    /// popup shows file jobs, and background meeting parts show nothing.
+    fn overlay_free(&self) -> bool {
+        self.window.is_some() || self.background
+    }
+
     /// Tell the popup something; a failed send just means it was closed.
     fn tell_window(&self, message: WindowMsg) -> bool {
         self.window
@@ -105,12 +117,26 @@ impl FileJob {
     }
 }
 
-/// A finished meeting recording waiting for the "create notes?" answer.
-struct PendingMeeting {
-    samples: Vec<f32>,
+/// A meeting being recorded: its parts are transcribed as they are cut.
+struct MeetingSession {
+    id: u64,
     started: meeting::LocalTime,
+    /// Settings as they were when the meeting began.
+    settings: Settings,
+}
+
+/// A finished meeting recording waiting for the "create notes?" answer. The
+/// final part is the audio recorded since the last rolling cut.
+struct PendingMeeting {
+    tail: meeting::Segment,
+    session: MeetingSession,
     recorded: Duration,
 }
+
+/// Rolling parts are queued as pieces of at most this long so that a
+/// dictation job never waits behind more than one short transcription.
+const MEETING_PIECE_SECONDS: usize = 300;
+const MEETING_PIECE_SEARCH_SECONDS: usize = 10;
 
 struct ActiveRecording {
     started: Instant,
@@ -320,6 +346,9 @@ struct State {
     meeting_indicator_override: Option<bool>,
     /// Recording finished; the notes question is open.
     pending_meeting: Option<PendingMeeting>,
+    /// The meeting being recorded, if any.
+    meeting_session: Option<MeetingSession>,
+    next_meeting_session: u64,
     /// Long-form jobs (imported files, meetings) mapped to their output file.
     file_jobs: HashMap<u64, FileJob>,
     file_import_running: bool,
@@ -429,6 +458,8 @@ pub fn run() -> Result<()> {
         meeting_overlay_enabled,
         meeting_indicator_override: None,
         pending_meeting: None,
+        meeting_session: None,
+        next_meeting_session: 1,
         file_jobs: HashMap::new(),
         file_import_running: false,
     };
@@ -942,6 +973,17 @@ impl AppHandler {
             }
         }
 
+        // Rolling transcription: an hour of finished audio goes to the
+        // transcriber while the recording carries on.
+        if self
+            .state
+            .meeting
+            .as_ref()
+            .is_some_and(|recorder| !recorder.is_paused() && recorder.roll_due())
+        {
+            self.roll_meeting_part();
+        }
+
         // Drain tray menu events.
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.state.tray.menu_quit_id {
@@ -1418,6 +1460,8 @@ impl AppHandler {
                 format_duration(seconds)
             ),
             window: Some(window),
+            background: false,
+            session: None,
         };
         self.dispatch_long_form(samples, job, "file");
     }
@@ -1429,10 +1473,10 @@ impl AppHandler {
             });
             return;
         }
-        let config = if job.notes {
-            JobConfig::meeting_notes(self.state.settings.clone())
-        } else {
-            JobConfig::long_form(self.state.settings.clone())
+        let config = match &job.session {
+            Some((part, settings)) => JobConfig::meeting_part(settings.clone(), *part, job.notes),
+            None if job.notes => JobConfig::meeting_notes(self.state.settings.clone()),
+            None => JobConfig::long_form(self.state.settings.clone()),
         };
         match self
             .state
@@ -1440,7 +1484,7 @@ impl AppHandler {
             .enqueue(samples, media::TARGET_RATE, config)
         {
             Ok(id) => {
-                let windowed = job.window.is_some();
+                let windowed = job.overlay_free();
                 job.tell_window(WindowMsg::Stage {
                     stage: transcript_window::Stage::Queued,
                     done: 0,
@@ -1541,6 +1585,13 @@ impl AppHandler {
         match MeetingRecorder::start(self.state.meeting_level.clone()) {
             Ok(recorder) => {
                 let sources = recorder.sources();
+                let id = self.state.next_meeting_session;
+                self.state.next_meeting_session += 1;
+                self.state.meeting_session = Some(MeetingSession {
+                    id,
+                    started: meeting::LocalTime::now(),
+                    settings: self.state.settings.clone(),
+                });
                 self.state.meeting = Some(recorder);
                 self.state
                     .tray
@@ -1576,14 +1627,11 @@ impl AppHandler {
         if recorder.is_paused() {
             let resumed = recorder.resume().map(|()| recorder.sources());
             match resumed {
-                Ok(sources) => {
+                Ok(_) => {
                     self.state
                         .tray
                         .set_meeting_state(tray::MeetingMenuState::Recording);
-                    self.state.tray.set_status(
-                        tray::IconColor::Recording,
-                        &format!("OpenWritr — recording meeting ({sources})"),
-                    );
+                    self.update_job_status();
                     self.show_overlay_notice(NoticeKind::Success, "Meeting recording resumed");
                 }
                 Err(error) => {
@@ -1598,14 +1646,67 @@ impl AppHandler {
             }
         } else {
             recorder.pause();
+            // Nothing more is recorded while paused, so use the time: hand
+            // everything recorded so far to the transcriber now.
+            let segment = recorder.take_segment(false, meeting::MIN_PAUSE_SEGMENT_SAMPLES);
             self.state
                 .tray
                 .set_meeting_state(tray::MeetingMenuState::Paused);
-            self.state.tray.set_status(
-                tray::IconColor::Transcribing,
-                "OpenWritr — meeting paused (not recording); resume or stop from the tray menu",
-            );
+            self.update_job_status();
             self.show_overlay_notice(NoticeKind::Info, "Meeting recording paused");
+            if let Some(segment) = segment {
+                self.queue_meeting_part(segment);
+            }
+        }
+    }
+
+    /// Cut the finished stretch of the recording off for transcription.
+    /// Called once an hour of audio is waiting (see `MeetingRecorder::roll_due`).
+    fn roll_meeting_part(&mut self) {
+        let segment = self
+            .state
+            .meeting
+            .as_mut()
+            .and_then(|recorder| recorder.take_segment(true, 1));
+        if let Some(segment) = segment {
+            info!(
+                seconds = segment.samples.len() / media::TARGET_RATE as usize,
+                "rolling meeting part cut"
+            );
+            self.queue_meeting_part(segment);
+        }
+    }
+
+    /// Queue a finished part of the running meeting as background jobs.
+    fn queue_meeting_part(&mut self, segment: meeting::Segment) {
+        let Some(session) = &self.state.meeting_session else {
+            return;
+        };
+        let (id, settings) = (session.id, session.settings.clone());
+        let pieces = media::plan_windows(
+            &segment.samples,
+            media::TARGET_RATE,
+            MEETING_PIECE_SECONDS,
+            MEETING_PIECE_SEARCH_SECONDS,
+        );
+        for range in pieces {
+            let part = SessionPart {
+                id,
+                offset_samples: segment.start + range.start,
+                last: false,
+            };
+            let job = FileJob {
+                output: PathBuf::new(),
+                markdown: false,
+                notes: false,
+                notes_output: None,
+                title: String::new(),
+                details: String::new(),
+                window: None,
+                background: true,
+                session: Some((part, settings.clone())),
+            };
+            self.dispatch_long_form(segment.samples[range].to_vec(), job, "meeting part");
         }
     }
 
@@ -1619,15 +1720,21 @@ impl AppHandler {
             .tray
             .set_meeting_state(tray::MeetingMenuState::Idle);
         let recorded = recorder.elapsed();
-        let samples = recorder.finish();
-        if samples.len() < media::TARGET_RATE as usize {
+        let tail = recorder.finish();
+        let session = self.state.meeting_session.take();
+        let total_samples = tail.start + tail.samples.len();
+        let Some(session) = session else {
+            return;
+        };
+        if total_samples < media::TARGET_RATE as usize {
             self.show_job_warning("Meeting recording was too short to transcribe");
+            self.update_job_status();
             return;
         }
         info!(seconds = recorded.as_secs(), "meeting capture stopped");
         let pending = PendingMeeting {
-            samples,
-            started: meeting::LocalTime::now(),
+            tail,
+            session,
             recorded,
         };
 
@@ -1663,13 +1770,13 @@ impl AppHandler {
         }
     }
 
-    /// Queue the transcription of the recording that was waiting on the
-    /// "create notes?" answer.
+    /// Queue the final part of the recording (and with it the stitched
+    /// transcript, and notes if wanted) after the "create notes?" answer.
     fn finish_pending_meeting(&mut self, create_notes: bool) {
         let Some(pending) = self.state.pending_meeting.take() else {
             return;
         };
-        let started = pending.started;
+        let started = pending.session.started;
         let markdown = self.state.settings.markdown_transcripts;
         let mut output = meeting::default_output_path(started);
         if markdown {
@@ -1677,12 +1784,19 @@ impl AppHandler {
         }
         let notes_output =
             create_notes.then(|| media::unique_path(meeting::default_notes_path(started)));
+        let part = SessionPart {
+            id: pending.session.id,
+            offset_samples: pending.tail.start,
+            last: true,
+        };
         let job = FileJob {
             output: media::unique_path(output),
             markdown,
             notes: create_notes,
             notes_output,
             window: None,
+            background: false,
+            session: Some((part, pending.session.settings)),
             title: format!(
                 "Meeting {:04}-{:02}-{:02} {:02}:{:02}",
                 started.year, started.month, started.day, started.hour, started.minute
@@ -1692,7 +1806,7 @@ impl AppHandler {
                 format_duration(pending.recorded.as_secs() as usize)
             ),
         };
-        self.dispatch_long_form(pending.samples, job, "meeting");
+        self.dispatch_long_form(pending.tail.samples, job, "meeting");
     }
 
     /// Report a file/meeting outcome. Windowed jobs only touch the tray; the
@@ -2001,7 +2115,7 @@ impl AppHandler {
                 delivery_target,
             } => {
                 let file_output = self.state.file_jobs.remove(&id);
-                let windowed = file_output.as_ref().is_some_and(|job| job.window.is_some());
+                let windowed = file_output.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
                 } else {
@@ -2018,6 +2132,11 @@ impl AppHandler {
                     return;
                 }
                 if let Some(job) = file_output {
+                    if job.background {
+                        // A non-final meeting part: its text lives in the
+                        // worker until the final part stitches the meeting.
+                        return;
+                    }
                     self.deliver_file_transcript(
                         job,
                         &text,
@@ -2130,7 +2249,7 @@ impl AppHandler {
             }
             WorkerEvent::JobFailed { id, error } => {
                 let file_job = self.state.file_jobs.remove(&id);
-                let windowed = file_job.as_ref().is_some_and(|job| job.window.is_some());
+                let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
                 } else {
@@ -2149,7 +2268,7 @@ impl AppHandler {
                 } else {
                     self.update_job_status();
                 }
-                if let Some(job) = file_job.filter(|job| job.window.is_some()) {
+                if let Some(job) = file_job.filter(FileJob::overlay_free) {
                     job.tell_window(WindowMsg::Failed {
                         error: error.clone(),
                     });
@@ -2162,7 +2281,7 @@ impl AppHandler {
             }
             WorkerEvent::JobDiscarded { id } => {
                 let file_job = self.state.file_jobs.remove(&id);
-                let windowed = file_job.as_ref().is_some_and(|job| job.window.is_some());
+                let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
                 } else {
@@ -2193,7 +2312,7 @@ impl AppHandler {
         self.state
             .file_jobs
             .get(&id)
-            .is_some_and(|job| job.window.is_some())
+            .is_some_and(FileJob::overlay_free)
     }
 
     fn tell_job_window(&self, id: u64, message: WindowMsg) {
@@ -2223,6 +2342,31 @@ impl AppHandler {
     }
 
     fn update_job_status(&self) {
+        // While a meeting is being recorded the tray shows *that*, however
+        // many earlier parts are being transcribed in the background.
+        if let Some(recorder) = &self.state.meeting {
+            let (color, state) = if recorder.is_paused() {
+                (
+                    tray::IconColor::Transcribing,
+                    "meeting paused, not recording",
+                )
+            } else {
+                (tray::IconColor::Recording, "recording meeting")
+            };
+            let queued = if self.state.pending_jobs > 0 {
+                format!(
+                    " · transcribing earlier parts ({} queued)",
+                    self.state.pending_jobs
+                )
+            } else {
+                String::new()
+            };
+            self.state.tray.set_status(
+                color,
+                &format!("OpenWritr — {state} ({}){queued}", recorder.sources()),
+            );
+            return;
+        }
         if self.state.pending_jobs > 0 {
             let noun = if self.state.pending_jobs == 1 {
                 "job"
@@ -2547,6 +2691,29 @@ mod tests {
     use crate::settings::{EnhanceMode, Settings};
     use crate::worker::RecordingIntent;
     use std::time::Instant;
+
+    fn file_job(window: bool, background: bool) -> FileJob {
+        FileJob {
+            output: PathBuf::new(),
+            markdown: false,
+            notes: false,
+            notes_output: None,
+            title: String::new(),
+            details: String::new(),
+            window: window.then(|| mpsc::channel().0),
+            background,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn popup_and_background_jobs_stay_out_of_the_dictation_overlay() {
+        // Dictation-style meeting jobs (the final part, with the pill) use it.
+        assert!(!file_job(false, false).overlay_free());
+        // A file job shows in its popup, a background meeting part nowhere.
+        assert!(file_job(true, false).overlay_free());
+        assert!(file_job(false, true).overlay_free());
+    }
 
     #[test]
     fn recording_intent_covers_the_full_shift_truth_table() {

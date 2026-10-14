@@ -44,6 +44,16 @@ const MIN_TURN_SAMPLES: usize = 4_000;
 /// Same-speaker turns separated by less than this are joined.
 const MAX_GAP_SAMPLES: usize = 8_000;
 
+/// Result of diarizing one stretch of audio.
+#[derive(Clone, Debug)]
+pub struct Diarization {
+    pub turns: Vec<Turn>,
+    /// One L2-normalised voice print per speaker id used in `turns`
+    /// (`centroids[turn.speaker]`), so speakers can be matched across
+    /// separately diarized parts of one recording.
+    pub centroids: Vec<Vec<f32>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Turn {
     pub start: usize,
@@ -83,9 +93,12 @@ impl Diarizer {
         samples: &[f32],
         cancelled: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(usize, usize),
-    ) -> Result<Vec<Turn>> {
+    ) -> Result<Diarization> {
         if samples.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Diarization {
+                turns: Vec::new(),
+                centroids: Vec::new(),
+            });
         }
         let started = Instant::now();
         let windows = samples.len().div_ceil(WINDOW_SAMPLES);
@@ -122,7 +135,12 @@ impl Diarizer {
             local_to_global[*window][*speaker] = Some(*label);
         }
 
-        let turns = build_turns(&activity, &local_to_global, samples.len());
+        let by_label = label_centroids(&embeddings, &labels);
+        let (turns, order) = build_turns(&activity, &local_to_global, samples.len());
+        let centroids = order
+            .iter()
+            .map(|label| by_label.get(*label).cloned().unwrap_or_default())
+            .collect();
         info!(
             windows,
             embeddings = items.len(),
@@ -131,7 +149,7 @@ impl Diarizer {
             ms = started.elapsed().as_millis() as u64,
             "diarized"
         );
-        Ok(turns)
+        Ok(Diarization { turns, centroids })
     }
 
     fn segment(&mut self, chunk: &[f32]) -> Result<Vec<[bool; LOCAL_SPEAKERS]>> {
@@ -174,6 +192,96 @@ impl Diarizer {
             vector.iter_mut().for_each(|x| *x /= norm);
         }
         Ok(vector)
+    }
+}
+
+/// Mean embedding of each cluster, re-normalised. Indexed by cluster label.
+fn label_centroids(embeddings: &[Vec<f32>], labels: &[usize]) -> Vec<Vec<f32>> {
+    let clusters = labels.iter().copied().max().map_or(0, |max| max + 1);
+    let width = embeddings.first().map_or(0, Vec::len);
+    let mut sums = vec![vec![0.0f32; width]; clusters];
+    for (embedding, &label) in embeddings.iter().zip(labels) {
+        for (sum, value) in sums[label].iter_mut().zip(embedding) {
+            *sum += value;
+        }
+    }
+    sums.iter_mut().for_each(|sum| normalize(sum));
+    sums
+}
+
+fn normalize(vector: &mut [f32]) {
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.iter_mut().for_each(|x| *x /= norm);
+    }
+}
+
+/// Speakers seen so far across the separately diarized parts of one
+/// recording, so "Speaker 1" in hour one is still "Speaker 1" in hour two.
+#[derive(Debug, Default)]
+pub struct SpeakerBook {
+    /// (centroid, how many parts have contributed to it)
+    speakers: Vec<(Vec<f32>, usize)>,
+}
+
+impl SpeakerBook {
+    /// Distinct speakers seen so far.
+    pub fn len(&self) -> usize {
+        self.speakers.len()
+    }
+
+    /// Map each local speaker (one centroid per local id) to a global id.
+    ///
+    /// Greedy by distance: the closest (local, known) pairs within the
+    /// clustering threshold are matched first and each known speaker is used
+    /// at most once per part, since two different people talking in the same
+    /// part must stay different. Everyone left over becomes a new speaker.
+    pub fn assign(&mut self, centroids: &[Vec<f32>]) -> Vec<usize> {
+        let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+        for (local, centroid) in centroids.iter().enumerate() {
+            for (global, (known, _)) in self.speakers.iter().enumerate() {
+                let dot: f32 = centroid.iter().zip(known).map(|(a, b)| a * b).sum();
+                let distance = 1.0 - dot;
+                if distance <= CLUSTER_THRESHOLD {
+                    pairs.push((distance, local, global));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut mapping: Vec<Option<usize>> = vec![None; centroids.len()];
+        let mut used = vec![false; self.speakers.len()];
+        for (_, local, global) in pairs {
+            if mapping[local].is_none() && !used[global] {
+                mapping[local] = Some(global);
+                used[global] = true;
+                let (known, weight) = &mut self.speakers[global];
+                for (k, c) in known.iter_mut().zip(&centroids[local]) {
+                    *k = *k * *weight as f32 + c;
+                }
+                *weight += 1;
+                normalize(known);
+            }
+        }
+        mapping
+            .into_iter()
+            .enumerate()
+            .map(|(local, matched)| {
+                matched.unwrap_or_else(|| {
+                    self.speakers.push((centroids[local].clone(), 1));
+                    self.speakers.len() - 1
+                })
+            })
+            .collect()
+    }
+}
+
+/// Rewrite `turns` so a local speaker id `i` becomes `mapping[i]`.
+pub fn remap_speakers(turns: &mut [Turn], mapping: &[usize]) {
+    for turn in turns {
+        if let Some(&global) = mapping.get(turn.speaker) {
+            turn.speaker = global;
+        }
     }
 }
 
@@ -223,7 +331,7 @@ fn build_turns(
     activity: &[Vec<[bool; LOCAL_SPEAKERS]>],
     local_to_global: &[[Option<usize>; LOCAL_SPEAKERS]],
     total_samples: usize,
-) -> Vec<Turn> {
+) -> (Vec<Turn>, Vec<usize>) {
     let mut runs: Vec<Turn> = Vec::new();
     for (window, frames) in activity.iter().enumerate() {
         // Overlapped speech goes to whoever talks most in this window.
@@ -261,7 +369,9 @@ fn build_turns(
 
 /// Relabel by first appearance, drop blips, and join near-adjacent turns of
 /// the same speaker.
-fn tidy_turns(turns: Vec<Turn>) -> Vec<Turn> {
+///
+/// Also returns, for each new speaker id, the cluster label it came from.
+fn tidy_turns(turns: Vec<Turn>) -> (Vec<Turn>, Vec<usize>) {
     let mut order: Vec<usize> = Vec::new();
     let mut tidy: Vec<Turn> = Vec::new();
     for turn in turns {
@@ -286,7 +396,7 @@ fn tidy_turns(turns: Vec<Turn>) -> Vec<Turn> {
             }),
         }
     }
-    tidy
+    (tidy, order)
 }
 
 #[cfg(test)]
@@ -303,7 +413,7 @@ mod tests {
 
     #[test]
     fn tidy_relabels_by_first_appearance_and_joins_gaps() {
-        let tidy = tidy_turns(vec![
+        let (tidy, order) = tidy_turns(vec![
             turn(0, 16_000, 5),
             turn(20_000, 36_000, 5),   // 4000-sample gap: joined
             turn(80_000, 96_000, 2),   // new speaker -> 1
@@ -319,11 +429,68 @@ mod tests {
             ]
         );
         assert_eq!(speaker_count(&tidy), 2);
+        // New id 0 came from cluster 5, new id 1 from cluster 2; the blip's
+        // cluster 9 never made it into a turn.
+        assert_eq!(order, vec![5, 2]);
+    }
+
+    fn voice(angle: f32) -> Vec<f32> {
+        let mut v = vec![angle.cos(), angle.sin(), 0.0];
+        normalize(&mut v);
+        v
+    }
+
+    #[test]
+    fn centroids_are_the_normalised_mean_of_each_cluster() {
+        let embeddings = vec![voice(0.0), voice(0.2), voice(2.0)];
+        let centroids = label_centroids(&embeddings, &[0, 0, 1]);
+        assert_eq!(centroids.len(), 2);
+        let norm = |v: &Vec<f32>| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm(&centroids[0]) - 1.0).abs() < 1e-5);
+        assert!((norm(&centroids[1]) - 1.0).abs() < 1e-5);
+        // Cluster 0 sits between its two members (angle ~0.1).
+        assert!((centroids[0][1].atan2(centroids[0][0]) - 0.1).abs() < 0.02);
+    }
+
+    #[test]
+    fn speaker_book_keeps_ids_stable_across_parts() {
+        let alice = voice(0.0);
+        let bob = voice(2.0);
+        let carol = voice(4.0);
+        let mut book = SpeakerBook::default();
+
+        // Part 1: Alice then Bob.
+        assert_eq!(book.assign(&[alice.clone(), bob.clone()]), vec![0, 1]);
+        // Part 2: the same two people, listed in the other order, plus Carol.
+        let again = book.assign(&[bob.clone(), voice(0.05), carol.clone()]);
+        assert_eq!(again, vec![1, 0, 2]);
+        assert_eq!(book.len(), 3);
+        // Part 3: only Carol.
+        assert_eq!(book.assign(&[voice(4.02)]), vec![2]);
+    }
+
+    #[test]
+    fn two_voices_in_one_part_never_share_a_global_speaker() {
+        let mut book = SpeakerBook::default();
+        book.assign(&[voice(0.0)]);
+        // Both locals are close to the known speaker; only the nearer one
+        // may take it, the other must become a new speaker.
+        let mapping = book.assign(&[voice(0.3), voice(0.05)]);
+        assert_eq!(mapping[1], 0);
+        assert_ne!(mapping[0], mapping[1]);
+        assert_eq!(book.len(), 2);
+    }
+
+    #[test]
+    fn remap_rewrites_local_ids() {
+        let mut turns = vec![turn(0, 16_000, 0), turn(16_000, 32_000, 1)];
+        remap_speakers(&mut turns, &[3, 0]);
+        assert_eq!((turns[0].speaker, turns[1].speaker), (3, 0));
     }
 
     #[test]
     fn large_gaps_keep_turns_apart() {
-        let tidy = tidy_turns(vec![turn(0, 16_000, 0), turn(40_000, 56_000, 0)]);
+        let (tidy, _) = tidy_turns(vec![turn(0, 16_000, 0), turn(40_000, 56_000, 0)]);
         assert_eq!(tidy.len(), 2);
     }
 
@@ -343,7 +510,7 @@ mod tests {
             f[1] = true;
         }
         let mapping = vec![[Some(7), Some(3), None]];
-        let turns = build_turns(&[frames], &mapping, WINDOW_SAMPLES);
+        let (turns, _) = build_turns(&[frames], &mapping, WINDOW_SAMPLES);
         assert_eq!(speaker_count(&turns), 2);
         assert_eq!(turns[0].speaker, 0);
         assert_eq!(turns[1].speaker, 1);
@@ -355,7 +522,7 @@ mod tests {
     #[test]
     fn speakers_without_embeddings_produce_no_turns() {
         let frames = vec![[true, false, false]; 100];
-        let turns = build_turns(&[frames], &[[None, None, None]], WINDOW_SAMPLES);
+        let (turns, _) = build_turns(&[frames], &[[None, None, None]], WINDOW_SAMPLES);
         assert!(turns.is_empty());
     }
 
