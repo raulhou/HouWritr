@@ -88,6 +88,13 @@ impl JobConfig {
     }
 }
 
+/// Which long-running phase a [`WorkerEvent::JobProgress`] belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStage {
+    Transcribing,
+    CleaningUp,
+}
+
 pub enum WorkerEvent {
     ModelState {
         generation: u64,
@@ -113,6 +120,14 @@ pub enum WorkerEvent {
     },
     EnhancementStarted {
         id: u64,
+    },
+    /// `done` of `total` windows (transcription) or slices (cleanup) finished.
+    /// Only long-form jobs report progress.
+    JobProgress {
+        id: u64,
+        stage: JobStage,
+        done: usize,
+        total: usize,
     },
     JobCompleted {
         id: u64,
@@ -457,7 +472,9 @@ impl JobEventTracker {
                 WorkerEvent::JobCompleted { id, .. } | WorkerEvent::JobFailed { id, .. } => {
                     WorkerEvent::JobDiscarded { id }
                 }
-                WorkerEvent::JobStarted { .. } | WorkerEvent::EnhancementStarted { .. } => {
+                WorkerEvent::JobStarted { .. }
+                | WorkerEvent::EnhancementStarted { .. }
+                | WorkerEvent::JobProgress { .. } => {
                     return None;
                 }
                 other => other,
@@ -482,6 +499,14 @@ impl JobEventTracker {
                 }
                 *phase = JobPhase::Enhancing;
                 Some(WorkerEvent::EnhancementStarted { id })
+            }
+            event @ WorkerEvent::JobProgress { id, .. } => {
+                // Progress is only meaningful while the job is still live.
+                matches!(
+                    self.phases.get(&id),
+                    Some(JobPhase::Transcribing | JobPhase::Enhancing)
+                )
+                .then_some(event)
             }
             event @ WorkerEvent::JobCompleted { id, .. } => {
                 if !matches!(
@@ -509,6 +534,7 @@ impl JobEventTracker {
         match event {
             WorkerEvent::JobStarted { id }
             | WorkerEvent::EnhancementStarted { id }
+            | WorkerEvent::JobProgress { id, .. }
             | WorkerEvent::JobCompleted { id, .. }
             | WorkerEvent::JobFailed { id, .. }
             | WorkerEvent::JobDiscarded { id } => Some(*id),
@@ -638,6 +664,14 @@ fn worker_main(
                             interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
                                 .is_some()
                         },
+                        |done, total| {
+                            let _ = event_tx.send(WorkerEvent::JobProgress {
+                                id: job.id,
+                                stage: JobStage::Transcribing,
+                                done,
+                                total,
+                            });
+                        },
                     )
                 } else {
                     active_engine.transcribe(&job.samples, job.sample_rate)
@@ -677,7 +711,19 @@ fn worker_main(
                             .is_none()
                     };
                     let outcome = if job.config.long_form {
-                        enhance::enhance_long_form(&text, &job.config.settings, || !still_wanted())
+                        enhance::enhance_long_form(
+                            &text,
+                            &job.config.settings,
+                            || !still_wanted(),
+                            |done, total| {
+                                let _ = event_tx.send(WorkerEvent::JobProgress {
+                                    id: job.id,
+                                    stage: JobStage::CleaningUp,
+                                    done,
+                                    total,
+                                });
+                            },
+                        )
                     } else {
                         enhance::enhance_outcome(&text, &job.config.settings, still_wanted)
                     };
@@ -803,10 +849,12 @@ fn transcribe_long_form(
     samples: &[f32],
     sample_rate: u32,
     interrupted: impl Fn() -> bool,
+    mut progress: impl FnMut(usize, usize),
 ) -> Result<String> {
     let windows = plan_long_form_windows(samples, sample_rate);
     let total = windows.len();
     let mut transcript = String::new();
+    progress(0, total);
     for (index, window) in windows.into_iter().enumerate() {
         // The caller re-checks interruption and discards the partial text.
         if interrupted() {
@@ -820,6 +868,7 @@ fn transcribe_long_form(
             }
             transcript.push_str(text);
         }
+        progress(index + 1, total);
         info!(window = index + 1, total, "long-form window transcribed");
     }
     Ok(transcript)
@@ -1323,6 +1372,65 @@ mod tests {
                 false,
             )
             .is_none());
+    }
+
+    #[test]
+    fn long_form_jobs_report_ordered_progress_before_completion() {
+        let (mut worker, _, _, _) = worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+        let job = worker
+            .enqueue(
+                vec![1.0; 65 * 16_000],
+                16_000,
+                JobConfig::long_form(settings),
+            )
+            .unwrap();
+
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        let progress = events
+            .iter()
+            .filter_map(|event| match event {
+                WorkerEvent::JobProgress {
+                    id,
+                    stage: JobStage::Transcribing,
+                    done,
+                    total,
+                } if *id == job => Some((*done, *total)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let total = progress.first().expect("progress was reported").1;
+        assert!(total >= 2);
+        let expected = (0..=total).map(|done| (done, total)).collect::<Vec<_>>();
+        assert_eq!(progress, expected);
+    }
+
+    #[test]
+    fn dictation_jobs_never_report_progress() {
+        let (mut worker, _, _, _) = worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let job = worker
+            .enqueue(
+                vec![1.0],
+                16_000,
+                job_config(Settings::default(), RecordingIntent::Raw),
+            )
+            .unwrap();
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::JobProgress { .. })));
     }
 
     #[test]

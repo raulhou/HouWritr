@@ -95,9 +95,14 @@ saving — no restart required.
 Both live in the tray menu and run fully offline on the selected engine.
 
 - **Transcribe audio or video file…** opens a file picker (WAV, MP3, M4A/AAC,
-  FLAC, OGG, MP4/MOV/MKV with a supported audio track). The transcript is saved
-  next to the source as `<name>.txt`, copied to the clipboard, and revealed in
-  Explorer.
+  FLAC, OGG, MP4/MOV/MKV with a supported audio track) and then a small
+  progress window instead of the bottom-center indicator. The window shows the
+  stage (reading audio, transcribing n/m, AI cleanup), elapsed time and an
+  estimate, the source, length, engine, whether AI cleanup is on, the output
+  format and file, and, when finished, the word count, a preview, and **Open
+  file / Show in folder / Copy text** buttons. Minimize it like any window;
+  closing it does not cancel the job. The transcript is saved next to the
+  source as `<name>.txt` (or `.md`) and copied to the clipboard.
 - **Start meeting recording / Stop meeting recording** captures your
   microphone and everything playing on the default output device (WASAPI
   loopback) into one timeline, up to 2 hours. On stop, the transcript is saved

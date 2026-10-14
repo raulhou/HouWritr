@@ -24,6 +24,7 @@ mod settings;
 mod settings_ui;
 mod single_instance;
 mod sounds;
+mod transcript_window;
 mod tray;
 mod worker;
 
@@ -36,6 +37,16 @@ fn main() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if is_self_check_mode(arguments.iter()) {
         return self_check::run();
+    }
+    if is_transcript_window_mode(arguments.iter()) {
+        let _log_guard = init_tracing()?;
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            mode = "transcript-window",
+            "process starting"
+        );
+        return transcript_window::run_window();
     }
     let settings_mode = is_settings_mode(arguments.iter());
     let about_mode = is_about_mode(arguments.iter());
@@ -92,6 +103,13 @@ fn is_settings_mode<T: AsRef<OsStr>>(args: impl IntoIterator<Item = T>) -> bool 
         .any(|arg| arg.as_ref().eq_ignore_ascii_case(OsStr::new("--settings")))
 }
 
+fn is_transcript_window_mode<T: AsRef<OsStr>>(args: impl IntoIterator<Item = T>) -> bool {
+    args.into_iter().any(|arg| {
+        arg.as_ref()
+            .eq_ignore_ascii_case(OsStr::new("--transcript-window"))
+    })
+}
+
 fn is_about_mode<T: AsRef<OsStr>>(args: impl IntoIterator<Item = T>) -> bool {
     args.into_iter()
         .any(|arg| arg.as_ref().eq_ignore_ascii_case(OsStr::new("--about")))
@@ -142,7 +160,7 @@ fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_about_mode, is_self_check_mode, is_settings_mode};
+    use super::{is_about_mode, is_self_check_mode, is_settings_mode, is_transcript_window_mode};
     use std::ffi::OsString;
 
     #[test]
@@ -157,6 +175,14 @@ mod tests {
         assert!(is_self_check_mode([OsString::from("--self-check")]));
         assert!(is_self_check_mode([OsString::from("--SELF-CHECK")]));
         assert!(!is_self_check_mode([OsString::from("--settings")]));
+    }
+
+    #[test]
+    fn transcript_window_mode_is_selected_before_tray_startup() {
+        assert!(is_transcript_window_mode([OsString::from(
+            "--transcript-window"
+        )]));
+        assert!(!is_transcript_window_mode([OsString::from("--settings")]));
     }
 
     #[test]

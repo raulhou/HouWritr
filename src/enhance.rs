@@ -312,9 +312,11 @@ pub fn enhance_long_form(
     text: &str,
     settings: &Settings,
     interrupted: impl Fn() -> bool,
+    mut progress: impl FnMut(usize, usize),
 ) -> Option<EnhanceOutcome> {
     let slices = split_for_cleanup(text, LONG_FORM_CLEANUP_CHARS);
     let total = slices.len();
+    progress(0, total);
     let mut joined = String::new();
     let mut cleaned = 0usize;
     let mut first_failure: Option<FallbackReason> = None;
@@ -340,6 +342,7 @@ pub fn enhance_long_form(
                 joined.push_str(&text);
             }
         }
+        progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
     }
 

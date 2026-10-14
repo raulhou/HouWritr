@@ -88,7 +88,7 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
     .map_err(|error| anyhow!("egui run failed: {error}"))
 }
 
-fn apply_dark_theme(ctx: &egui::Context) {
+pub(crate) fn apply_dark_theme(ctx: &egui::Context) {
     use egui::{Color32, FontFamily, FontId, Stroke, Style, Visuals};
     let mut style = Style::default();
     style.visuals = Visuals::dark();
@@ -1758,7 +1758,7 @@ fn info_button(ui: &mut egui::Ui, help: &str) {
         .on_hover_text_at_pointer(help);
 }
 
-fn inline_error(ui: &mut egui::Ui, message: impl Into<String>) {
+pub(crate) fn inline_error(ui: &mut egui::Ui, message: impl Into<String>) {
     ui.label(
         egui::RichText::new(message.into())
             .small()

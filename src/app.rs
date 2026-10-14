@@ -16,14 +16,19 @@ use crate::{
     overlay::{self, ListeningIntent, NoticeKind, OverlayViewState, ProcessingPhase},
     paste,
     settings::{CredentialHealth, EnhanceMode, Settings, SettingsRevision},
-    sounds, tray,
-    worker::{DeliveryTarget, JobConfig, RecordingIntent, ShutdownMode, Worker, WorkerEvent},
+    sounds,
+    transcript_window::{self, WindowMsg},
+    tray,
+    worker::{
+        DeliveryTarget, JobConfig, JobStage, RecordingIntent, ShutdownMode, Worker, WorkerEvent,
+    },
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -50,10 +55,14 @@ pub enum UserEvent {
     HotkeyRelease,
     DiagnosticsExported,
     DiagnosticsExportFailed(String),
-    /// A file picked from the tray menu was decoded to 16 kHz mono.
+    /// A file picked from the tray menu was decoded to 16 kHz mono. `window`
+    /// feeds the popup that was opened for it when the file was chosen.
     FileDecoded {
         path: PathBuf,
         samples: Vec<f32>,
+        output: PathBuf,
+        markdown: bool,
+        window: mpsc::Sender<WindowMsg>,
     },
     /// The file dialog was dismissed, or decoding failed (`Some(reason)`).
     FileImportEnded(Option<String>),
@@ -79,6 +88,17 @@ struct FileJob {
     notes: bool,
     title: String,
     details: String,
+    /// Popup window for this job. `None` (meetings) keeps the overlay pill.
+    window: Option<mpsc::Sender<WindowMsg>>,
+}
+
+impl FileJob {
+    /// Tell the popup something; a failed send just means it was closed.
+    fn tell_window(&self, message: WindowMsg) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.send(message).is_ok())
+    }
 }
 
 struct ActiveRecording {
@@ -771,15 +791,25 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                     .tray
                     .set_tooltip("OpenWritr — diagnostics export failed (see log)");
             }
-            UserEvent::FileDecoded { path, samples } => {
+            UserEvent::FileDecoded {
+                path,
+                samples,
+                output,
+                markdown,
+                window,
+            } => {
                 self.state.file_import_running = false;
-                self.dispatch_file(path, samples);
+                self.dispatch_file(path, samples, output, markdown, window);
             }
             UserEvent::FileImportEnded(error) => {
                 self.state.file_import_running = false;
                 if let Some(error) = error {
+                    // The popup already shows the reason; no pill for files.
                     warn!(error = %error, "file import failed");
-                    self.show_job_warning(&format!("Could not read file: {}", short_error(&error)));
+                    self.state.tray.set_status(
+                        tray::IconColor::Error,
+                        &format!("OpenWritr — could not read file: {}", short_error(&error)),
+                    );
                 } else {
                     self.update_job_status();
                 }
@@ -1289,24 +1319,22 @@ impl AppHandler {
         }
         self.state.file_import_running = true;
         let proxy = self.state.proxy.clone();
+        let markdown = self.state.settings.markdown_transcripts;
+        let cleanup = self.state.settings.enhance.mode.is_enabled();
+        let engine = match &self.state.engine_state {
+            EngineState::Ready { label } => label.clone(),
+            _ => self.state.settings.engine.clone(),
+        };
         // The Open dialog blocks and decoding is CPU-heavy: neither may run
         // on the tray event loop.
         let spawned = thread::Builder::new()
             .name("file-import".into())
             .spawn(move || {
-                let event = match media::pick_audio_file() {
-                    None => UserEvent::FileImportEnded(None),
-                    Some(path) => match media::decode_file(&path) {
-                        Ok(samples) => {
-                            info!(
-                                seconds = samples.len() / media::TARGET_RATE as usize,
-                                "file decoded"
-                            );
-                            UserEvent::FileDecoded { path, samples }
-                        }
-                        Err(error) => UserEvent::FileImportEnded(Some(format!("{error:#}"))),
-                    },
+                let Some(path) = media::pick_audio_file() else {
+                    let _ = proxy.send_event(UserEvent::FileImportEnded(None));
+                    return;
                 };
+                let event = import_file(path, markdown, cleanup, engine);
                 let _ = proxy.send_event(event);
             });
         if let Err(error) = spawned {
@@ -1315,9 +1343,14 @@ impl AppHandler {
         }
     }
 
-    fn dispatch_file(&mut self, source: PathBuf, samples: Vec<f32>) {
-        let markdown = self.state.settings.markdown_transcripts;
-        let output = media::unique_path(source.with_extension(if markdown { "md" } else { "txt" }));
+    fn dispatch_file(
+        &mut self,
+        source: PathBuf,
+        samples: Vec<f32>,
+        output: PathBuf,
+        markdown: bool,
+        window: mpsc::Sender<WindowMsg>,
+    ) {
         let name = source
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1336,12 +1369,16 @@ impl AppHandler {
                 "Transcript of {name} ({}) · OpenWritr",
                 format_duration(seconds)
             ),
+            window: Some(window),
         };
         self.dispatch_long_form(samples, job, "file");
     }
 
     fn dispatch_long_form(&mut self, samples: Vec<f32>, job: FileJob, kind: &str) {
         if self.state.shutting_down {
+            job.tell_window(WindowMsg::Failed {
+                error: "OpenWritr is shutting down".into(),
+            });
             return;
         }
         let config = if job.notes {
@@ -1355,16 +1392,34 @@ impl AppHandler {
             .enqueue(samples, media::TARGET_RATE, config)
         {
             Ok(id) => {
+                let windowed = job.window.is_some();
+                job.tell_window(WindowMsg::Stage {
+                    stage: transcript_window::Stage::Queued,
+                    done: 0,
+                    total: 0,
+                });
                 self.state.file_jobs.insert(id, job);
                 self.state.pending_jobs = self.state.pending_jobs.saturating_add(1);
-                self.state.overlay_state.job_queued(id);
+                if !windowed {
+                    self.state.overlay_state.job_queued(id);
+                }
                 info!(id, kind, "long-form transcription job queued");
                 self.update_job_status();
                 self.sync_overlay();
             }
             Err(error) => {
                 warn!(error = %error, "failed to queue long-form transcription");
-                self.show_job_warning("Could not queue transcription (see log)");
+                let reported = job.tell_window(WindowMsg::Failed {
+                    error: format!("could not queue transcription: {error}"),
+                });
+                if reported {
+                    self.state.tray.set_status(
+                        tray::IconColor::Error,
+                        "OpenWritr — could not queue transcription (see log)",
+                    );
+                } else {
+                    self.show_job_warning("Could not queue transcription (see log)");
+                }
             }
         }
     }
@@ -1432,6 +1487,7 @@ impl AppHandler {
             output: media::unique_path(output),
             markdown,
             notes,
+            window: None,
             title: format!(
                 "{} {:04}-{:02}-{:02} {:02}:{:02}",
                 if notes { "Meeting notes" } else { "Meeting" },
@@ -1449,28 +1505,45 @@ impl AppHandler {
         self.dispatch_long_form(samples, job, "meeting");
     }
 
+    /// Report a file/meeting outcome. Windowed jobs only touch the tray; the
+    /// popup carries the details, so the overlay pill stays out of it.
+    fn report_long_form(&mut self, windowed: bool, warning: bool, message: &str) {
+        if windowed {
+            let color = if warning {
+                tray::IconColor::Error
+            } else {
+                tray::IconColor::Idle
+            };
+            self.state
+                .tray
+                .set_status(color, &format!("OpenWritr — {message}"));
+        } else if warning {
+            self.show_job_warning(message);
+        } else {
+            self.show_job_success(message);
+        }
+    }
+
     fn deliver_file_transcript(
         &mut self,
         job: FileJob,
         text: &str,
         cleanup_warning: Option<FallbackReason>,
     ) {
+        let windowed = job.window.is_some();
         if text.trim().is_empty() {
-            self.show_job_warning("No speech detected in the audio");
+            job.tell_window(WindowMsg::Failed {
+                error: "No speech detected in the audio".into(),
+            });
+            self.report_long_form(windowed, true, "No speech detected in the audio");
             return;
         }
-        let FileJob {
-            output,
-            markdown,
-            notes,
-            title,
-            details,
-        } = job;
-        let document = if markdown {
-            media::to_markdown(&title, &details, text)
+        let document = if job.markdown {
+            media::to_markdown(&job.title, &job.details, text)
         } else {
             text.to_string()
         };
+        let output = job.output.clone();
         let text = document.as_str();
         let written = output
             .parent()
@@ -1480,18 +1553,44 @@ impl AppHandler {
             warn!(error = %error, file = %output.display(), "failed to write transcript");
             // Never lose a long transcription to a bad path.
             let _ = paste::deliver(text, paste::DeliveryMode::Clipboard);
-            self.show_job_warning(&format!(
-                "Could not save transcript ({}); copied to clipboard",
-                short_error(&error.to_string())
-            ));
+            job.tell_window(WindowMsg::Failed {
+                error: format!(
+                    "could not save {}: {error}. The transcript was copied to the clipboard.",
+                    output.display()
+                ),
+            });
+            self.report_long_form(
+                windowed,
+                true,
+                &format!(
+                    "Could not save transcript ({}); copied to clipboard",
+                    short_error(&error.to_string())
+                ),
+            );
             return;
         }
         info!(file = %output.display(), chars = text.chars().count(), "transcript saved");
         if let Err(error) = paste::deliver(text, paste::DeliveryMode::Clipboard) {
             warn!(error = %error, "failed to copy transcript to clipboard");
         }
-        if let Err(error) = diagnostics::reveal(&output) {
-            warn!(error = %error, "failed to reveal transcript");
+
+        let missing = if job.notes { "AI notes" } else { "AI cleanup" };
+        let (words, chars, preview) = transcript_window::summarize(text);
+        let shown = job.tell_window(WindowMsg::Done {
+            output_path: output.display().to_string(),
+            words,
+            chars,
+            preview,
+            warning: cleanup_warning
+                .as_ref()
+                .map(|_| format!("Saved without {missing}: provider or credential problem.")),
+        });
+        // The popup has "Show in folder"; only pop Explorer open ourselves
+        // when nothing is showing the result (meetings, or popup closed).
+        if !shown {
+            if let Err(error) = diagnostics::reveal(&output) {
+                warn!(error = %error, "failed to reveal transcript");
+            }
         }
         let name = output
             .file_name()
@@ -1499,12 +1598,17 @@ impl AppHandler {
             .unwrap_or_else(|| "transcript".into());
         if let Some(reason) = cleanup_warning {
             warn!(?reason, "transcript saved without AI output");
-            let missing = if notes { "AI notes" } else { "AI cleanup" };
-            self.show_job_warning(&format!(
-                "Saved {name} without {missing} (provider or credential problem)"
-            ));
+            self.report_long_form(
+                windowed,
+                true,
+                &format!("Saved {name} without {missing} (provider or credential problem)"),
+            );
         } else {
-            self.show_job_success(&format!("Saved {name} and copied to clipboard"));
+            self.report_long_form(
+                windowed,
+                false,
+                &format!("Saved {name} and copied to clipboard"),
+            );
         }
     }
 
@@ -1578,6 +1682,44 @@ impl AppHandler {
                     &format!("OpenWritr — {engine} failed: {short_error}; choose Retry"),
                 );
             }
+            WorkerEvent::JobStarted { id } if self.is_windowed_job(id) => {
+                self.state.active_job = Some(id);
+                self.tell_job_window(
+                    id,
+                    WindowMsg::Stage {
+                        stage: transcript_window::Stage::Transcribing,
+                        done: 0,
+                        total: 0,
+                    },
+                );
+                self.update_job_status();
+            }
+            WorkerEvent::EnhancementStarted { id } if self.is_windowed_job(id) => {
+                self.tell_job_window(
+                    id,
+                    WindowMsg::Stage {
+                        stage: transcript_window::Stage::CleaningUp,
+                        done: 0,
+                        total: 0,
+                    },
+                );
+                self.state.tray.set_status(
+                    tray::IconColor::Transcribing,
+                    "OpenWritr — cleaning up transcript",
+                );
+            }
+            WorkerEvent::JobProgress {
+                id,
+                stage,
+                done,
+                total,
+            } => {
+                let stage = match stage {
+                    JobStage::Transcribing => transcript_window::Stage::Transcribing,
+                    JobStage::CleaningUp => transcript_window::Stage::CleaningUp,
+                };
+                self.tell_job_window(id, WindowMsg::Stage { stage, done, total });
+            }
             WorkerEvent::JobStarted { id } => {
                 if !self.state.overlay_state.job_started(id) {
                     warn!(id, "ignoring start event for unknown or inactive job");
@@ -1609,7 +1751,13 @@ impl AppHandler {
                 delivery_target,
             } => {
                 let file_output = self.state.file_jobs.remove(&id);
-                if !self.finish_job(id) {
+                let windowed = file_output.as_ref().is_some_and(|job| job.window.is_some());
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     warn!(id, "ignoring completion for tombstoned or unknown job");
                     return;
                 }
@@ -1725,8 +1873,14 @@ impl AppHandler {
                 }
             }
             WorkerEvent::JobFailed { id, error } => {
-                self.state.file_jobs.remove(&id);
-                if !self.finish_job(id) {
+                let file_job = self.state.file_jobs.remove(&id);
+                let windowed = file_job.as_ref().is_some_and(|job| job.window.is_some());
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     warn!(id, "ignoring failure for tombstoned or unknown job");
                     return;
                 }
@@ -1739,15 +1893,32 @@ impl AppHandler {
                 } else {
                     self.update_job_status();
                 }
-                self.show_overlay_notice(
-                    NoticeKind::Error,
-                    format!("Transcription failed: {}", short_error(&error)),
-                );
+                if let Some(job) = file_job.filter(|job| job.window.is_some()) {
+                    job.tell_window(WindowMsg::Failed {
+                        error: error.clone(),
+                    });
+                } else {
+                    self.show_overlay_notice(
+                        NoticeKind::Error,
+                        format!("Transcription failed: {}", short_error(&error)),
+                    );
+                }
             }
             WorkerEvent::JobDiscarded { id } => {
-                self.state.file_jobs.remove(&id);
-                if !self.finish_job(id) {
+                let file_job = self.state.file_jobs.remove(&id);
+                let windowed = file_job.as_ref().is_some_and(|job| job.window.is_some());
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     return;
+                }
+                if let Some(job) = file_job {
+                    job.tell_window(WindowMsg::Failed {
+                        error: "Cancelled because OpenWritr is quitting".into(),
+                    });
                 }
                 info!(id, "transcription job discarded");
                 self.update_job_status();
@@ -1758,6 +1929,30 @@ impl AppHandler {
                 self.exit_after_clipboard_settles(el);
             }
         }
+    }
+
+    /// Whether `id` is a file job whose progress lives in a popup window
+    /// rather than the overlay pill.
+    fn is_windowed_job(&self, id: u64) -> bool {
+        self.state
+            .file_jobs
+            .get(&id)
+            .is_some_and(|job| job.window.is_some())
+    }
+
+    fn tell_job_window(&self, id: u64, message: WindowMsg) {
+        if let Some(job) = self.state.file_jobs.get(&id) {
+            job.tell_window(message);
+        }
+    }
+
+    /// `finish_job` for jobs the overlay reducer never saw.
+    fn finish_windowed_job(&mut self, id: u64) -> bool {
+        self.state.pending_jobs = self.state.pending_jobs.saturating_sub(1);
+        if self.state.active_job == Some(id) {
+            self.state.active_job = None;
+        }
+        true
     }
 
     fn finish_job(&mut self, id: u64) -> bool {
@@ -1976,6 +2171,57 @@ impl AppHandler {
             warn!("clipboard restoration did not settle before the shutdown timeout");
         }
         el.exit();
+    }
+}
+
+/// Runs on the file-import thread after a file was picked: opens the popup,
+/// decodes, and returns the event that hands everything to the tray loop.
+fn import_file(path: PathBuf, markdown: bool, cleanup: bool, engine: String) -> UserEvent {
+    let (window, messages) = mpsc::channel();
+    if let Err(error) = transcript_window::spawn_window_thread(messages) {
+        // The job still runs; the result is saved and revealed as usual.
+        warn!(error = %error, "could not open the transcript window");
+    }
+    let output = media::unique_path(path.with_extension(if markdown { "md" } else { "txt" }));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio file".into());
+    let init = |duration: String| WindowMsg::Init {
+        title: name.clone(),
+        source_path: path.display().to_string(),
+        duration,
+        engine: engine.clone(),
+        cleanup,
+        markdown,
+        output_path: output.display().to_string(),
+    };
+    let _ = window.send(init("reading…".into()));
+    let _ = window.send(WindowMsg::Stage {
+        stage: transcript_window::Stage::Decoding,
+        done: 0,
+        total: 0,
+    });
+    match media::decode_file(&path) {
+        Ok(samples) => {
+            let seconds = samples.len() / media::TARGET_RATE as usize;
+            info!(seconds, "file decoded");
+            let _ = window.send(init(format_duration(seconds)));
+            UserEvent::FileDecoded {
+                path,
+                samples,
+                output,
+                markdown,
+                window,
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let _ = window.send(WindowMsg::Failed {
+                error: message.clone(),
+            });
+            UserEvent::FileImportEnded(Some(message))
+        }
     }
 }
 
