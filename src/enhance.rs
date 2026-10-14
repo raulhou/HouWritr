@@ -306,42 +306,135 @@ fn split_for_cleanup(text: &str, max_chars: usize) -> Vec<&str> {
     slices
 }
 
+/// How a long-form cleanup went, slice by slice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Slices the text was divided into.
+    pub total: usize,
+    /// Slices the provider cleaned.
+    pub cleaned: usize,
+    /// Slices left as recognised because the provider could not be reached
+    /// (or the circuit breaker skipped them): worth trying again later.
+    pub unreachable: usize,
+}
+
+impl CleanupReport {
+    /// A retry could still improve this text.
+    pub fn needs_retry(&self) -> bool {
+        self.unreachable > 0
+    }
+
+    pub fn add(&mut self, other: CleanupReport) {
+        self.total += other.total;
+        self.cleaned += other.cleaned;
+        self.unreachable += other.unreachable;
+    }
+}
+
+/// The text after cleanup plus how it went.
+pub struct LongFormCleanup {
+    pub outcome: EnhanceOutcome,
+    pub report: CleanupReport,
+}
+
+/// After this many failed requests in a row the provider is treated as
+/// unreachable and the remaining slices are not even attempted (each failed
+/// attempt can take a full request timeout).
+const UNREACHABLE_TRIP: usize = 3;
+
+/// Failures that say "could not talk to the provider" rather than "the
+/// provider answered and the answer was rejected". Only the former are worth
+/// retrying later.
+pub fn is_unreachable(reason: &FallbackReason) -> bool {
+    matches!(
+        reason,
+        FallbackReason::RequestFailed | FallbackReason::ResponseUnparseable
+    )
+}
+
 /// Clean up an imported file or meeting transcript slice by slice.
 ///
 /// Slices that fail cleanup keep their raw text, so a flaky request never
-/// loses content. The result is `RawFallback` only when *no* slice could be
-/// cleaned, which is what the caller reports to the user. Returns `None` when
-/// `interrupted` fires.
+/// loses content. After [`UNREACHABLE_TRIP`] unreachable failures in a row the
+/// rest are skipped. The outcome is `RawFallback` only when *no* slice could
+/// be cleaned. Returns `None` when `interrupted` fires.
 pub fn enhance_long_form(
     text: &str,
     settings: &Settings,
     interrupted: impl Fn() -> bool,
-    mut progress: impl FnMut(usize, usize),
-) -> Option<EnhanceOutcome> {
+    progress: impl FnMut(usize, usize),
+) -> Option<LongFormCleanup> {
+    clean_slices(
+        split_for_cleanup(text, LONG_FORM_CLEANUP_CHARS),
+        |slice| enhance_outcome(slice, settings, || !interrupted()),
+        &interrupted,
+        progress,
+    )
+}
+
+/// What cleanup would report if it were skipped outright (the provider was
+/// found unreachable moments ago): the text is returned untouched and every
+/// slice is marked for a later retry.
+pub fn skipped_cleanup(text: &str) -> LongFormCleanup {
     let slices = split_for_cleanup(text, LONG_FORM_CLEANUP_CHARS);
+    LongFormCleanup {
+        report: CleanupReport {
+            total: slices.len(),
+            cleaned: 0,
+            unreachable: slices.len(),
+        },
+        outcome: EnhanceOutcome::raw_fallback(slices.join("\n\n"), FallbackReason::RequestFailed),
+    }
+}
+
+fn clean_slices(
+    slices: Vec<&str>,
+    mut clean: impl FnMut(&str) -> Option<EnhanceOutcome>,
+    interrupted: &dyn Fn() -> bool,
+    mut progress: impl FnMut(usize, usize),
+) -> Option<LongFormCleanup> {
     let total = slices.len();
     progress(0, total);
     let mut joined = String::new();
-    let mut cleaned = 0usize;
+    let mut report = CleanupReport {
+        total,
+        ..CleanupReport::default()
+    };
     let mut first_failure: Option<FallbackReason> = None;
-    let mut failed = 0usize;
+    let mut in_a_row = 0usize;
+    let mut tripped = false;
 
     for (index, slice) in slices.into_iter().enumerate() {
         if interrupted() {
             return None;
         }
-        let outcome = enhance_outcome(slice, settings, || !interrupted())?;
         if !joined.is_empty() {
             joined.push_str("\n\n");
         }
-        match outcome {
+        if tripped {
+            joined.push_str(slice);
+            report.unreachable += 1;
+            progress(index + 1, total);
+            continue;
+        }
+        match clean(slice)? {
             EnhanceOutcome::Enhanced { text, .. } => {
-                cleaned += 1;
+                report.cleaned += 1;
+                in_a_row = 0;
                 joined.push_str(&text);
             }
             EnhanceOutcome::Skipped { text, .. } => joined.push_str(&text),
             EnhanceOutcome::RawFallback { text, reason } => {
-                failed += 1;
+                if is_unreachable(&reason) {
+                    report.unreachable += 1;
+                    in_a_row += 1;
+                    if in_a_row >= UNREACHABLE_TRIP {
+                        tripped = true;
+                        warn!("cleanup provider unreachable; skipping the remaining slices");
+                    }
+                } else {
+                    in_a_row = 0;
+                }
                 first_failure.get_or_insert(reason);
                 joined.push_str(&text);
             }
@@ -350,14 +443,21 @@ pub fn enhance_long_form(
         info!(slice = index + 1, total, "long-form cleanup slice done");
     }
 
+    let failed = report.total - report.cleaned;
     if failed > 0 {
-        warn!(failed, total, "some long-form cleanup slices kept raw text");
+        warn!(
+            failed,
+            total,
+            unreachable = report.unreachable,
+            "some long-form cleanup slices kept raw text"
+        );
     }
-    Some(match first_failure {
-        Some(reason) if cleaned == 0 => EnhanceOutcome::raw_fallback(joined, reason),
-        _ if cleaned > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
+    let outcome = match first_failure {
+        Some(reason) if report.cleaned == 0 => EnhanceOutcome::raw_fallback(joined, reason),
+        _ if report.cleaned > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
         _ => EnhanceOutcome::skipped(joined, SkipReason::EmptyTranscript),
-    })
+    };
+    Some(LongFormCleanup { outcome, report })
 }
 
 /// Generous per-request timeout: notes read the whole meeting and write a
@@ -662,7 +762,7 @@ mod tests {
 
 #[cfg(test)]
 mod long_form_tests {
-    use super::split_for_cleanup;
+    use super::*;
 
     #[test]
     fn short_text_is_one_slice() {
@@ -704,5 +804,123 @@ mod long_form_tests {
         let slices = split_for_cleanup(&text, 50);
         assert!(slices.iter().all(|slice| slice.chars().count() <= 50));
         assert!(slices.iter().all(|slice| !slice.ends_with(' ')));
+    }
+
+    fn slices(n: usize) -> Vec<&'static str> {
+        vec!["raw slice"; n]
+    }
+
+    fn enhanced(text: &str) -> Option<EnhanceOutcome> {
+        Some(EnhanceOutcome::enhanced(text, Vec::new()))
+    }
+
+    fn failed(reason: FallbackReason) -> Option<EnhanceOutcome> {
+        Some(EnhanceOutcome::raw_fallback("raw slice", reason))
+    }
+
+    #[test]
+    fn a_clean_run_reports_everything_cleaned() {
+        let result = clean_slices(slices(3), |_| enhanced("Clean."), &|| false, |_, _| {}).unwrap();
+        assert_eq!(
+            result.report,
+            CleanupReport {
+                total: 3,
+                cleaned: 3,
+                unreachable: 0
+            }
+        );
+        assert!(!result.report.needs_retry());
+        assert_eq!(result.outcome.text(), "Clean.\n\nClean.\n\nClean.");
+    }
+
+    #[test]
+    fn intermittent_failures_are_counted_but_never_trip_the_breaker() {
+        let mut call = 0;
+        let result = clean_slices(
+            slices(6),
+            |_| {
+                call += 1;
+                if call % 2 == 0 {
+                    failed(FallbackReason::RequestFailed)
+                } else {
+                    enhanced("Clean.")
+                }
+            },
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(call, 6, "every slice was still attempted");
+        assert_eq!(result.report.cleaned, 3);
+        assert_eq!(result.report.unreachable, 3);
+        assert!(result.report.needs_retry());
+        assert!(result.outcome.is_enhanced());
+    }
+
+    #[test]
+    fn three_unreachable_failures_in_a_row_skip_the_rest() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(10),
+            |_| {
+                calls += 1;
+                failed(FallbackReason::RequestFailed)
+            },
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            calls, UNREACHABLE_TRIP,
+            "no requests after the breaker trips"
+        );
+        assert_eq!(result.report.total, 10);
+        assert_eq!(result.report.cleaned, 0);
+        assert_eq!(result.report.unreachable, 10);
+        assert!(result.report.needs_retry());
+        // All ten slices are still in the text, untouched.
+        assert_eq!(result.outcome.text().matches("raw slice").count(), 10);
+        assert!(matches!(
+            result.outcome,
+            EnhanceOutcome::RawFallback {
+                reason: FallbackReason::RequestFailed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejected_answers_are_final_and_do_not_trip_or_retry() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(5),
+            |_| {
+                calls += 1;
+                failed(FallbackReason::IntegrityRejected(Vec::new()))
+            },
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 5);
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
+    }
+
+    #[test]
+    fn interruption_returns_nothing() {
+        assert!(clean_slices(slices(3), |_| enhanced("x"), &|| true, |_, _| {}).is_none());
+    }
+
+    #[test]
+    fn skipped_cleanup_returns_the_text_and_marks_every_slice_for_retry() {
+        let text = format!("{}\n\n{}", "a ".repeat(1_400), "b ".repeat(1_400));
+        let skipped = skipped_cleanup(&text);
+        assert!(skipped.report.total >= 2);
+        assert_eq!(skipped.report.unreachable, skipped.report.total);
+        assert_eq!(
+            skipped.outcome.text().split_whitespace().count(),
+            text.split_whitespace().count()
+        );
     }
 }

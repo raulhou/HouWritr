@@ -20,8 +20,8 @@ use crate::{
     transcript_window::{self, WindowMsg},
     tray,
     worker::{
-        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, SessionPart,
-        ShutdownMode, Worker, WorkerEvent,
+        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, RepairPlan,
+        Rerun, SessionPart, ShutdownMode, Worker, WorkerEvent,
     },
 };
 use anyhow::Result;
@@ -119,6 +119,89 @@ impl FileJob {
             .as_ref()
             .is_some_and(|window| window.send(message).is_ok())
     }
+}
+
+/// What one background retry does for a delivered transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairStep {
+    /// Clean piece `n` of the transcript again.
+    Piece(usize),
+    /// Generate the meeting notes that could not be generated before.
+    Notes,
+}
+
+/// A delivered transcript whose AI cleanup (or notes) could not finish, e.g.
+/// because the connection was down. The app keeps what is needed to try again
+/// in the background and rewrites the saved files when it succeeds.
+struct Repair {
+    id: u64,
+    name: String,
+    plan: RepairPlan,
+    output: PathBuf,
+    notes_output: Option<PathBuf>,
+    markdown: bool,
+    title: String,
+    details: String,
+    /// Exactly what the transcript file held when we last wrote it: if the
+    /// file has changed since (the user edited it), it is left alone.
+    last_written: String,
+    /// Most slices ever cleaned for each piece, to tell progress from repeats.
+    best_cleaned: Vec<usize>,
+    failed_rounds: u32,
+    next_attempt: Instant,
+    in_flight: Option<u64>,
+}
+
+/// First retry after two minutes, then slower; after five fruitless rounds
+/// the text is left as it is.
+const REPAIR_BACKOFF_SECONDS: [u64; 5] = [120, 300, 600, 1_200, 1_800];
+/// Pause between steps of one productive round.
+const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
+
+/// How long to wait before the next round after `failed_rounds` fruitless
+/// ones, or `None` to give up.
+fn repair_delay(failed_rounds: u32) -> Option<Duration> {
+    REPAIR_BACKOFF_SECONDS
+        .get(failed_rounds.saturating_sub(1) as usize)
+        .map(|seconds| Duration::from_secs(*seconds))
+}
+
+/// The next thing to retry: unfinished pieces in order, then the notes.
+fn next_repair_step(plan: &RepairPlan) -> Option<RepairStep> {
+    plan.pieces
+        .iter()
+        .position(|piece| piece.raw.is_some())
+        .map(RepairStep::Piece)
+        .or_else(|| plan.notes_failed.then_some(RepairStep::Notes))
+}
+
+/// File content for a transcript: Markdown with a title, or the plain text.
+fn render_transcript(markdown: bool, title: &str, details: &str, text: &str) -> String {
+    if markdown {
+        media::to_markdown(title, details, text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// File content for meeting notes, which sit next to the transcript.
+fn render_notes(title: &str, details: &str, transcript_name: &str, notes: &str) -> String {
+    media::to_markdown(
+        &title.replacen("Meeting", "Meeting notes", 1),
+        &format!("{details} · transcript: {transcript_name}"),
+        notes,
+    )
+}
+
+fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+    std::fs::write(path, content)
+}
+
+/// "cleaned 21 of 25 sections" when some of the text is still as recognised.
+fn cleanup_summary(report: &crate::enhance::CleanupReport) -> Option<String> {
+    (report.total > 0 && report.cleaned < report.total)
+        .then(|| format!("cleaned {} of {} sections", report.cleaned, report.total))
 }
 
 /// A meeting being recorded: its parts are transcribed as they are cut.
@@ -381,6 +464,10 @@ struct State {
     /// The meeting being recorded, if any.
     meeting_session: Option<MeetingSession>,
     next_meeting_session: u64,
+    /// Delivered transcripts waiting for an automatic retry of AI cleanup.
+    repairs: Vec<Repair>,
+    repair_jobs: HashMap<u64, (u64, RepairStep)>,
+    next_repair_id: u64,
     /// Long-form jobs (imported files, meetings) mapped to their output file.
     file_jobs: HashMap<u64, FileJob>,
     file_import_running: bool,
@@ -492,6 +579,9 @@ pub fn run() -> Result<()> {
         pending_meeting: None,
         meeting_session: None,
         next_meeting_session: 1,
+        repairs: Vec::new(),
+        repair_jobs: HashMap::new(),
+        next_repair_id: 1,
         file_jobs: HashMap::new(),
         file_import_running: false,
     };
@@ -1005,7 +1095,9 @@ impl AppHandler {
             }
         }
 
-        // Rolling transcription: an hour of finished audio goes to the
+        self.run_due_repairs();
+
+        // Rolling transcription: five minutes of finished audio go to the
         // transcriber while the recording carries on.
         if self
             .state
@@ -1883,6 +1975,8 @@ impl AppHandler {
         text: &str,
         notes: Option<String>,
         diarization: DiarizationOutcome,
+        cleanup: Option<crate::enhance::CleanupReport>,
+        repair: Option<RepairPlan>,
         cleanup_warning: Option<FallbackReason>,
     ) {
         let windowed = job.window.is_some();
@@ -1893,11 +1987,7 @@ impl AppHandler {
             self.report_long_form(windowed, true, "No speech detected in the audio");
             return;
         }
-        let document = if job.markdown {
-            media::to_markdown(&job.title, &job.details, text)
-        } else {
-            text.to_string()
-        };
+        let document = render_transcript(job.markdown, &job.title, &job.details, text);
         let output = job.output.clone();
         let text = document.as_str();
         let written = output
@@ -1942,15 +2032,8 @@ impl AppHandler {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let document = media::to_markdown(
-                &job.title.replacen("Meeting", "Meeting notes", 1),
-                &format!("{} · transcript: {transcript_name}", job.details),
-                notes_text,
-            );
-            let saved = notes_path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::write(notes_path, document));
+            let document = render_notes(&job.title, &job.details, &transcript_name, notes_text);
+            let saved = write_file(notes_path, &document);
             match saved {
                 Ok(()) => notes_saved = true,
                 Err(error) => {
@@ -1964,6 +2047,12 @@ impl AppHandler {
         } else {
             "AI cleanup"
         };
+        // What is still missing is retried in the background; say so.
+        let retrying = repair.is_some();
+        let summary = cleanup.as_ref().and_then(cleanup_summary);
+        if let Some(plan) = repair {
+            self.register_repair(&job, plan, text.to_string());
+        }
         let (words, chars, preview) = transcript_window::summarize(text);
         // Warnings for the popup: AI problems and unavailable speaker labels.
         let mut warnings = Vec::new();
@@ -1971,6 +2060,11 @@ impl AppHandler {
             warnings.push(format!(
                 "Saved without {missing}: provider or credential problem."
             ));
+        } else if let Some(summary) = &summary {
+            warnings.push(format!("AI cleanup incomplete: {summary}."));
+        }
+        if retrying {
+            warnings.push("OpenWritr will retry automatically and update the file.".into());
         }
         if let DiarizationOutcome::Failed(reason) = &diarization {
             warnings.push(format!("Speaker labels unavailable: {reason}"));
@@ -1998,12 +2092,25 @@ impl AppHandler {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "transcript".into());
+        let retry_note = if retrying {
+            "; retrying automatically"
+        } else {
+            ""
+        };
         if let Some(reason) = cleanup_warning {
             warn!(?reason, "transcript saved without AI output");
             self.report_long_form(
                 windowed,
                 true,
-                &format!("Saved {name} without {missing} (provider or credential problem)"),
+                &format!(
+                    "Saved {name} without {missing} (provider or credential problem){retry_note}"
+                ),
+            );
+        } else if let Some(summary) = &summary {
+            self.report_long_form(
+                windowed,
+                true,
+                &format!("Saved {name} · {summary}{retry_note}"),
             );
         } else if let DiarizationOutcome::Failed(reason) = &diarization {
             self.report_long_form(
@@ -2027,8 +2134,240 @@ impl AppHandler {
         }
     }
 
+    /// Remember a delivered transcript whose AI steps can still be retried.
+    fn register_repair(&mut self, job: &FileJob, plan: RepairPlan, written: String) {
+        let id = self.state.next_repair_id;
+        self.state.next_repair_id += 1;
+        let name = job
+            .output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "transcript".into());
+        info!(id, file = %job.output.display(), "AI cleanup will be retried in the background");
+        self.state.repairs.push(Repair {
+            id,
+            name,
+            best_cleaned: vec![0; plan.pieces.len()],
+            plan,
+            output: job.output.clone(),
+            notes_output: job.notes_output.clone(),
+            markdown: job.markdown,
+            title: job.title.clone(),
+            details: job.details.clone(),
+            last_written: written,
+            failed_rounds: 0,
+            next_attempt: Instant::now() + Duration::from_secs(REPAIR_BACKOFF_SECONDS[0]),
+            in_flight: None,
+        });
+    }
+
+    /// Start the next retry of every delivered transcript that is due.
+    fn run_due_repairs(&mut self) {
+        if self.state.shutting_down || self.state.repairs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for index in 0..self.state.repairs.len() {
+            let repair = &self.state.repairs[index];
+            if repair.in_flight.is_some() || now < repair.next_attempt {
+                continue;
+            }
+            let Some(step) = next_repair_step(&repair.plan) else {
+                continue;
+            };
+            let kind = match step {
+                RepairStep::Piece(piece) => Rerun::Clean {
+                    raw: repair.plan.pieces[piece].raw.clone().unwrap_or_default(),
+                },
+                RepairStep::Notes => Rerun::Notes {
+                    text: repair.plan.assemble(),
+                },
+            };
+            let repair_id = repair.id;
+            let config = JobConfig::rerun(self.state.settings.clone(), kind);
+            match self
+                .state
+                .worker
+                .enqueue(Vec::new(), media::TARGET_RATE, config)
+            {
+                Ok(job_id) => {
+                    self.state.repairs[index].in_flight = Some(job_id);
+                    self.state.repair_jobs.insert(job_id, (repair_id, step));
+                }
+                Err(error) => {
+                    warn!(error = %error, "could not queue a cleanup retry");
+                    self.state.repairs[index].next_attempt = now + Duration::from_secs(60);
+                }
+            }
+        }
+    }
+
+    /// A background retry finished.
+    fn finish_repair_step(
+        &mut self,
+        job_id: u64,
+        text: String,
+        notes: Option<String>,
+        cleanup: Option<crate::enhance::CleanupReport>,
+    ) {
+        let Some((repair_id, step)) = self.state.repair_jobs.remove(&job_id) else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .repairs
+            .iter()
+            .position(|repair| repair.id == repair_id)
+        else {
+            return;
+        };
+        let mut transcript_changed = false;
+        let progressed;
+        {
+            let repair = &mut self.state.repairs[index];
+            repair.in_flight = None;
+            match step {
+                RepairStep::Piece(piece) => {
+                    let report = cleanup.unwrap_or_default();
+                    let improved = report.cleaned > repair.best_cleaned[piece];
+                    let complete = !report.needs_retry();
+                    if improved || complete {
+                        repair.plan.pieces[piece].text = text;
+                        transcript_changed = true;
+                    }
+                    if improved {
+                        repair.best_cleaned[piece] = report.cleaned;
+                    }
+                    if complete {
+                        repair.plan.pieces[piece].raw = None;
+                    }
+                    progressed = improved || complete;
+                }
+                RepairStep::Notes => match (notes, repair.notes_output.clone()) {
+                    (Some(notes), Some(path)) => {
+                        let transcript_name = repair
+                            .output
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let document =
+                            render_notes(&repair.title, &repair.details, &transcript_name, &notes);
+                        match write_file(&path, &document) {
+                            Ok(()) => {
+                                repair.plan.notes_failed = false;
+                                progressed = true;
+                            }
+                            Err(error) => {
+                                warn!(error = %error, file = %path.display(), "could not write the retried notes");
+                                progressed = false;
+                            }
+                        }
+                    }
+                    _ => progressed = false,
+                },
+            }
+        }
+
+        if transcript_changed {
+            if let Err(reason) = self.rewrite_repaired_transcript(index) {
+                // Most likely the file was edited or moved: leave it alone.
+                let repair = self.state.repairs.remove(index);
+                warn!(file = %repair.output.display(), reason, "stopping cleanup retries");
+                self.show_job_warning(&format!(
+                    "Left {} as it is ({reason}); automatic cleanup stopped",
+                    repair.name
+                ));
+                return;
+            }
+        }
+
+        let repair = &mut self.state.repairs[index];
+        if repair.plan.is_complete() {
+            let repair = self.state.repairs.remove(index);
+            info!(file = %repair.output.display(), "transcript cleanup finished in the background");
+            self.show_job_success(&format!("Finished cleaning up {}", repair.name));
+        } else if progressed {
+            repair.next_attempt = Instant::now() + REPAIR_STEP_PAUSE;
+        } else {
+            self.schedule_repair_retry(index);
+        }
+    }
+
+    /// A background retry did not run to completion.
+    fn abort_repair_step(&mut self, job_id: u64) {
+        let Some((repair_id, _)) = self.state.repair_jobs.remove(&job_id) else {
+            return;
+        };
+        if let Some(index) = self
+            .state
+            .repairs
+            .iter()
+            .position(|repair| repair.id == repair_id)
+        {
+            self.state.repairs[index].in_flight = None;
+            self.schedule_repair_retry(index);
+        }
+    }
+
+    /// Count a fruitless round and wait longer, or give up.
+    fn schedule_repair_retry(&mut self, index: usize) {
+        let repair = &mut self.state.repairs[index];
+        repair.failed_rounds += 1;
+        match repair_delay(repair.failed_rounds) {
+            Some(delay) => repair.next_attempt = Instant::now() + delay,
+            None => {
+                let repair = self.state.repairs.remove(index);
+                warn!(file = %repair.output.display(), "giving up on background cleanup");
+                self.show_job_warning(&format!(
+                    "Could not finish cleaning up {}; it stays as recognised",
+                    repair.name
+                ));
+            }
+        }
+    }
+
+    /// Rewrite the saved transcript from the repaired pieces, unless the file
+    /// was changed by someone else since we wrote it.
+    fn rewrite_repaired_transcript(&mut self, index: usize) -> Result<(), String> {
+        let repair = &mut self.state.repairs[index];
+        let current = std::fs::read_to_string(&repair.output)
+            .map_err(|_| "the file was moved or deleted".to_string())?;
+        if current != repair.last_written {
+            return Err("you have edited it".into());
+        }
+        let document = render_transcript(
+            repair.markdown,
+            &repair.title,
+            &repair.details,
+            &repair.plan.assemble(),
+        );
+        write_file(&repair.output, &document).map_err(|error| error.to_string())?;
+        repair.last_written = document;
+        Ok(())
+    }
+
     fn handle_worker_event(&mut self, el: &ActiveEventLoop, event: WorkerEvent) {
         match event {
+            // Background retries of AI cleanup / notes never touch the
+            // overlay, the job counters or the tray.
+            WorkerEvent::JobStarted { id }
+            | WorkerEvent::EnhancementStarted { id }
+            | WorkerEvent::JobProgress { id, .. }
+                if self.state.repair_jobs.contains_key(&id) => {}
+            WorkerEvent::JobCompleted {
+                id,
+                text,
+                cleanup,
+                notes,
+                ..
+            } if self.state.repair_jobs.contains_key(&id) => {
+                self.finish_repair_step(id, text, notes, cleanup);
+            }
+            WorkerEvent::JobFailed { id, .. } | WorkerEvent::JobDiscarded { id }
+                if self.state.repair_jobs.contains_key(&id) =>
+            {
+                self.abort_repair_step(id);
+            }
             WorkerEvent::ModelState {
                 generation,
                 engine,
@@ -2163,6 +2502,8 @@ impl AppHandler {
                 id,
                 text,
                 diarization,
+                cleanup,
+                repair,
                 notes,
                 auto_paste,
                 enhancement_warning,
@@ -2200,6 +2541,8 @@ impl AppHandler {
                         &text,
                         notes,
                         diarization,
+                        cleanup,
+                        repair,
                         enhancement_warning,
                     );
                     return;
@@ -2763,6 +3106,82 @@ mod tests {
             session: None,
             partial: None,
         }
+    }
+
+    #[test]
+    fn repairs_back_off_and_eventually_give_up() {
+        let seconds: Vec<Option<u64>> = (1..=6)
+            .map(|round| super::repair_delay(round).map(|d| d.as_secs()))
+            .collect();
+        assert_eq!(
+            seconds,
+            vec![
+                Some(120),
+                Some(300),
+                Some(600),
+                Some(1_200),
+                Some(1_800),
+                None
+            ]
+        );
+        // Round zero (nothing failed yet) behaves like the first.
+        assert_eq!(super::repair_delay(0).map(|d| d.as_secs()), Some(120));
+    }
+
+    #[test]
+    fn repairs_fix_unfinished_pieces_in_order_then_the_notes() {
+        use super::{next_repair_step, RepairStep};
+        use crate::worker::{RepairPiece, RepairPlan};
+        let piece = |raw: Option<&str>| RepairPiece {
+            text: "t".into(),
+            raw: raw.map(str::to_string),
+        };
+        let mut plan = RepairPlan {
+            pieces: vec![piece(None), piece(Some("b")), piece(Some("c"))],
+            separator: " ".into(),
+            unlabel: false,
+            notes_failed: true,
+        };
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Piece(1)));
+        plan.pieces[1].raw = None;
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Piece(2)));
+        plan.pieces[2].raw = None;
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Notes));
+        plan.notes_failed = false;
+        assert_eq!(next_repair_step(&plan), None);
+    }
+
+    #[test]
+    fn documents_are_rendered_the_same_way_every_time() {
+        use super::{render_notes, render_transcript};
+        assert_eq!(render_transcript(false, "T", "d", "plain"), "plain");
+        let markdown = render_transcript(true, "Meeting 1", "details", "body text.");
+        assert!(markdown.starts_with("# Meeting 1\n\n*details*\n\n"));
+        let notes = render_notes(
+            "Meeting 2026-03-09 14:05",
+            "Recorded",
+            "Meeting.txt",
+            "## Summary",
+        );
+        assert!(notes.starts_with("# Meeting notes 2026-03-09 14:05\n"));
+        assert!(notes.contains("transcript: Meeting.txt"));
+    }
+
+    #[test]
+    fn the_cleanup_summary_only_appears_when_something_is_left() {
+        use super::cleanup_summary;
+        use crate::enhance::CleanupReport;
+        let report = |total, cleaned| CleanupReport {
+            total,
+            cleaned,
+            unreachable: 0,
+        };
+        assert_eq!(
+            cleanup_summary(&report(25, 21)).unwrap(),
+            "cleaned 21 of 25 sections"
+        );
+        assert!(cleanup_summary(&report(25, 25)).is_none());
+        assert!(cleanup_summary(&report(0, 0)).is_none());
     }
 
     #[test]

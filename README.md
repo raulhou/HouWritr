@@ -178,6 +178,22 @@ enhancement), *Ask every time* shows *Also create meeting notes with AI?* **Yes*
 transcript only. **Always** creates the notes without asking, also when you quit mid-meeting; **Never** never asks. Without a provider the question is skipped and a hint is shown. The prompt forbids
 inventing names, owners, dates or decisions, but speakers are not labelled and
 recognition errors can slip through, so review notes before acting on them.
+**When the connection is unreliable.** Cleanup never holds up your transcript.
+A request that cannot reach the provider keeps that section as recognised;
+after three failures in a row the rest is skipped instead of waiting out each
+timeout, and for the next minute no further requests are attempted (so
+dictation is not held up either). Sections that could not be cleaned during a
+meeting get a second try when you press Stop (for up to 90 seconds, and only
+while the provider answers). Whatever is still unfinished is retried
+**automatically in the background** after the transcript is saved, 2, 5, 10,
+20 and 30 minutes later, and the saved transcript (and meeting notes, if they
+could not be generated) are updated in place when it works. The saved-file
+notice tells you what happened, for example *cleaned 21 of 25 sections;
+retrying automatically*. OpenWritr leaves a file alone if you have edited,
+moved or deleted it, and the retries stop when you quit the app (the
+transcript stays as recognised; the in-progress and saved files are never
+lost).
+
 Notes work even when cleanup is set to **Never**; if cleanup is on it runs
 first and the notes are built from the cleaned text. If the provider fails, the
 transcript is still saved and the notice says the notes are missing. Very long

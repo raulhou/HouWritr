@@ -45,6 +45,8 @@ pub struct JobConfig {
     diarize: bool,
     /// Set for the parts of a rolling meeting transcription.
     session: Option<SessionPart>,
+    /// Set for text-only retries of cleanup / notes (no audio involved).
+    rerun: Option<Rerun>,
     /// Also ask the provider for structured meeting notes (implies
     /// `long_form`); the notes are placed above the transcript.
     notes: bool,
@@ -64,6 +66,7 @@ impl JobConfig {
             long_form: false,
             diarize: false,
             session: None,
+            rerun: None,
             notes: false,
         }
     }
@@ -76,7 +79,16 @@ impl JobConfig {
             delivery_target: None,
             long_form: true,
             session: None,
+            rerun: None,
             notes: false,
+        }
+    }
+
+    /// Retry cleanup or notes on finished text. Uses no engine.
+    pub fn rerun(settings: Settings, kind: Rerun) -> Self {
+        Self {
+            rerun: Some(kind),
+            ..Self::long_form(settings)
         }
     }
 
@@ -125,6 +137,62 @@ pub struct SessionPart {
     /// `[m:ss]` markers are meeting-global.
     pub offset_samples: usize,
     pub last: bool,
+}
+
+/// One stretch of a delivered transcript. `raw` is the text as recognised,
+/// kept only for pieces whose AI cleanup is worth trying again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairPiece {
+    pub text: String,
+    pub raw: Option<String>,
+}
+
+/// What a delivered transcript still lacks, and how to put it together again
+/// once it is fixed: the app retries in the background (a connection that was
+/// down, say) and rewrites the saved files when cleanup or notes succeed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairPlan {
+    pub pieces: Vec<RepairPiece>,
+    /// Put between pieces: a blank line for labelled blocks, a space for
+    /// plain run-on text.
+    pub separator: String,
+    /// Remove speaker labels and markers after joining (one voice only).
+    pub unlabel: bool,
+    /// Notes were requested but the provider could not be reached.
+    pub notes_failed: bool,
+}
+
+impl RepairPlan {
+    /// The full transcript from the current pieces.
+    pub fn assemble(&self) -> String {
+        let text = self
+            .pieces
+            .iter()
+            .map(|piece| piece.text.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(&self.separator);
+        if self.unlabel {
+            unlabel(&text)
+        } else {
+            text
+        }
+    }
+
+    /// Nothing left worth retrying.
+    pub fn is_complete(&self) -> bool {
+        !self.notes_failed && self.pieces.iter().all(|piece| piece.raw.is_none())
+    }
+}
+
+/// A text-only job that retries the AI steps of an already delivered
+/// transcript. Needs no speech engine.
+#[derive(Clone, Debug)]
+pub enum Rerun {
+    /// Clean this text (as recognised) again.
+    Clean { raw: String },
+    /// Generate meeting notes from this finished transcript.
+    Notes { text: String },
 }
 
 /// What happened to the optional "label the speakers" step of a job.
@@ -178,6 +246,11 @@ pub enum WorkerEvent {
         id: u64,
         text: String,
         diarization: DiarizationOutcome,
+        /// How AI cleanup went for a long-form job (`None` otherwise).
+        cleanup: Option<enhance::CleanupReport>,
+        /// Present when the delivered transcript can still be improved by
+        /// retrying later.
+        repair: Option<RepairPlan>,
         /// Structured meeting notes, kept apart from the transcript so the
         /// caller can save them as their own file. `Some` only for notes jobs
         /// whose generation succeeded.
@@ -609,6 +682,8 @@ fn worker_main(
     // Rolling meeting transcriptions in progress. Jobs run one at a time on
     // this thread, so the map needs no locking.
     let mut sessions: HashMap<u64, SessionState> = HashMap::new();
+    // Whether the AI provider answered recently (see `CleanupGate`).
+    let mut gate = CleanupGate::default();
     while let Ok(command) = command_rx.recv() {
         match command {
             Command::Load {
@@ -690,55 +765,63 @@ fn worker_main(
                         let _ = event_tx.send(WorkerEvent::JobDiscarded { id: job.id });
                         continue;
                     }
-                    if engine_generation != Some(job.generation)
-                        || engine_cancellation
-                            .as_ref()
-                            .map(CancellationToken::is_cancelled)
-                            .unwrap_or(true)
-                    {
-                        if let Some(part) = job.config.session {
-                            // Never lose a whole meeting because one part
-                            // met a reloading engine.
-                            let state = sessions.entry(part.id).or_default();
-                            let placeholder = failed_part_text(
-                                part.offset_samples,
-                                job.sample_rate,
-                                "the speech engine was not ready",
-                            );
-                            let completed = if part.last {
-                                let state = sessions.remove(&part.id).unwrap_or_default();
-                                let (text, diarization, warning) = state.finish(
-                                    placeholder.clone(),
-                                    None,
-                                    DiarizationOutcome::NotRequested,
+                    // Text-only retries need no speech engine at all.
+                    if job.config.rerun.is_some() {
+                        let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
+                    } else {
+                        if engine_generation != Some(job.generation)
+                            || engine_cancellation
+                                .as_ref()
+                                .map(CancellationToken::is_cancelled)
+                                .unwrap_or(true)
+                        {
+                            if let Some(part) = job.config.session {
+                                // Never lose a whole meeting because one part
+                                // met a reloading engine.
+                                let state = sessions.entry(part.id).or_default();
+                                let placeholder = failed_part_text(
+                                    part.offset_samples,
+                                    job.sample_rate,
+                                    "the speech engine was not ready",
                                 );
-                                Some((text, diarization, warning))
-                            } else {
-                                state.parts.push(placeholder.clone());
-                                None
-                            };
-                            let (text, diarization, warning) = completed.unwrap_or_else(|| {
-                                (placeholder, DiarizationOutcome::NotRequested, None)
-                            });
-                            let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
-                            let _ = event_tx.send(WorkerEvent::JobCompleted {
+                                let (text, diarization, warning) = if part.last {
+                                    let state = sessions.remove(&part.id).unwrap_or_default();
+                                    let stitched = state.finish(
+                                        PartText::plain(placeholder),
+                                        None,
+                                        DiarizationOutcome::NotRequested,
+                                    );
+                                    (stitched.text, stitched.outcome, stitched.warning)
+                                } else {
+                                    state.parts.push(PartText::plain(placeholder.clone()));
+                                    (placeholder, DiarizationOutcome::NotRequested, None)
+                                };
+                                let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
+                                let _ = event_tx.send(WorkerEvent::JobCompleted {
+                                    id: job.id,
+                                    text,
+                                    diarization,
+                                    cleanup: None,
+                                    repair: None,
+                                    notes: None,
+                                    auto_paste: false,
+                                    enhancement_warning: warning,
+                                    delivery_target: None,
+                                });
+                                continue;
+                            }
+                            let _ = event_tx.send(WorkerEvent::JobFailed {
                                 id: job.id,
-                                text,
-                                diarization,
-                                notes: None,
-                                auto_paste: false,
-                                enhancement_warning: warning,
-                                delivery_target: None,
+                                error: "selected engine is not ready".into(),
                             });
                             continue;
                         }
-                        let _ = event_tx.send(WorkerEvent::JobFailed {
-                            id: job.id,
-                            error: "selected engine is not ready".into(),
-                        });
-                        continue;
+                        let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
                     }
-                    let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
+                }
+                if let Some(rerun) = job.config.rerun.clone() {
+                    run_rerun(&job, rerun, &mut gate, &event_tx, &discard_requested);
+                    continue;
                 }
                 let active_engine = engine
                     .as_mut()
@@ -868,41 +951,47 @@ fn worker_main(
                     }
                 }
 
+                let interrupted_now = || {
+                    interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
+                        .is_some()
+                };
+                let send_cleaning_progress = |done: usize, total: usize| {
+                    let _ = event_tx.send(WorkerEvent::JobProgress {
+                        id: job.id,
+                        stage: JobStage::CleaningUp,
+                        done,
+                        total,
+                    });
+                };
+
+                // `raw_text` is what was recognised; it is kept so a failed
+                // cleanup can be redone later.
+                let raw_text = text;
+                let mut cleanup_report: Option<enhance::CleanupReport> = None;
                 let (final_text, enhancement_warning) = if job.config.should_enhance()
                     && !transcription_failed
                 {
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
                     info!("enhancement requested");
-                    // Speaker-labelled text carries [m:ss] markers; keep them
-                    // out of the cleanup request and put them back after.
-                    let (cleanup_input, stamps) =
-                        if matches!(diarization, DiarizationOutcome::Labelled { .. }) {
-                            strip_timestamps(&text)
-                        } else {
-                            (text.clone(), Vec::new())
-                        };
-                    let still_wanted = || {
-                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                            .is_none()
-                    };
-                    let outcome = if job.config.long_form {
-                        enhance::enhance_long_form(
-                            &cleanup_input,
+                    let cleaned = if job.config.long_form {
+                        clean_transcript(
+                            &raw_text,
                             &job.config.settings,
-                            || !still_wanted(),
-                            |done, total| {
-                                let _ = event_tx.send(WorkerEvent::JobProgress {
-                                    id: job.id,
-                                    stage: JobStage::CleaningUp,
-                                    done,
-                                    total,
-                                });
-                            },
+                            &mut gate,
+                            &interrupted_now,
+                            send_cleaning_progress,
                         )
+                        .map(|cleaned| (cleaned.text, cleaned.warning, Some(cleaned.report)))
                     } else {
-                        enhance::enhance_outcome(&cleanup_input, &job.config.settings, still_wanted)
+                        enhance::enhance_outcome(&raw_text, &job.config.settings, || {
+                            !interrupted_now()
+                        })
+                        .map(|outcome| {
+                            let (text, warning) = completed_cleanup(outcome);
+                            (text, warning, None)
+                        })
                     };
-                    let Some(outcome) = outcome else {
+                    let Some((cleaned_text, warning, report)) = cleaned else {
                         let _transition = transition_gate.lock();
                         if let Some(event) =
                             interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
@@ -911,25 +1000,59 @@ fn worker_main(
                         }
                         continue;
                     };
-                    let (cleaned, warning) = completed_cleanup(outcome);
-                    (restore_timestamps(&cleaned, &stamps), warning)
+                    cleanup_report = report;
+                    (cleaned_text, warning)
                 } else {
-                    (text, None)
+                    (raw_text.clone(), None)
                 };
 
                 // Parts of a rolling meeting: remember everything but the last
                 // part's text; the last part carries the whole transcript.
+                let own_report = cleanup_report.unwrap_or_default();
+                let mut final_report = cleanup_report;
+                let mut repair_plan: Option<RepairPlan> = None;
                 let (final_text, enhancement_warning, diarization) = match job.config.session {
                     Some(part) => {
+                        let own = PartText {
+                            raw: raw_text,
+                            text: final_text,
+                            report: own_report,
+                        };
                         let state = sessions.entry(part.id).or_default();
                         state.note_part(&diarization, &enhancement_warning);
                         if part.last {
-                            let state = sessions.remove(&part.id).unwrap_or_default();
-                            let (text, outcome, warning) =
-                                state.finish(final_text, enhancement_warning, diarization);
-                            (text, warning, outcome)
+                            let mut state = sessions.remove(&part.id).unwrap_or_default();
+                            // A second chance for parts whose cleanup could not
+                            // reach the provider while the meeting was running.
+                            if job.config.should_enhance() {
+                                retry_incomplete_parts(
+                                    &mut state.parts,
+                                    RETRY_BUDGET,
+                                    |raw| {
+                                        if !gate.open(Instant::now()) {
+                                            return RetryAttempt::Unavailable;
+                                        }
+                                        match clean_transcript(
+                                            raw,
+                                            &job.config.settings,
+                                            &mut gate,
+                                            &interrupted_now,
+                                            |_, _| {},
+                                        ) {
+                                            Some(cleaned) => RetryAttempt::Done(cleaned),
+                                            None => RetryAttempt::Interrupted,
+                                        }
+                                    },
+                                    send_cleaning_progress,
+                                );
+                            }
+                            let stitched = state.finish(own, enhancement_warning, diarization);
+                            final_report = Some(stitched.report);
+                            repair_plan = Some(stitched.plan);
+                            (stitched.text, stitched.warning, stitched.outcome)
                         } else {
-                            state.parts.push(final_text.clone());
+                            let part_text = own.text.clone();
+                            state.parts.push(own);
                             let _transition = transition_gate.lock();
                             // The part's text goes along so the app can keep
                             // an in-progress transcript on disk; the final
@@ -940,8 +1063,10 @@ fn worker_main(
                                 &engine_cancellation,
                                 || WorkerEvent::JobCompleted {
                                     id: job.id,
-                                    text: final_text,
+                                    text: part_text,
                                     diarization: DiarizationOutcome::NotRequested,
+                                    cleanup: None,
+                                    repair: None,
                                     notes: None,
                                     auto_paste: false,
                                     enhancement_warning: None,
@@ -952,7 +1077,20 @@ fn worker_main(
                             continue;
                         }
                     }
-                    None => (final_text, enhancement_warning, diarization),
+                    None => {
+                        if job.config.long_form {
+                            repair_plan = Some(RepairPlan {
+                                pieces: vec![RepairPiece {
+                                    text: final_text.clone(),
+                                    raw: own_report.needs_retry().then_some(raw_text),
+                                }],
+                                separator: " ".into(),
+                                unlabel: false,
+                                notes_failed: false,
+                            });
+                        }
+                        (final_text, enhancement_warning, diarization)
+                    }
                 };
 
                 let (final_text, enhancement_warning, notes_text) = if job.config.notes {
@@ -962,8 +1100,7 @@ fn worker_main(
                     info!("meeting notes requested");
                     let outcome =
                         enhance::generate_meeting_notes(&final_text, &job.config.settings, || {
-                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                                .is_some()
+                            interrupted_now()
                         });
                     match outcome {
                         enhance::NotesOutcome::Notes(notes) => (
@@ -973,6 +1110,13 @@ fn worker_main(
                         ),
                         enhance::NotesOutcome::Failed(reason) => {
                             info!(?reason, "meeting notes unavailable; saving transcript only");
+                            // A provider that could not be reached is worth
+                            // asking again later; a refusal is not.
+                            if enhance::is_unreachable(&reason) {
+                                if let Some(plan) = repair_plan.as_mut() {
+                                    plan.notes_failed = true;
+                                }
+                            }
                             (final_text, Some(reason), None)
                         }
                         enhance::NotesOutcome::Interrupted => {
@@ -1000,6 +1144,8 @@ fn worker_main(
                             id: job.id,
                             text: final_text,
                             diarization,
+                            cleanup: final_report,
+                            repair: repair_plan.filter(|plan| !plan.is_complete()),
                             notes: notes_text,
                             auto_paste: job.config.settings.auto_paste,
                             enhancement_warning,
@@ -1231,12 +1377,41 @@ fn short_reason(error: &str) -> String {
     text
 }
 
+/// A finished part of a rolling meeting: what was recognised, what cleanup
+/// made of it, and how that went (so a second pass can redo only what failed).
+#[derive(Clone, Debug, Default)]
+struct PartText {
+    raw: String,
+    text: String,
+    report: enhance::CleanupReport,
+}
+
+impl PartText {
+    /// Text that is final as it stands (e.g. a placeholder for a lost part).
+    fn plain(text: String) -> Self {
+        Self {
+            raw: text.clone(),
+            text,
+            report: enhance::CleanupReport::default(),
+        }
+    }
+}
+
+/// A rolling meeting transcription, put together.
+struct Stitched {
+    text: String,
+    outcome: DiarizationOutcome,
+    warning: Option<FallbackReason>,
+    report: enhance::CleanupReport,
+    plan: RepairPlan,
+}
+
 /// Worker-side memory of one rolling meeting transcription.
 #[derive(Default)]
 struct SessionState {
     speakers: asr::diarize::SpeakerBook,
-    /// Finished (cleaned) texts of the earlier parts, in order.
-    parts: Vec<String>,
+    /// Finished texts of the earlier parts, in order.
+    parts: Vec<PartText>,
     /// At least one part came back speaker-labelled.
     labelled: bool,
     diarization_failure: Option<String>,
@@ -1259,37 +1434,216 @@ impl SessionState {
         }
     }
 
-    /// Stitch every earlier part and `own` (the last part's text) together.
+    /// Stitch every earlier part and `own` (the last part) together.
     fn finish(
         self,
-        own: String,
+        own: PartText,
         own_warning: Option<FallbackReason>,
         own_diarization: DiarizationOutcome,
-    ) -> (String, DiarizationOutcome, Option<FallbackReason>) {
+    ) -> Stitched {
         let labelled =
             self.labelled || matches!(own_diarization, DiarizationOutcome::Labelled { .. });
         let speakers = self.speakers.len();
-        let mut pieces = self.parts;
-        pieces.push(own);
-        pieces.retain(|piece| !piece.trim().is_empty());
-        // Labelled transcripts are blocks; plain ones are one run-on string
-        // that the Markdown writer later breaks into paragraphs itself.
-        let separator = if labelled { "\n\n" } else { " " };
-        let mut text = pieces.join(separator);
-        let outcome = if labelled && speakers >= 2 {
+        let mut report = enhance::CleanupReport::default();
+        let mut pieces = Vec::new();
+        for part in self.parts.into_iter().chain(std::iter::once(own)) {
+            if part.text.trim().is_empty() {
+                continue;
+            }
+            report.add(part.report);
+            pieces.push(RepairPiece {
+                raw: part.report.needs_retry().then_some(part.raw),
+                text: part.text,
+            });
+        }
+        // One person for the whole meeting: leave it unlabelled, exactly
+        // like a single-speaker file.
+        let unlabel = labelled && speakers < 2;
+        let plan = RepairPlan {
+            pieces,
+            // Labelled transcripts are blocks; plain ones are one run-on
+            // string that the Markdown writer later breaks into paragraphs.
+            separator: if labelled { "\n\n" } else { " " }.to_string(),
+            unlabel,
+            notes_failed: false,
+        };
+        let outcome = if labelled && !unlabel {
             DiarizationOutcome::Labelled { speakers }
         } else if labelled {
-            // One person for the whole meeting: leave it unlabelled, exactly
-            // like a single-speaker file.
-            text = unlabel(&text);
             DiarizationOutcome::SingleSpeaker
         } else if let Some(reason) = self.diarization_failure {
             DiarizationOutcome::Failed(reason)
         } else {
             own_diarization
         };
-        (text, outcome, own_warning.or(self.cleanup_warning))
+        Stitched {
+            text: plan.assemble(),
+            outcome,
+            warning: own_warning.or(self.cleanup_warning),
+            report,
+            plan,
+        }
     }
+}
+
+/// Remembers that the AI provider could not be reached, so the next requests
+/// are not even attempted for a minute. Without this every meeting part (and
+/// every dictation queued behind it) would wait out a request timeout while
+/// the connection is down.
+#[derive(Default)]
+struct CleanupGate {
+    unreachable_until: Option<Instant>,
+}
+
+impl CleanupGate {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn open(&self, now: Instant) -> bool {
+        self.unreachable_until.map_or(true, |until| now >= until)
+    }
+
+    fn record(&mut self, report: &enhance::CleanupReport, now: Instant) {
+        if report.cleaned > 0 {
+            self.unreachable_until = None;
+        } else if report.unreachable > 0 {
+            self.unreachable_until = Some(now + Self::COOLDOWN);
+        }
+    }
+}
+
+struct CleanedText {
+    text: String,
+    warning: Option<FallbackReason>,
+    report: enhance::CleanupReport,
+}
+
+/// AI cleanup of a long-form transcript. `[m:ss]` markers are held back from
+/// the request (its integrity check treats digits as facts) and put back
+/// afterwards. Skips the network when the gate says the provider is down.
+/// `None` when `interrupted` fires.
+fn clean_transcript(
+    raw: &str,
+    settings: &Settings,
+    gate: &mut CleanupGate,
+    interrupted: &dyn Fn() -> bool,
+    progress: impl FnMut(usize, usize),
+) -> Option<CleanedText> {
+    let (input, stamps) = strip_timestamps(raw);
+    let attempt = gate.open(Instant::now());
+    let result = if attempt {
+        enhance::enhance_long_form(&input, settings, interrupted, progress)?
+    } else {
+        enhance::skipped_cleanup(&input)
+    };
+    // Only a real attempt says anything about the connection; a skip must not
+    // extend the cool-down it is waiting out.
+    if attempt {
+        gate.record(&result.report, Instant::now());
+    }
+    let (cleaned, warning) = completed_cleanup(result.outcome);
+    Some(CleanedText {
+        text: restore_timestamps(&cleaned, &stamps),
+        warning,
+        report: result.report,
+    })
+}
+
+/// How long the second pass at Stop may spend on parts whose cleanup failed
+/// during the meeting.
+const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// One retry of a part's cleanup.
+enum RetryAttempt {
+    /// The provider was found unreachable moments ago: don't even try.
+    Unavailable,
+    Interrupted,
+    Done(CleanedText),
+}
+
+/// A second chance for the parts whose cleanup could not reach the provider
+/// during the meeting. Stops as soon as one attempt gets nothing through (the
+/// connection is still down) or the time budget is spent; what is left is
+/// retried later in the background by the app.
+fn retry_incomplete_parts(
+    parts: &mut [PartText],
+    budget: std::time::Duration,
+    mut attempt: impl FnMut(&str) -> RetryAttempt,
+    mut progress: impl FnMut(usize, usize),
+) {
+    let started = Instant::now();
+    let todo: Vec<usize> = (0..parts.len())
+        .filter(|&index| parts[index].report.needs_retry())
+        .collect();
+    let total = todo.len();
+    progress(0, total);
+    for (done, index) in todo.into_iter().enumerate() {
+        if started.elapsed() > budget {
+            break;
+        }
+        let cleaned = match attempt(&parts[index].raw) {
+            RetryAttempt::Done(cleaned) => cleaned,
+            RetryAttempt::Unavailable | RetryAttempt::Interrupted => break,
+        };
+        let reached = cleaned.report.cleaned > 0;
+        // Never trade earlier progress for a worse second attempt.
+        if cleaned.report.cleaned >= parts[index].report.cleaned {
+            parts[index].text = cleaned.text;
+            parts[index].report = cleaned.report;
+        }
+        progress(done + 1, total);
+        if !reached {
+            break;
+        }
+    }
+}
+
+/// Run a text-only retry (see [`Rerun`]).
+fn run_rerun(
+    job: &Job,
+    rerun: Rerun,
+    gate: &mut CleanupGate,
+    event_tx: &Sender<WorkerEvent>,
+    discard_requested: &AtomicBool,
+) {
+    let interrupted = || discard_requested.load(Ordering::Acquire);
+    let completed = |text: String,
+                     notes: Option<String>,
+                     cleanup: Option<enhance::CleanupReport>,
+                     warning: Option<FallbackReason>| {
+        WorkerEvent::JobCompleted {
+            id: job.id,
+            text,
+            diarization: DiarizationOutcome::NotRequested,
+            cleanup,
+            repair: None,
+            notes,
+            auto_paste: false,
+            enhancement_warning: warning,
+            delivery_target: None,
+        }
+    };
+    let event = match rerun {
+        Rerun::Clean { raw } => {
+            match clean_transcript(&raw, &job.config.settings, gate, &interrupted, |_, _| {}) {
+                Some(cleaned) => {
+                    completed(cleaned.text, None, Some(cleaned.report), cleaned.warning)
+                }
+                None => WorkerEvent::JobDiscarded { id: job.id },
+            }
+        }
+        Rerun::Notes { text } => {
+            match enhance::generate_meeting_notes(&text, &job.config.settings, &interrupted) {
+                enhance::NotesOutcome::Notes(notes) => {
+                    completed(String::new(), Some(notes.trim().to_string()), None, None)
+                }
+                enhance::NotesOutcome::Failed(reason) => {
+                    completed(String::new(), None, None, Some(reason))
+                }
+                enhance::NotesOutcome::Interrupted => WorkerEvent::JobDiscarded { id: job.id },
+            }
+        }
+    };
+    let _ = event_tx.send(event);
 }
 
 /// Remove `[m:ss] Speaker N: ` prefixes and join the blocks into one run of
@@ -1803,6 +2157,8 @@ mod tests {
                     id: 41,
                     text: "done".into(),
                     diarization: DiarizationOutcome::NotRequested,
+                    cleanup: None,
+                    repair: None,
                     notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
@@ -1821,6 +2177,8 @@ mod tests {
                     id: 41,
                     text: "late".into(),
                     diarization: DiarizationOutcome::NotRequested,
+                    cleanup: None,
+                    repair: None,
                     notes: None,
                     auto_paste: true,
                     enhancement_warning: None,
@@ -2078,56 +2436,86 @@ mod tests {
         state
     }
 
+    fn parts(texts: &[&str]) -> Vec<PartText> {
+        texts
+            .iter()
+            .map(|text| PartText::plain((*text).to_string()))
+            .collect()
+    }
+
+    fn report(total: usize, cleaned: usize, unreachable: usize) -> enhance::CleanupReport {
+        enhance::CleanupReport {
+            total,
+            cleaned,
+            unreachable,
+        }
+    }
+
     #[test]
     fn session_stitches_labelled_parts_as_blocks_with_global_speakers() {
         let mut state = state_with_speakers(2);
         state.labelled = true;
-        state.parts = vec!["[0:00] Speaker 1: hello".into(), String::new()];
-        let (text, outcome, warning) = state.finish(
-            "[1:00:00] Speaker 2: hi again".into(),
+        state.parts = parts(&["[0:00] Speaker 1: hello", ""]);
+        let stitched = state.finish(
+            PartText::plain("[1:00:00] Speaker 2: hi again".into()),
             None,
             DiarizationOutcome::Labelled { speakers: 2 },
         );
         assert_eq!(
-            text,
+            stitched.text,
             "[0:00] Speaker 1: hello\n\n[1:00:00] Speaker 2: hi again"
         );
-        assert_eq!(outcome, DiarizationOutcome::Labelled { speakers: 2 });
-        assert!(warning.is_none());
+        assert_eq!(
+            stitched.outcome,
+            DiarizationOutcome::Labelled { speakers: 2 }
+        );
+        assert!(stitched.warning.is_none());
+        assert_eq!(stitched.plan.separator, "\n\n");
+        assert!(stitched.plan.is_complete());
     }
 
     #[test]
     fn a_meeting_with_one_voice_comes_out_unlabelled() {
         let mut state = state_with_speakers(1);
         state.labelled = true;
-        state.parts = vec!["[0:00] Speaker 1: one two".into()];
-        let (text, outcome, _) = state.finish(
-            "[1:00:00] Speaker 1: three".into(),
+        state.parts = parts(&["[0:00] Speaker 1: one two"]);
+        let stitched = state.finish(
+            PartText::plain("[1:00:00] Speaker 1: three".into()),
             None,
             DiarizationOutcome::Labelled { speakers: 1 },
         );
-        assert_eq!(text, "one two three");
-        assert_eq!(outcome, DiarizationOutcome::SingleSpeaker);
+        assert_eq!(stitched.text, "one two three");
+        assert_eq!(stitched.outcome, DiarizationOutcome::SingleSpeaker);
+        // A later repair must strip the labels the same way.
+        assert!(stitched.plan.unlabel);
+        assert_eq!(stitched.plan.assemble(), "one two three");
     }
 
     #[test]
     fn unlabelled_parts_run_together_and_empty_parts_vanish() {
         let state = SessionState {
-            parts: vec!["one two".into(), "   ".into(), "three".into()],
+            parts: parts(&["one two", "   ", "three"]),
             ..Default::default()
         };
-        let (text, outcome, _) =
-            state.finish("four".into(), None, DiarizationOutcome::NotRequested);
-        assert_eq!(text, "one two three four");
-        assert_eq!(outcome, DiarizationOutcome::NotRequested);
+        let stitched = state.finish(
+            PartText::plain("four".into()),
+            None,
+            DiarizationOutcome::NotRequested,
+        );
+        assert_eq!(stitched.text, "one two three four");
+        assert_eq!(stitched.outcome, DiarizationOutcome::NotRequested);
 
         // A silent tail adds nothing.
         let state = SessionState {
-            parts: vec!["only part".into()],
+            parts: parts(&["only part"]),
             ..Default::default()
         };
-        let (text, _, _) = state.finish(String::new(), None, DiarizationOutcome::NotRequested);
-        assert_eq!(text, "only part");
+        let stitched = state.finish(
+            PartText::plain(String::new()),
+            None,
+            DiarizationOutcome::NotRequested,
+        );
+        assert_eq!(stitched.text, "only part");
     }
 
     #[test]
@@ -2141,10 +2529,252 @@ mod tests {
             &DiarizationOutcome::Failed("later".into()),
             &Some(FallbackReason::MissingCredential),
         );
-        let (_, outcome, warning) =
-            state.finish("x".into(), None, DiarizationOutcome::Failed("last".into()));
-        assert_eq!(outcome, DiarizationOutcome::Failed("model missing".into()));
-        assert_eq!(warning, Some(FallbackReason::RequestFailed));
+        let stitched = state.finish(
+            PartText::plain("x".into()),
+            None,
+            DiarizationOutcome::Failed("last".into()),
+        );
+        assert_eq!(
+            stitched.outcome,
+            DiarizationOutcome::Failed("model missing".into())
+        );
+        assert_eq!(stitched.warning, Some(FallbackReason::RequestFailed));
+    }
+
+    #[test]
+    fn pieces_that_could_not_be_cleaned_keep_their_raw_text_for_a_retry() {
+        let state = SessionState {
+            parts: vec![
+                PartText {
+                    raw: "first as heard".into(),
+                    text: "First, cleaned.".into(),
+                    report: report(2, 2, 0),
+                },
+                PartText {
+                    raw: "second as heard".into(),
+                    text: "second as heard".into(),
+                    report: report(2, 0, 2),
+                },
+            ],
+            ..Default::default()
+        };
+        let stitched = state.finish(
+            PartText {
+                raw: "third as heard".into(),
+                text: "Third, half cleaned".into(),
+                report: report(2, 1, 1),
+            },
+            None,
+            DiarizationOutcome::NotRequested,
+        );
+        assert_eq!(stitched.report, report(6, 3, 3));
+        assert!(stitched.report.needs_retry());
+        let raws: Vec<Option<&str>> = stitched
+            .plan
+            .pieces
+            .iter()
+            .map(|piece| piece.raw.as_deref())
+            .collect();
+        assert_eq!(
+            raws,
+            vec![None, Some("second as heard"), Some("third as heard")]
+        );
+        assert!(!stitched.plan.is_complete());
+        assert_eq!(
+            stitched.plan.assemble(),
+            "First, cleaned. second as heard Third, half cleaned"
+        );
+    }
+
+    #[test]
+    fn a_plan_is_complete_only_when_nothing_is_left_to_retry() {
+        let mut plan = RepairPlan {
+            pieces: vec![RepairPiece {
+                text: "t".into(),
+                raw: Some("r".into()),
+            }],
+            separator: " ".into(),
+            unlabel: false,
+            notes_failed: false,
+        };
+        assert!(!plan.is_complete());
+        plan.pieces[0].raw = None;
+        assert!(plan.is_complete());
+        plan.notes_failed = true;
+        assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn the_cleanup_gate_closes_when_nothing_gets_through_and_reopens_on_success() {
+        let now = Instant::now();
+        let mut gate = CleanupGate::default();
+        assert!(gate.open(now));
+
+        // Some slices worked: the provider is evidently reachable.
+        gate.record(&report(4, 2, 2), now);
+        assert!(gate.open(now));
+
+        // Nothing got through: stay away for the cool-down.
+        gate.record(&report(4, 0, 4), now);
+        assert!(!gate.open(now));
+        assert!(!gate.open(now + CleanupGate::COOLDOWN - std::time::Duration::from_secs(1)));
+        assert!(gate.open(now + CleanupGate::COOLDOWN));
+
+        // A rejected answer is not a connection problem.
+        let mut gate = CleanupGate::default();
+        gate.record(&report(4, 0, 0), now);
+        assert!(gate.open(now));
+
+        // One success clears an earlier outage.
+        let mut gate = CleanupGate::default();
+        gate.record(&report(4, 0, 4), now);
+        gate.record(&report(2, 1, 1), now);
+        assert!(gate.open(now));
+    }
+
+    fn cleaned(text: &str, report: enhance::CleanupReport) -> RetryAttempt {
+        RetryAttempt::Done(CleanedText {
+            text: text.into(),
+            warning: None,
+            report,
+        })
+    }
+
+    fn pending_part(raw: &str) -> PartText {
+        PartText {
+            raw: raw.into(),
+            text: raw.into(),
+            report: report(2, 0, 2),
+        }
+    }
+
+    #[test]
+    fn the_retry_pass_fixes_parts_and_skips_those_already_clean() {
+        let mut list = vec![
+            PartText {
+                raw: "ok raw".into(),
+                text: "Ok.".into(),
+                report: report(1, 1, 0),
+            },
+            pending_part("needs it"),
+        ];
+        let mut asked = Vec::new();
+        retry_incomplete_parts(
+            &mut list,
+            std::time::Duration::from_secs(60),
+            |raw| {
+                asked.push(raw.to_string());
+                cleaned("Needs it.", report(2, 2, 0))
+            },
+            |_, _| {},
+        );
+        assert_eq!(asked, vec!["needs it"], "only the failed part is retried");
+        assert_eq!(list[0].text, "Ok.");
+        assert_eq!(list[1].text, "Needs it.");
+        assert!(!list[1].report.needs_retry());
+    }
+
+    #[test]
+    fn the_retry_pass_gives_up_at_once_while_still_offline() {
+        let mut list = vec![pending_part("a"), pending_part("b"), pending_part("c")];
+        let mut calls = 0;
+        retry_incomplete_parts(
+            &mut list,
+            std::time::Duration::from_secs(60),
+            |_| {
+                calls += 1;
+                // Nothing got through.
+                cleaned("unchanged", report(2, 0, 2))
+            },
+            |_, _| {},
+        );
+        assert_eq!(calls, 1, "one failed attempt is enough to know");
+
+        // The gate being closed means not even one attempt is made.
+        let mut calls = 0;
+        retry_incomplete_parts(
+            &mut list,
+            std::time::Duration::from_secs(60),
+            |_| {
+                calls += 1;
+                RetryAttempt::Unavailable
+            },
+            |_, _| {},
+        );
+        assert_eq!(calls, 1);
+        assert!(list.iter().all(|part| part.report.needs_retry()));
+    }
+
+    #[test]
+    fn a_worse_retry_never_replaces_earlier_progress() {
+        let mut list = vec![PartText {
+            raw: "raw".into(),
+            text: "partly cleaned".into(),
+            report: report(4, 3, 1),
+        }];
+        retry_incomplete_parts(
+            &mut list,
+            std::time::Duration::from_secs(60),
+            |_| cleaned("raw", report(4, 1, 3)),
+            |_, _| {},
+        );
+        assert_eq!(list[0].text, "partly cleaned");
+        assert_eq!(list[0].report, report(4, 3, 1));
+    }
+
+    #[test]
+    fn an_exhausted_budget_stops_the_pass() {
+        let mut list = vec![pending_part("a"), pending_part("b")];
+        let mut calls = 0;
+        retry_incomplete_parts(
+            &mut list,
+            std::time::Duration::ZERO,
+            |_| {
+                calls += 1;
+                cleaned("x", report(2, 2, 0))
+            },
+            |_, _| {},
+        );
+        assert!(calls <= 1, "a zero budget allows at most the first attempt");
+    }
+
+    #[test]
+    fn rerun_jobs_need_no_engine_and_report_how_cleanup_went() {
+        // The harness worker never loads an engine here: a rerun is text only.
+        let (mut worker, _, _, _) = worker(&[], None);
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+        let job = worker
+            .enqueue(
+                Vec::new(),
+                16_000,
+                JobConfig::rerun(
+                    settings,
+                    Rerun::Clean {
+                        raw: "[0:05] Speaker 1: as recognised".into(),
+                    },
+                ),
+            )
+            .unwrap();
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        let Some(WorkerEvent::JobCompleted {
+            text,
+            cleanup,
+            repair,
+            notes,
+            ..
+        }) = events.last()
+        else {
+            panic!("the rerun should complete");
+        };
+        // Cleanup is switched off, so the text comes back untouched, with
+        // its marker, and nothing is left to retry.
+        assert_eq!(text, "[0:05] Speaker 1: as recognised");
+        assert!(cleanup.is_some_and(|report| !report.needs_retry()));
+        assert!(repair.is_none() && notes.is_none());
     }
 
     #[test]
