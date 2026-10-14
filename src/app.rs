@@ -2692,15 +2692,15 @@ mod tests {
     use crate::worker::RecordingIntent;
     use std::time::Instant;
 
-    fn file_job(window: bool, background: bool) -> FileJob {
-        FileJob {
-            output: PathBuf::new(),
+    fn file_job(window: bool, background: bool) -> super::FileJob {
+        super::FileJob {
+            output: std::path::PathBuf::new(),
             markdown: false,
             notes: false,
             notes_output: None,
             title: String::new(),
             details: String::new(),
-            window: window.then(|| mpsc::channel().0),
+            window: window.then(|| std::sync::mpsc::channel().0),
             background,
             session: None,
         }
