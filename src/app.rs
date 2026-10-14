@@ -15,7 +15,7 @@ use crate::{
     model_manager::ModelState,
     overlay::{self, ListeningIntent, NoticeKind, OverlayViewState, ProcessingPhase},
     paste,
-    settings::{CredentialHealth, EnhanceMode, Settings, SettingsRevision},
+    settings::{CredentialHealth, EnhanceMode, MeetingNotesMode, Settings, SettingsRevision},
     sounds,
     transcript_window::{self, WindowMsg},
     tray,
@@ -131,6 +131,32 @@ struct PendingMeeting {
     tail: meeting::Segment,
     session: MeetingSession,
     recorded: Duration,
+}
+
+/// What to do about meeting notes when a recording stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotesDecision {
+    /// Show the "create notes?" question.
+    Ask,
+    /// Create notes without asking.
+    Create,
+    /// Transcript only.
+    Skip,
+    /// The user wants notes (or would be asked) but no AI provider is set
+    /// up: transcript only, with a hint.
+    SkipNoProvider,
+}
+
+/// `may_ask` is false when no question can be shown (quitting the app).
+fn notes_decision(mode: MeetingNotesMode, provider_ready: bool, may_ask: bool) -> NotesDecision {
+    match mode {
+        MeetingNotesMode::Never => NotesDecision::Skip,
+        MeetingNotesMode::Always if provider_ready => NotesDecision::Create,
+        MeetingNotesMode::Always => NotesDecision::SkipNoProvider,
+        MeetingNotesMode::Ask if !may_ask => NotesDecision::Skip,
+        MeetingNotesMode::Ask if provider_ready => NotesDecision::Ask,
+        MeetingNotesMode::Ask => NotesDecision::SkipNoProvider,
+    }
 }
 
 /// Rolling parts are queued as pieces of at most this long so that a
@@ -1738,18 +1764,25 @@ impl AppHandler {
             recorded,
         };
 
-        let can_offer_notes =
-            ask_for_notes && enhance::notes_configuration(&self.state.settings).is_ok();
-        if !can_offer_notes {
-            if ask_for_notes {
-                self.show_overlay_notice(
-                    NoticeKind::Info,
-                    "Set up an AI provider in Settings to get meeting notes",
-                );
+        let provider_ready = enhance::notes_configuration(&self.state.settings).is_ok();
+        let decision = notes_decision(
+            self.state.settings.meeting_notes,
+            provider_ready,
+            ask_for_notes,
+        );
+        match decision {
+            NotesDecision::Create | NotesDecision::Skip | NotesDecision::SkipNoProvider => {
+                if decision == NotesDecision::SkipNoProvider {
+                    self.show_overlay_notice(
+                        NoticeKind::Info,
+                        "Set up an AI provider in Settings to get meeting notes",
+                    );
+                }
+                self.state.pending_meeting = Some(pending);
+                self.finish_pending_meeting(decision == NotesDecision::Create);
+                return;
             }
-            self.state.pending_meeting = Some(pending);
-            self.finish_pending_meeting(false);
-            return;
+            NotesDecision::Ask => {}
         }
 
         self.state.pending_meeting = Some(pending);
@@ -2704,6 +2737,28 @@ mod tests {
             background,
             session: None,
         }
+    }
+
+    #[test]
+    fn notes_decision_covers_every_mode() {
+        use super::notes_decision;
+        use super::NotesDecision::{Ask as AskUser, Create, Skip, SkipNoProvider};
+        use crate::settings::MeetingNotesMode::{Always, Ask, Never};
+        // Never: no notes, no question, no hint.
+        for ready in [true, false] {
+            for may_ask in [true, false] {
+                assert_eq!(notes_decision(Never, ready, may_ask), Skip);
+            }
+        }
+        // Always: notes whenever a provider is ready, even while quitting.
+        assert_eq!(notes_decision(Always, true, true), Create);
+        assert_eq!(notes_decision(Always, true, false), Create);
+        assert_eq!(notes_decision(Always, false, true), SkipNoProvider);
+        // Ask: the question only when it can be shown and notes are possible.
+        assert_eq!(notes_decision(Ask, true, true), AskUser);
+        assert_eq!(notes_decision(Ask, true, false), Skip);
+        assert_eq!(notes_decision(Ask, false, true), SkipNoProvider);
+        assert_eq!(notes_decision(Ask, false, false), Skip);
     }
 
     #[test]

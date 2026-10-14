@@ -136,6 +136,13 @@ Long audio is split into windows of at most 30 s at the quietest nearby point
 and transcribed in order. These jobs never paste. Transcription itself never
 leaves the machine.
 
+**Turning a meeting into a full report.** [`docs/meeting-report-prompt.md`](docs/meeting-report-prompt.md)
+is a ready-made prompt for Claude: give it the saved transcript (with
+`[m:ss] Speaker N:` markers) plus the agenda, slides and other material from
+the meeting and it builds a single self-contained HTML file with an executive
+summary, decisions, action items, a topic-by-topic digest, a materials
+cross-reference, and the full verbatim transcript with a searchable index.
+
 **Recording indicator.** While a meeting is being recorded, a pill in the
 same style as the dictation indicator stays on screen, in exactly the same
 place: red `Recording 12:34` with live level bars, or amber `Paused 12:34`.
@@ -159,12 +166,13 @@ can be cleaned the raw transcript is saved with a warning. Set enhancement to
 transcript text to the provider you chose, so avoid it for confidential
 meetings unless that provider is acceptable.
 
-**Meeting notes.** If an AI provider is configured (Settings → Text
-enhancement), stopping a meeting recording asks *Also create meeting notes with
-AI?* **Yes** saves, next to the transcript, a separate
+**Meeting notes.** Under *Settings → Output and feedback* choose what happens
+when a meeting recording stops: **Ask every time** (the default), **Always**
+create notes, or **Never**. With an AI provider configured (Settings → Text
+enhancement), *Ask every time* shows *Also create meeting notes with AI?* **Yes** saves, next to the transcript, a separate
 `Meeting notes <date> <time>.md` with a *Summary*, *Key points*, *Decisions*,
 *Action items* (a `- [ ]` checklist) and *Open questions*. **No** saves the
-transcript only. Without a provider the question is skipped. The prompt forbids
+transcript only. **Always** creates the notes without asking, also when you quit mid-meeting; **Never** never asks. Without a provider the question is skipped and a hint is shown. The prompt forbids
 inventing names, owners, dates or decisions, but speakers are not labelled and
 recognition errors can slip through, so review notes before acting on them.
 Notes work even when cleanup is set to **Never**; if cleanup is on it runs

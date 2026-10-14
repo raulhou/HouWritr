@@ -10,7 +10,7 @@ use crate::model_manager::{
     CancellationToken, ModelCacheState, ModelDetails, ModelInfo, ModelManager, ModelState,
 };
 use crate::paths::settings_path;
-use crate::settings::{Enhance, EnhanceMode, Settings, SettingsRevision};
+use crate::settings::{Enhance, EnhanceMode, MeetingNotesMode, Settings, SettingsRevision};
 use crate::single_instance::SettingsTransaction;
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -1175,6 +1175,25 @@ impl SettingsApp {
                 "Show a recording indicator during meeting recordings",
             )
             .changed();
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("When a meeting recording stops, create AI meeting notes:");
+            info_button(
+                ui,
+                "Notes (summary, decisions, action items) are written by your AI provider from the transcript text, so they need a provider set up under Text enhancement. The transcript itself is always saved.",
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (mode, label) in [
+                (MeetingNotesMode::Ask, "Ask every time"),
+                (MeetingNotesMode::Always, "Always"),
+                (MeetingNotesMode::Never, "Never"),
+            ] {
+                self.dirty |= ui
+                    .radio_value(&mut self.settings.meeting_notes, mode, label)
+                    .changed();
+            }
+        });
         self.dirty |= ui
             .checkbox(
                 &mut self.settings.sounds,
