@@ -1456,39 +1456,47 @@ mod tests {
     #[repr(C)]
     struct FakeHandle;
 
-    static RELEASES: AtomicUsize = AtomicUsize::new(0);
+    // One counter and release function per test: tests run in parallel, so a
+    // shared counter made them see each other's releases.
+    static UNWIND_RELEASES: AtomicUsize = AtomicUsize::new(0);
+    static PARTIAL_RELEASES: AtomicUsize = AtomicUsize::new(0);
 
-    unsafe extern "system" fn release_fake(handle: *mut FakeHandle) {
-        RELEASES.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "system" fn release_fake_unwind(handle: *mut FakeHandle) {
+        UNWIND_RELEASES.fetch_add(1, Ordering::SeqCst);
+        drop(Box::from_raw(handle));
+    }
+
+    unsafe extern "system" fn release_fake_partial(handle: *mut FakeHandle) {
+        PARTIAL_RELEASES.fetch_add(1, Ordering::SeqCst);
         drop(Box::from_raw(handle));
     }
 
     #[test]
     fn owned_handles_release_during_error_unwind() {
-        RELEASES.store(0, Ordering::SeqCst);
+        UNWIND_RELEASES.store(0, Ordering::SeqCst);
         let result = (|| -> Result<()> {
             let raw = Box::into_raw(Box::new(FakeHandle));
-            let _handle = unsafe { OrtHandle::from_raw(raw, release_fake, "fake")? };
+            let _handle = unsafe { OrtHandle::from_raw(raw, release_fake_unwind, "fake")? };
             bail!("injected failure")
         })();
 
         assert!(result.is_err());
-        assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+        assert_eq!(UNWIND_RELEASES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn failed_creation_releases_a_partial_handle() {
-        RELEASES.store(0, Ordering::SeqCst);
+        PARTIAL_RELEASES.store(0, Ordering::SeqCst);
         let raw = Box::into_raw(Box::new(FakeHandle));
         let result: Result<OrtHandle<FakeHandle>> = finish_created_handle(
             raw,
-            release_fake,
+            release_fake_partial,
             "fake",
             Err(anyhow!("injected creation failure")),
         );
 
         assert!(result.is_err());
-        assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+        assert_eq!(PARTIAL_RELEASES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
