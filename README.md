@@ -11,7 +11,8 @@ Push-to-talk voice-to-text for Windows. Local transcription uses **NVIDIA
 Parakeet TDT 0.6B v3** on CPU or Qualcomm Hexagon NPU, plus native
 **Whisper Large v3 Turbo** on the Snapdragon X Elite NPU.
 Optional LLM cleanup via **GitHub Copilot** (Claude Haiku 4.5, GPT-5 Mini,
-GPT-4.1) or any OpenAI-compatible endpoint.
+GPT-4.1), any OpenAI-compatible endpoint, or a **model that runs on your PC**
+(on the Snapdragon NPU via Qualcomm GenieX, or a local server such as LM Studio).
 
 **[Microsoft Store](https://apps.microsoft.com/detail/9MSQWR701P2Q)** · **[Website](https://trsdn.github.io/openwritr-windows/)** · **[Releases](https://github.com/trsdn/openwritr-windows/releases)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)** · **[macOS sibling](https://github.com/trsdn/OpenWritr)**
 
@@ -277,7 +278,8 @@ Tray icon → right-click → **Settings**. All fields:
   covers both the recording waveform and typed job/status messages.
   Start/stop sounds are optional.
 - **Text enhancement**: choose **Never**, **When Shift is additionally held**,
-  or **Always**, then select GitHub Copilot or an OpenAI-compatible API.
+  or **Always**, then select GitHub Copilot, an OpenAI-compatible API, or a
+  **Local model (on this PC)** (see below).
   Shift is monitored throughout the recording, so the mode and purple overlay
   indicator update immediately instead of being fixed at the initial key
   press. In **Always** mode, additional Shift bypasses cleanup while held. The
@@ -307,6 +309,34 @@ replacement, and legacy plaintext API keys are migrated only after the secure
 credential can be written and read back successfully. Unsaved changes require
 confirmation before the Settings window closes.
 
+### Local model for AI cleanup (NPU)
+
+Settings → Text enhancement → **Local model (on this PC)** runs cleanup and
+meeting notes on a model that never leaves your computer. Two sources:
+
+- **Built-in model (NPU)** – on a Snapdragon (Windows on ARM) PC, OpenWritr
+  uses Qualcomm's [GenieX](https://github.com/qualcomm/GenieX) to run
+  `ai-hub-models/Qwen3-4B-Instruct-2507` on the Hexagon NPU. In Settings press
+  **Install GenieX…** (downloads the pinned official v0.8.0 installer, checks its
+  SHA-256, installs for your Windows user only, adds `geniex` to your PATH),
+  then **Download model** (several GB, resumable), then **Test model**.
+  OpenWritr starts `geniex serve` on a private port (18651) when a cleanup needs
+  it, stops it after 15 idle minutes, and ties it to the app so the NPU is never
+  left occupied. If the server cannot start, cleanup falls back to the raw text
+  exactly like an unreachable hosted provider.
+- **Another local server** – any OpenAI-compatible server on this PC
+  (a GenieX server you run yourself, LM Studio, Ollama, Foundry Local). Presets,
+  **Find models**, **Test connection**, and a setup guide are in Settings. Only
+  `localhost` / `127.0.0.1` / `::1` addresses are accepted here; no API key is
+  needed unless the server asks for one.
+
+Local models are slower and weaker than hosted ones, so OpenWritr sends them
+smaller slices (about 1,200 characters for cleanup, 8,000 for meeting notes),
+waits 8× longer for each answer, and removes `<think>…</think>` reasoning
+blocks from replies. The same integrity checks as for hosted models apply.
+Developer-preview note: GenieX is a Qualcomm developer preview; the pinned
+version is isolated in `src/local_llm.rs`.
+
 ## Architecture
 
 ### Native Rust app (what ships in the release zip)
@@ -329,7 +359,8 @@ openwritr-windows/
 │   │   ├── whisper_mel.rs   128-bin Whisper log-mel frontend
 │   │   ├── whisper_decoder.rs  QNN encoder/decoder and KV-cache loop
 │   │   └── qnn_ffi.rs       reusable typed QNN C-API sessions
-│   ├── enhance.rs           Copilot / OpenAI cleanup pass
+│   ├── enhance.rs           Copilot / OpenAI / local-model cleanup pass
+│   ├── local_llm.rs         GenieX install, model download, private `geniex serve`
 │   ├── sounds.rs            G3/E3 tone synth (start/stop pings)
 │   └── bin/
 │       ├── package.rs       distributable-zip builder

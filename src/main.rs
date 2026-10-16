@@ -13,6 +13,7 @@ mod diagnostics;
 mod enhance;
 mod hotkey;
 mod key_hook;
+mod local_llm;
 mod media;
 mod meeting;
 mod model_manager;

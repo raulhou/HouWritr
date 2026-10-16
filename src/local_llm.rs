@@ -1,0 +1,775 @@
+//! A language model that runs on this machine, for AI text cleanup and meeting
+//! notes.
+//!
+//! OpenWritr drives Qualcomm's GenieX command-line tool (`geniex serve` is an
+//! OpenAI-compatible server that runs AI Hub models on the Hexagon NPU) as a
+//! private child process, and the normal OpenAI-compatible cleanup pipeline
+//! talks to it over loopback. Nothing is bound in-process: GenieX is a
+//! developer-preview SDK, so keeping it behind a process boundary means a
+//! crash or an ABI change can never take the app down.
+//!
+//! What this module owns:
+//! * finding (or, with the user's consent, installing) the official GenieX CLI;
+//! * downloading / removing the model with `geniex pull` / `geniex remove`;
+//! * starting `geniex serve` on a private port when a request needs it, and
+//!   stopping it again when idle or when OpenWritr exits.
+//!
+//! The server is only ever started for the *managed* endpoint
+//! ([`MANAGED_BASE_URL`]). Any other loopback address (Ollama, LM Studio, a
+//! `geniex serve` the user runs themselves) is simply talked to.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
+use tracing::{info, warn};
+
+use crate::cleanup::EndpointScope;
+
+/// Private port for the server OpenWritr starts. Deliberately not GenieX's
+/// default (18181) so it never collides with a server the user runs.
+pub const MANAGED_PORT: u16 = 18651;
+pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
+/// Qualcomm AI Hub bundle run on the NPU (4B instruct, no reasoning prefix).
+pub const DEFAULT_MODEL: &str = "ai-hub-models/Qwen3-4B-Instruct-2507";
+
+/// Pinned official installer (GenieX v0.8.0, Windows ARM64, Inno Setup).
+const INSTALLER_URL: &str = "https://github.com/qualcomm/GenieX/releases/download/v0.8.0/geniex-cli-setup-windows-arm64-v0.8.0.exe";
+const INSTALLER_SHA256: &str = "fcc4d932f371a9b3ad3d08a1b34912fe21a7fdf7c54d47c869250b50d81ec734";
+const INSTALLER_BYTES: u64 = 65_196_910;
+
+/// How long a freshly started server may take to answer.
+const START_TIMEOUT: Duration = Duration::from_secs(90);
+/// After a failed start, further requests fail fast for this long instead of
+/// each waiting out [`START_TIMEOUT`].
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
+/// The server (and with it the NPU) is released after this much idleness.
+const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Whether `endpoint` is the server OpenWritr manages itself.
+pub fn is_managed(endpoint: &EndpointScope) -> bool {
+    endpoint.is_loopback()
+        && endpoint.port() == Some(MANAGED_PORT)
+        && endpoint.scheme() == "http"
+        && endpoint.path() == "/v1"
+}
+
+/// [`is_managed`] for a raw settings string.
+pub fn is_managed_url(raw: &str) -> bool {
+    EndpointScope::parse(raw).is_ok_and(|scope| is_managed(&scope))
+}
+
+/// Why the managed local model cannot be used right now.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalLlmError {
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("the GenieX command-line tool is not installed")]
+    CliMissing,
+    #[error("the local model server did not start: {0}")]
+    StartFailed(String),
+    #[error("the local model server failed to start recently; not retrying yet")]
+    RecentlyFailed,
+}
+
+/// The managed local model needs Qualcomm's NPU runtime, which only exists for
+/// Windows on ARM64.
+pub fn platform_support() -> std::result::Result<(), String> {
+    platform_support_for(
+        cfg!(target_arch = "aarch64"),
+        std::env::var("PROCESSOR_ARCHITEW6432").ok().as_deref(),
+    )
+}
+
+fn platform_support_for(
+    native_arm64: bool,
+    emulated_host: Option<&str>,
+) -> std::result::Result<(), String> {
+    if native_arm64 || emulated_host.is_some_and(|host| host.eq_ignore_ascii_case("ARM64")) {
+        Ok(())
+    } else {
+        Err(
+            "The built-in local model runs on Qualcomm Snapdragon (Windows on ARM). \
+             On this PC use \"Another local server\" instead."
+                .into(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finding the CLI
+// ---------------------------------------------------------------------------
+
+fn cli_candidates(
+    local_app_data: Option<&Path>,
+    program_files: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = local_app_data {
+        out.push(dir.join("GenieX CLI").join("geniex.exe"));
+    }
+    if let Some(dir) = program_files {
+        out.push(dir.join("GenieX CLI").join("geniex.exe"));
+    }
+    if let Some(path) = path_var {
+        out.extend(std::env::split_paths(path).map(|dir| dir.join("geniex.exe")));
+    }
+    out
+}
+
+/// The installed GenieX CLI, if any.
+pub fn locate_cli() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let path = std::env::var_os("PATH");
+    cli_candidates(local.as_deref(), program_files.as_deref(), path.as_deref())
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+fn work_dir() -> PathBuf {
+    crate::paths::models_dir()
+        .parent()
+        .map(|base| base.join("local-llm"))
+        .unwrap_or_else(|| PathBuf::from("local-llm"))
+}
+
+fn hidden(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+// ---------------------------------------------------------------------------
+// Installing the CLI (explicit user action)
+// ---------------------------------------------------------------------------
+
+/// Download the pinned official GenieX installer, verify it, and run it
+/// silently for the current user. The installer adds `geniex` to the user's
+/// PATH; nothing is installed machine-wide and no administrator rights are
+/// needed. `progress` receives a 0..=1 fraction while downloading.
+pub fn install_cli(progress: &mut dyn FnMut(f32), cancel: &AtomicBool) -> Result<PathBuf> {
+    platform_support().map_err(|reason| anyhow!(reason))?;
+    let dir = work_dir();
+    std::fs::create_dir_all(&dir).context("create the local model folder")?;
+    let part = dir.join("geniex-cli-setup.exe.part");
+    let installer = dir.join("geniex-cli-setup.exe");
+
+    download_verified(
+        INSTALLER_URL,
+        INSTALLER_SHA256,
+        INSTALLER_BYTES,
+        &part,
+        progress,
+        cancel,
+    )?;
+    std::fs::rename(&part, &installer).context("finish the installer download")?;
+
+    info!("running the GenieX installer");
+    let status = hidden(Command::new(&installer).args([
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/NOICONS",
+        "/TASKS=",
+    ]))
+    .status()
+    .context("start the GenieX installer")?;
+    let _ = std::fs::remove_file(&installer);
+    if !status.success() {
+        bail!("the GenieX installer exited with {status}");
+    }
+    locate_cli().ok_or_else(|| anyhow!("GenieX was installed but geniex.exe was not found"))
+}
+
+fn download_verified(
+    url: &str,
+    sha256: &str,
+    expected_bytes: u64,
+    dest: &Path,
+    progress: &mut dyn FnMut(f32),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(None)
+        .build()?;
+    let mut response = client.get(url).send()?.error_for_status()?;
+    let total = response.content_length().unwrap_or(expected_bytes).max(1);
+    let mut file = std::fs::File::create(dest).context("create the download file")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut done = 0_u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            bail!("cancelled");
+        }
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])?;
+        done += read as u64;
+        progress((done as f32 / total as f32).min(1.0));
+    }
+    file.flush()?;
+    drop(file);
+    let digest = hex(&hasher.finalize());
+    if !digest.eq_ignore_ascii_case(sha256) {
+        let _ = std::fs::remove_file(dest);
+        bail!("the download does not match the expected checksum");
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Model management
+// ---------------------------------------------------------------------------
+
+/// Whether `model` is already downloaded, according to `geniex list`.
+pub fn model_installed(cli: &Path, model: &str) -> Result<bool> {
+    let output = hidden(Command::new(cli).args(["list", "--format", "json"]))
+        .output()
+        .context("run geniex list")?;
+    if !output.status.success() {
+        bail!("geniex list failed ({})", output.status);
+    }
+    Ok(lists_model(&String::from_utf8_lossy(&output.stdout), model))
+}
+
+fn lists_model(listing: &str, model: &str) -> bool {
+    let wanted = model.trim().to_ascii_lowercase();
+    !wanted.is_empty() && listing.to_ascii_lowercase().contains(&wanted)
+}
+
+/// Download `model` with `geniex pull`. `progress` gets a percentage when the
+/// tool prints one, plus the latest status line. Cancelling keeps what was
+/// downloaded so far (GenieX resumes).
+pub fn pull_model(
+    cli: &Path,
+    model: &str,
+    progress: &mut dyn FnMut(Option<f32>, &str),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut child = hidden(
+        Command::new(cli)
+            .args(["pull", model])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .spawn()
+    .context("start geniex pull")?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    for stream in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || split_progress_lines(stream, &tx));
+    }
+    drop(tx);
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("cancelled");
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                let clean = strip_ansi(&line);
+                let clean = clean.trim();
+                if !clean.is_empty() {
+                    progress(parse_percent(clean), clean);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("geniex pull failed ({status})");
+    }
+    Ok(())
+}
+
+pub fn remove_model(cli: &Path, model: &str) -> Result<()> {
+    let status = hidden(Command::new(cli).args(["remove", model, "--yes"]))
+        .status()
+        .context("run geniex remove")?;
+    if !status.success() {
+        bail!("geniex remove failed ({status})");
+    }
+    Ok(())
+}
+
+/// Emit text split on `\r` and `\n` (progress bars redraw with `\r`).
+fn split_progress_lines(mut stream: Box<dyn Read + Send>, tx: &mpsc::Sender<String>) {
+    let mut current = Vec::new();
+    let mut byte = [0_u8; 1];
+    while matches!(stream.read(&mut byte), Ok(1)) {
+        if byte[0] == b'\r' || byte[0] == b'\n' {
+            if !current.is_empty() {
+                let _ = tx.send(String::from_utf8_lossy(&current).into_owned());
+                current.clear();
+            }
+        } else {
+            current.push(byte[0]);
+        }
+    }
+    if !current.is_empty() {
+        let _ = tx.send(String::from_utf8_lossy(&current).into_owned());
+    }
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The last `NN%` / `NN.N%` figure in a progress line.
+fn parse_percent(line: &str) -> Option<f32> {
+    let end = line.rfind('%')?;
+    let head = &line[..end];
+    let start = head
+        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map_or(0, |index| index + 1);
+    head[start..]
+        .parse::<f32>()
+        .ok()
+        .filter(|value| (0.0..=100.0).contains(value))
+}
+
+// ---------------------------------------------------------------------------
+// The server process
+// ---------------------------------------------------------------------------
+
+struct Server {
+    child: Option<Child>,
+    last_used: Instant,
+    failed_at: Option<Instant>,
+    reaper_running: bool,
+}
+
+static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
+    Mutex::new(Server {
+        child: None,
+        last_used: Instant::now(),
+        failed_at: None,
+        reaper_running: false,
+    })
+});
+
+/// Make sure a request to `endpoint` can be answered. A no-op for every
+/// endpoint other than the managed one.
+pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), LocalLlmError> {
+    if !is_managed(endpoint) {
+        return Ok(());
+    }
+    let mut server = SERVER.lock();
+    server.last_used = Instant::now();
+
+    if let Some(child) = server.child.as_mut() {
+        match child.try_wait() {
+            Ok(None) => return Ok(()),
+            _ => {
+                warn!("local model server exited; restarting");
+                server.child = None;
+            }
+        }
+    }
+    // Something else (a server the user started) already answers there.
+    if server_answers(Duration::from_millis(500)) {
+        return Ok(());
+    }
+    if server
+        .failed_at
+        .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE)
+    {
+        return Err(LocalLlmError::RecentlyFailed);
+    }
+
+    let result = start_server();
+    match result {
+        Ok(child) => {
+            server.child = Some(child);
+            server.failed_at = None;
+            if !server.reaper_running {
+                server.reaper_running = true;
+                std::thread::spawn(reap_when_idle);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            server.failed_at = Some(Instant::now());
+            Err(error)
+        }
+    }
+}
+
+fn start_server() -> std::result::Result<Child, LocalLlmError> {
+    platform_support().map_err(LocalLlmError::Unsupported)?;
+    let cli = locate_cli().ok_or(LocalLlmError::CliMissing)?;
+    info!(cli = %cli.display(), "starting the local model server");
+    let mut child = hidden(
+        Command::new(&cli)
+            .args(["serve", "--host", &format!("127.0.0.1:{MANAGED_PORT}")])
+            .env("GENIEX_LOG", "none")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .spawn()
+    .map_err(|error| LocalLlmError::StartFailed(error.to_string()))?;
+    kill_with_parent(&child);
+
+    let started = Instant::now();
+    while started.elapsed() < START_TIMEOUT {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(LocalLlmError::StartFailed(format!("exited with {status}")));
+        }
+        if server_answers(Duration::from_secs(2)) {
+            info!(took = ?started.elapsed(), "local model server is ready");
+            return Ok(child);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(LocalLlmError::StartFailed("timed out".into()))
+}
+
+fn server_answers(timeout: Duration) -> bool {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .and_then(|client| client.get(format!("{MANAGED_BASE_URL}/models")).send())
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn reap_when_idle() {
+    loop {
+        std::thread::sleep(Duration::from_secs(30));
+        let mut server = SERVER.lock();
+        if server.child.is_none() {
+            server.reaper_running = false;
+            return;
+        }
+        if server.last_used.elapsed() >= IDLE_STOP {
+            info!("local model server idle; stopping it");
+            stop_locked(&mut server);
+            server.reaper_running = false;
+            return;
+        }
+    }
+}
+
+fn stop_locked(server: &mut Server) {
+    if let Some(mut child) = server.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Stop the server (called when OpenWritr exits or the model is removed).
+pub fn shutdown() {
+    stop_locked(&mut SERVER.lock());
+}
+
+/// Tie the child's life to ours: when OpenWritr exits for any reason, even a
+/// crash, Windows ends the server too, so the NPU is never left occupied.
+fn kill_with_parent(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // The job handle is intentionally never closed: it lives as long as the
+    // process, and closing it is what kills the children.
+    static JOB: Lazy<usize> = Lazy::new(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set == 0 {
+            return 0;
+        }
+        job as usize
+    });
+
+    let job = *JOB;
+    if job == 0 {
+        warn!("could not create a job object; the server will not stop with the app");
+        return;
+    }
+    let assigned =
+        unsafe { AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE) };
+    if assigned == 0 {
+        warn!("could not attach the local model server to the app's job");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test connection (used by Settings)
+// ---------------------------------------------------------------------------
+
+/// Start the built-in server and load its model in the background, so the
+/// cleanup that follows a dictation does not wait for the NPU to wake up.
+/// Does nothing unless `base_url` is the built-in endpoint.
+pub fn prewarm(base_url: &str, model: &str) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if !is_managed_url(base_url) || RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (base_url, model) = (base_url.to_string(), model.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("local-llm-prewarm".into())
+        .spawn(move || {
+            if let Err(error) = test_chat(&base_url, &model) {
+                warn!(error = %error, "local model prewarm failed");
+            }
+            RUNNING.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// Models a server reports at `GET <base>/models` (OpenAI list format).
+pub fn discover_models(base_url: &str) -> Result<Vec<String>> {
+    let scope = EndpointScope::parse(base_url).map_err(|error| anyhow!(error.to_string()))?;
+    if !scope.is_loopback() {
+        bail!("only servers on this PC can be queried here");
+    }
+    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let value: serde_json::Value = client
+        .get(scope.join("/models"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    Ok(parse_model_ids(&value))
+}
+
+/// Send one tiny chat request to a server on this PC and report how long the
+/// answer took. The first request to the built-in model includes loading it
+/// onto the NPU, so the timeout is generous.
+pub fn test_chat(base_url: &str, model: &str) -> Result<Duration> {
+    let scope = EndpointScope::parse(base_url).map_err(|error| anyhow!(error.to_string()))?;
+    if !scope.is_loopback() {
+        bail!("only servers on this PC can be tested here");
+    }
+    if model.trim().is_empty() {
+        bail!("enter a model ID first");
+    }
+    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()?;
+    let started = Instant::now();
+    let response = client
+        .post(scope.join("/chat/completions"))
+        .json(&serde_json::json!({
+            "model": model.trim(),
+            "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
+            "max_tokens": 32,
+            "temperature": 0.0,
+        }))
+        .send()
+        .context("the server did not answer")?;
+    if !response.status().is_success() {
+        bail!("the server answered with {}", response.status());
+    }
+    let value: serde_json::Value = response.json().context("the answer was not valid JSON")?;
+    let has_text = value
+        .pointer("/choices/0/message/content")
+        .and_then(|content| content.as_str())
+        .is_some();
+    if !has_text {
+        bail!("the answer had no text in the OpenAI chat format");
+    }
+    Ok(started.elapsed())
+}
+
+fn parse_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(raw: &str) -> EndpointScope {
+        EndpointScope::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn only_the_private_loopback_endpoint_is_managed() {
+        assert!(is_managed(&scope(MANAGED_BASE_URL)));
+        assert!(is_managed(&scope("http://localhost:18651/v1/")));
+        assert!(!is_managed(&scope("http://127.0.0.1:18181/v1")));
+        assert!(!is_managed(&scope("http://127.0.0.1:11434/v1")));
+        assert!(!is_managed(&scope("https://127.0.0.1:18651/v1")));
+        assert!(!is_managed(&scope("http://192.168.1.5:18651/v1")));
+        assert!(!is_managed(&scope("http://127.0.0.1:18651")));
+    }
+
+    #[test]
+    fn platform_support_needs_arm64() {
+        assert!(platform_support_for(true, None).is_ok());
+        assert!(platform_support_for(false, Some("ARM64")).is_ok());
+        assert!(platform_support_for(false, Some("arm64")).is_ok());
+        assert!(platform_support_for(false, None).is_err());
+        assert!(platform_support_for(false, Some("AMD64")).is_err());
+    }
+
+    #[test]
+    fn cli_search_order_is_install_dir_then_program_files_then_path() {
+        let path = std::env::join_paths(["tools", "bin"]).unwrap();
+        let found = cli_candidates(
+            Some(Path::new("local")),
+            Some(Path::new("programs")),
+            Some(&path),
+        );
+        assert_eq!(
+            found,
+            [
+                Path::new("local").join("GenieX CLI").join("geniex.exe"),
+                Path::new("programs").join("GenieX CLI").join("geniex.exe"),
+                Path::new("tools").join("geniex.exe"),
+                Path::new("bin").join("geniex.exe"),
+            ]
+        );
+        assert!(cli_candidates(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn model_listing_match_is_case_insensitive_and_non_empty() {
+        let listing = r#"[{"name":"ai-hub-models/Qwen3-4B-Instruct-2507","size":123}]"#;
+        assert!(lists_model(listing, DEFAULT_MODEL));
+        assert!(lists_model(listing, "AI-HUB-MODELS/qwen3-4b-instruct-2507"));
+        assert!(!lists_model(listing, "ai-hub-models/Other"));
+        assert!(!lists_model(listing, "  "));
+        assert!(!lists_model("[]", DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn percent_is_read_from_progress_lines() {
+        assert_eq!(
+            parse_percent("Downloading  42%  1.2 GiB/2.9 GiB"),
+            Some(42.0)
+        );
+        assert_eq!(parse_percent("[=====>   ] 63.5% 12 MB/s"), Some(63.5));
+        assert_eq!(parse_percent("100%"), Some(100.0));
+        assert_eq!(parse_percent("step 1 of 3"), None);
+        assert_eq!(parse_percent("up 250%"), None);
+        assert_eq!(parse_percent("%"), None);
+    }
+
+    #[test]
+    fn ansi_escapes_are_removed() {
+        assert_eq!(strip_ansi("\u{1b}[32m✔  done\u{1b}[0m"), "✔  done");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn progress_lines_split_on_carriage_returns() {
+        let (tx, rx) = mpsc::channel();
+        let data: Box<dyn Read + Send> =
+            Box::new(std::io::Cursor::new(b"10%\r20%\r\n\nfinished".to_vec()));
+        split_progress_lines(data, &tx);
+        drop(tx);
+        let lines: Vec<String> = rx.iter().collect();
+        assert_eq!(lines, ["10%", "20%", "finished"]);
+    }
+
+    #[test]
+    fn model_ids_are_read_sorted_and_deduplicated() {
+        let value = serde_json::json!({
+            "object": "list",
+            "data": [{"id": "b"}, {"id": "a"}, {"id": "b"}, {"nope": 1}]
+        });
+        assert_eq!(parse_model_ids(&value), ["a", "b"]);
+        assert!(parse_model_ids(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn hex_is_lowercase_and_padded() {
+        assert_eq!(hex(&[0, 15, 255]), "000fff");
+    }
+
+    #[test]
+    fn unmanaged_endpoints_never_start_anything() {
+        assert!(ensure_running(&scope("http://127.0.0.1:11434/v1")).is_ok());
+        assert!(ensure_running(&scope("https://api.openai.com/v1")).is_ok());
+    }
+}

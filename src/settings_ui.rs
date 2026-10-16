@@ -17,6 +17,9 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+mod local_model;
+use local_model::LocalModelUi;
+
 pub fn run_dialog(show_about: bool) -> Result<()> {
     let (settings, initial_error, migration_blocked, load_failed, settings_revision) =
         match Settings::load_runtime() {
@@ -66,6 +69,7 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
         Box::new(move |cc| {
             apply_dark_theme(&cc.egui_ctx);
             Ok(Box::new(SettingsApp {
+                local_model: LocalModelUi::new(&settings.enhance),
                 settings,
                 dirty: false,
                 api_key_input: String::new(),
@@ -142,6 +146,7 @@ struct SettingsApp {
     about_error: Option<String>,
     autostart: AutostartUi,
     speaker_model: SpeakerModelUi,
+    local_model: LocalModelUi,
 }
 
 /// Id of the speaker-label models in `models-manifest.json`.
@@ -1286,31 +1291,13 @@ impl SettingsApp {
                 "Only recognized transcript text is sent to the provider. Recorded audio stays on this PC.",
             );
         });
-        let before_provider = self.settings.enhance.provider.clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(
-                &mut self.settings.enhance.provider,
-                "github_copilot".into(),
-                "GitHub Copilot",
-            );
-            ui.radio_value(
-                &mut self.settings.enhance.provider,
-                "openai_compatible".into(),
-                "OpenAI-compatible API",
-            );
-        });
-        if before_provider != self.settings.enhance.provider {
-            if self.settings.enhance.provider != "openai_compatible" {
-                self.api_key_input.clear();
-                self.remove_api_key = false;
-            }
-            self.dirty = true;
-        }
+        self.render_provider_choice(ui);
 
         ui.add_space(8.0);
 
         match self.settings.enhance.provider.as_str() {
             "github_copilot" => self.render_github_copilot(ui),
+            "openai_compatible" if self.local_model.local_selected => self.render_local_model(ui),
             "openai_compatible" => self.render_openai_compatible(ui),
             _ => inline_error(ui, "Select a supported enhancement provider."),
         }
@@ -1431,6 +1418,10 @@ impl SettingsApp {
         }
 
         ui.add_space(6.0);
+        self.render_api_key_controls(ui);
+    }
+
+    fn render_api_key_controls(&mut self, ui: &mut egui::Ui) {
         match &self.credential_status {
             CredentialStatus::Saved if !self.remove_api_key => status_label(
                 ui,
@@ -1851,6 +1842,7 @@ impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_copilot_probe();
         self.poll_speaker_model_job(ctx);
+        self.poll_local_model(ctx);
 
         if ctx.input(|input| input.viewport().close_requested()) && self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

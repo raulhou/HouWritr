@@ -1533,7 +1533,7 @@ fn clean_transcript(
     let result = if attempt {
         enhance::enhance_long_form(&input, settings, interrupted, progress)?
     } else {
-        enhance::skipped_cleanup(&input)
+        enhance::skipped_cleanup(&input, settings)
     };
     // Only a real attempt says anything about the connection; a skip must not
     // extend the cool-down it is waiting out.

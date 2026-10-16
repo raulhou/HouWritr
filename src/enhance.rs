@@ -175,6 +175,44 @@ pub fn enhance_outcome(
 /// Longest a single cleanup request may take.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A model running on this machine generates far slower than a hosted one
+/// (and may still be loading), so every request timeout is multiplied.
+const LOCAL_TIMEOUT_FACTOR: u32 = 8;
+
+/// Whether the target is an OpenAI-compatible server on this machine.
+fn is_local_target(target: &PromptTarget) -> bool {
+    target.endpoint().is_some_and(EndpointScope::is_loopback)
+}
+
+/// Whether the configured cleanup provider is a model on this machine.
+pub fn uses_local_model(settings: &Settings) -> bool {
+    settings
+        .prompt_target()
+        .map(|target| is_local_target(&target))
+        .unwrap_or(false)
+}
+
+/// Small local models have short context windows and generate slowly, so
+/// they get smaller slices than a hosted model.
+const LOCAL_CLEANUP_CHARS: usize = 1_200;
+const LOCAL_NOTES_PART_CHARS: usize = 8_000;
+
+fn cleanup_slice_chars(settings: &Settings) -> usize {
+    if uses_local_model(settings) {
+        LOCAL_CLEANUP_CHARS
+    } else {
+        LONG_FORM_CLEANUP_CHARS
+    }
+}
+
+fn notes_part_chars(settings: &Settings) -> usize {
+    if uses_local_model(settings) {
+        LOCAL_NOTES_PART_CHARS
+    } else {
+        NOTES_PART_CHARS
+    }
+}
+
 /// Read the just-in-time credential, bind it to the frozen target, send the
 /// prepared chat request and return the assistant text. Every failure maps to
 /// a content-free [`FallbackReason`].
@@ -184,18 +222,23 @@ fn request_content(
 ) -> std::result::Result<String, FallbackReason> {
     let provider = prepared.provider;
 
+    let local = is_local_target(&prepared.target);
+
     // Secrets are the sole just-in-time setting: read them only when the job
-    // actually reaches provider execution.
+    // actually reaches provider execution. A server on this machine (Ollama,
+    // LM Studio, GenieX, ...) usually needs no key, so for those the key is
+    // optional and a failed lookup just means "send none".
     let token = match provider {
         EnhanceProvider::GithubCopilot => match gh_token() {
-            Ok(token) => token,
+            Ok(token) => Some(token),
             Err(error) => {
                 warn!(error = %error, "GitHub Copilot credential lookup failed");
                 return Err(FallbackReason::MissingCredential);
             }
         },
         EnhanceProvider::OpenAiCompatible => match read_openai_api_key() {
-            Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+            Ok(Some(secret)) if !secret.trim().is_empty() => Some(secret),
+            _ if local => None,
             Ok(_) => {
                 warn!("OpenAI-compatible credential is not configured");
                 return Err(FallbackReason::MissingCredential);
@@ -205,6 +248,19 @@ fn request_content(
                 return Err(FallbackReason::MissingCredential);
             }
         },
+    };
+
+    // OpenWritr's own local model server is started on demand.
+    if let Some(endpoint) = prepared.target.endpoint() {
+        if let Err(error) = crate::local_llm::ensure_running(endpoint) {
+            warn!(error = %error, "local model server is not available");
+            return Err(FallbackReason::RequestFailed);
+        }
+    }
+    let timeout = if local {
+        timeout * LOCAL_TIMEOUT_FACTOR
+    } else {
+        timeout
     };
 
     let client = match reqwest::blocking::Client::builder()
@@ -217,10 +273,10 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
-    let mut request = client
-        .post(&prepared.url)
-        .bearer_auth(&token)
-        .json(&prepared.body);
+    let mut request = client.post(&prepared.url).json(&prepared.body);
+    if let Some(token) = &token {
+        request = request.bearer_auth(token);
+    }
     for &(name, value) in provider.request_headers() {
         request = request.header(name, value);
     }
@@ -365,7 +421,7 @@ pub fn enhance_long_form(
     progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
     clean_slices(
-        split_for_cleanup(text, LONG_FORM_CLEANUP_CHARS),
+        split_for_cleanup(text, cleanup_slice_chars(settings)),
         |slice| enhance_outcome(slice, settings, || !interrupted()),
         &interrupted,
         progress,
@@ -375,8 +431,8 @@ pub fn enhance_long_form(
 /// What cleanup would report if it were skipped outright (the provider was
 /// found unreachable moments ago): the text is returned untouched and every
 /// slice is marked for a later retry.
-pub fn skipped_cleanup(text: &str) -> LongFormCleanup {
-    let slices = split_for_cleanup(text, LONG_FORM_CLEANUP_CHARS);
+pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
+    let slices = split_for_cleanup(text, cleanup_slice_chars(settings));
     LongFormCleanup {
         report: CleanupReport {
             total: slices.len(),
@@ -532,7 +588,7 @@ pub fn generate_meeting_notes(
     if !transcript.chars().any(char::is_alphanumeric) {
         return NotesOutcome::Failed(FallbackReason::EmptyCandidate);
     }
-    let parts = split_for_cleanup(transcript, NOTES_PART_CHARS);
+    let parts = split_for_cleanup(transcript, notes_part_chars(settings));
     let mut part_notes = Vec::with_capacity(parts.len());
     for (index, part) in parts.iter().enumerate() {
         if interrupted() {
@@ -762,6 +818,56 @@ mod tests {
 
 #[cfg(test)]
 mod long_form_tests {
+    fn openai_settings(base_url: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.enhance.provider = "openai_compatible".into();
+        settings.enhance.base_url = base_url.into();
+        settings.enhance.model = "some-model".into();
+        settings
+    }
+
+    #[test]
+    fn local_profile_applies_only_to_loopback_endpoints() {
+        let local = openai_settings("http://127.0.0.1:18651/v1");
+        assert!(uses_local_model(&local));
+        assert_eq!(cleanup_slice_chars(&local), LOCAL_CLEANUP_CHARS);
+        assert_eq!(notes_part_chars(&local), LOCAL_NOTES_PART_CHARS);
+
+        let hosted = openai_settings("https://api.openai.com/v1");
+        assert!(!uses_local_model(&hosted));
+        assert_eq!(cleanup_slice_chars(&hosted), LONG_FORM_CLEANUP_CHARS);
+        assert_eq!(notes_part_chars(&hosted), NOTES_PART_CHARS);
+
+        let lan = openai_settings("http://192.168.1.20:1234/v1");
+        assert!(!uses_local_model(&lan), "a LAN server is not this machine");
+
+        let mut copilot = Settings::default();
+        copilot.enhance.provider = "github_copilot".into();
+        assert!(!uses_local_model(&copilot));
+    }
+
+    #[test]
+    fn local_slices_are_smaller_so_they_fit_a_small_model() {
+        const { assert!(LOCAL_CLEANUP_CHARS < LONG_FORM_CLEANUP_CHARS) };
+        const { assert!(LOCAL_NOTES_PART_CHARS < NOTES_PART_CHARS) };
+        let text = "A sentence of some length. ".repeat(200);
+        let local = split_for_cleanup(&text, LOCAL_CLEANUP_CHARS);
+        let hosted = split_for_cleanup(&text, LONG_FORM_CLEANUP_CHARS);
+        assert!(local.len() > hosted.len());
+        assert!(local
+            .iter()
+            .all(|slice| slice.chars().count() <= LOCAL_CLEANUP_CHARS));
+    }
+
+    #[test]
+    fn a_local_target_keeps_its_loopback_identity_in_the_prompt_target() {
+        let prepared =
+            prepare_cleanup_request("hello there", &openai_settings("http://localhost:11434/v1"))
+                .unwrap();
+        assert!(is_local_target(&prepared.target));
+        assert_eq!(prepared.url, "http://localhost:11434/v1/chat/completions");
+    }
+
     use super::*;
 
     #[test]
@@ -915,7 +1021,7 @@ mod long_form_tests {
     #[test]
     fn skipped_cleanup_returns_the_text_and_marks_every_slice_for_retry() {
         let text = format!("{}\n\n{}", "a ".repeat(1_400), "b ".repeat(1_400));
-        let skipped = skipped_cleanup(&text);
+        let skipped = skipped_cleanup(&text, &Settings::default());
         assert!(skipped.report.total >= 2);
         assert_eq!(skipped.report.unreachable, skipped.report.total);
         assert_eq!(

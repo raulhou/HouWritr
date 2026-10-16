@@ -1327,6 +1327,11 @@ impl AppHandler {
                 .iter()
                 .any(|modifier| modifier == "shift");
             let intent = recording_intent(settings.enhance.mode, shift_is_modifier, shift_down);
+            if settings.enhance.mode != crate::settings::EnhanceMode::Never
+                && settings.enhance.provider == "openai_compatible"
+            {
+                crate::local_llm::prewarm(&settings.enhance.base_url, &settings.enhance.model);
+            }
             match self.state.recorder.start(settings.max_record_seconds) {
                 Ok(capture) => {
                     self.state.tray.set_status(
@@ -2975,6 +2980,7 @@ impl AppHandler {
         if !paste::wait_for_pending_restorations(Duration::from_secs(2)) {
             warn!("clipboard restoration did not settle before the shutdown timeout");
         }
+        crate::local_llm::shutdown();
         el.exit();
     }
 }

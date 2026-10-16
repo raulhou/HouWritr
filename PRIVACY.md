@@ -36,6 +36,14 @@ OpenWritr connects to the internet only for:
    configured OpenAI-compatible API for grammar and punctuation cleanup using
    your own credentials. The provider's privacy policy applies. Set enhancement
    to **Never** to keep all processing local.
+4. **Optional local model for cleanup** — choose *Local model (on this PC)*
+   in Settings and the text is processed by a model running on your own
+   computer (on the Snapdragon NPU, or a server such as LM Studio on
+   `localhost`); the text is never sent over the internet. Setting it up
+   downloads, only when you press the button, the official Qualcomm GenieX
+   installer from GitHub (about 62 MB, checked against a pinned SHA-256) and
+   the model from Qualcomm AI Hub (several GB). Only loopback addresses are
+   accepted for a local model.
 
 ## Data stored on your device
 

@@ -92,6 +92,19 @@ impl EndpointScope {
         &self.path
     }
 
+    /// Whether the endpoint is on this machine: `localhost`, any `127.0.0.0/8`
+    /// address, or `::1`. Look-alike names such as `127.0.0.1.example.com`
+    /// are not loopback.
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        if host == "localhost" {
+            return true;
+        }
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    }
+
     /// The canonical base URL string (no trailing slash).
     pub fn base_url(&self) -> String {
         let mut out = format!("{}://{}", self.scheme, self.host);
@@ -170,6 +183,32 @@ pub enum EndpointScopeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_detection_is_strict() {
+        let loopback = [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST/v1",
+            "http://127.0.0.1:18181/v1",
+            "http://127.1.2.3/v1",
+            "http://[::1]:1234/v1",
+        ];
+        for raw in loopback {
+            assert!(EndpointScope::parse(raw).unwrap().is_loopback(), "{raw}");
+        }
+        let remote = [
+            "https://api.openai.com/v1",
+            "http://192.168.1.10:11434/v1",
+            "http://0.0.0.0:8080/v1",
+            "http://127.0.0.1.example.com/v1",
+            "http://localhost.example.com/v1",
+            "http://my.localhost/v1",
+            "http://[::2]/v1",
+        ];
+        for raw in remote {
+            assert!(!EndpointScope::parse(raw).unwrap().is_loopback(), "{raw}");
+        }
+    }
 
     /// Golden canonicalization table: raw input -> canonical base URL.
     #[test]
