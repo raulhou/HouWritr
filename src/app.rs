@@ -2074,6 +2074,9 @@ impl AppHandler {
         if let DiarizationOutcome::Failed(reason) = &diarization {
             warnings.push(format!("Speaker labels unavailable: {reason}"));
         }
+        if let Some(note) = self.unlabelled_note(&diarization, text) {
+            warnings.push(note);
+        }
         let speakers = match &diarization {
             DiarizationOutcome::Labelled { speakers } => Some(*speakers),
             _ => None,
@@ -2134,8 +2137,28 @@ impl AppHandler {
             };
             if let DiarizationOutcome::Labelled { speakers } = &diarization {
                 message.push_str(&format!(" · {speakers} speakers"));
+            } else if let Some(note) = self.unlabelled_note(&diarization, text) {
+                message.push_str(&format!(" · {}", note.trim_end_matches('.')));
             }
             self.report_long_form(windowed, false, &message);
+        }
+    }
+
+    /// Why a finished file or meeting transcript has no speaker labels, when
+    /// that is not an error (switched off, or only one voice heard).
+    fn unlabelled_note(&self, diarization: &DiarizationOutcome, text: &str) -> Option<String> {
+        match diarization {
+            // A retried cleanup reports `NotRequested` for text that already
+            // carries labels from the first pass.
+            DiarizationOutcome::NotRequested
+                if !self.state.settings.diarize_speakers && !text.contains("Speaker 1:") =>
+            {
+                Some("Speaker labels are off. Turn them on in Settings → Speaker labels.".into())
+            }
+            DiarizationOutcome::SingleSpeaker => {
+                Some("Only one speaker was detected, so no labels were added.".into())
+            }
+            _ => None,
         }
     }
 
