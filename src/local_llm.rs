@@ -296,6 +296,8 @@ pub fn pull_model(
     }
     drop(tx);
 
+    // The last few lines the tool printed: when it fails, they say why.
+    let mut recent: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -308,6 +310,12 @@ pub fn pull_model(
                 let clean = clean.trim();
                 if !clean.is_empty() {
                     progress(parse_percent(clean), clean);
+                    if parse_percent(clean).is_none() {
+                        recent.push_back(clean.to_string());
+                        if recent.len() > 4 {
+                            recent.pop_front();
+                        }
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -316,7 +324,11 @@ pub fn pull_model(
     }
     let status = child.wait()?;
     if !status.success() {
-        bail!("geniex pull failed ({status})");
+        let detail = recent.into_iter().collect::<Vec<_>>().join(" | ");
+        if detail.is_empty() {
+            bail!("geniex pull failed ({status})");
+        }
+        bail!("geniex pull failed ({status}): {detail}");
     }
     Ok(())
 }

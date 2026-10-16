@@ -474,7 +474,11 @@ impl SettingsApp {
             });
         match spawned {
             Ok(_) => {
-                self.local_model.outcome = None;
+                // The automatic re-check after a download must not wipe the
+                // message that download just produced.
+                if kind != JobKind::Check {
+                    self.local_model.outcome = None;
+                }
                 self.local_model.job = Some(LocalJob {
                     kind,
                     events,
@@ -530,7 +534,7 @@ impl SettingsApp {
             Some((kind, result)) => {
                 self.local_model.job = None;
                 self.local_model.outcome = match result {
-                    Ok(message) if message.is_empty() => None,
+                    Ok(message) if message.is_empty() => self.local_model.outcome.take(),
                     Ok(message) => Some(Ok(message)),
                     Err(message) if message.contains("cancelled") => Some(Err("Cancelled.".into())),
                     Err(message) => Some(Err(message)),
