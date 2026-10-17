@@ -95,8 +95,48 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
     .map_err(|error| anyhow!("egui run failed: {error}"))
 }
 
+/// Windows fonts that cover Chinese, best first. egui's built-in fonts have
+/// no CJK glyphs, so without one of these Chinese text shows as boxes.
+const CJK_FONT_FILES: &[&str] = &["msyh.ttc", "msjh.ttc", "simsun.ttc", "Deng.ttf"];
+
+fn cjk_font_candidates(windows_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    CJK_FONT_FILES
+        .iter()
+        .map(|file| windows_dir.join("Fonts").join(file))
+        .collect()
+}
+
+/// Add the first installed Chinese-capable system font behind egui's own
+/// fonts, so Latin text looks the same and Chinese falls through to it.
+fn install_cjk_fallback_font(ctx: &egui::Context) {
+    let windows_dir = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SystemRoot"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let Some(bytes) = cjk_font_candidates(&windows_dir)
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "system-cjk".into(),
+        egui::FontData::from_owned(bytes).into(),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("system-cjk".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
 pub(crate) fn apply_dark_theme(ctx: &egui::Context) {
     use egui::{Color32, FontFamily, FontId, Stroke, Style, Visuals};
+    install_cjk_fallback_font(ctx);
     let mut style = Style::default();
     style.visuals = Visuals::dark();
     style.visuals.window_fill = Color32::from_rgb(20, 23, 31);
@@ -2312,6 +2352,19 @@ fn label_for_trigger(trigger: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cjk_font_candidates_live_in_the_windows_fonts_folder_best_first() {
+        let found = cjk_font_candidates(std::path::Path::new("win"));
+        assert_eq!(found.len(), CJK_FONT_FILES.len());
+        assert_eq!(
+            found[0],
+            std::path::Path::new("win").join("Fonts").join("msyh.ttc")
+        );
+        assert!(found
+            .iter()
+            .all(|path| path.parent().unwrap().ends_with("Fonts")));
+    }
+
     use super::*;
     use crate::credentials::CredentialError;
     use parking_lot::Mutex;
