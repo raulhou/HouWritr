@@ -885,9 +885,12 @@ fn worker_main(
                             Err(error) => {
                                 // An interruption is handled right below by
                                 // the transcription step's own checks.
-                                warn!(error = %error, "speaker diarization failed; continuing without labels");
+                                warn!(
+                                    error = format!("{error:#}"),
+                                    "speaker diarization failed; continuing without labels"
+                                );
                                 diarization =
-                                    DiarizationOutcome::Failed(short_reason(&error.to_string()));
+                                    DiarizationOutcome::Failed(short_reason(&format!("{error:#}")));
                                 None
                             }
                         }
@@ -1370,8 +1373,8 @@ fn restore_timestamps(cleaned: &str, stamps: &[String]) -> String {
 /// Short, single-line version of an error for user-facing notices.
 fn short_reason(error: &str) -> String {
     let first_line = error.lines().next().unwrap_or_default();
-    let mut text: String = first_line.chars().take(120).collect();
-    if first_line.chars().count() > 120 {
+    let mut text: String = first_line.chars().take(240).collect();
+    if first_line.chars().count() > 240 {
         text.push('…');
     }
     text

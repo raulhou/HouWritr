@@ -427,6 +427,8 @@ struct Server {
     last_used: Instant,
     failed_at: Option<Instant>,
     reaper_running: bool,
+    /// The model has answered at least once since the server started.
+    model_loaded: bool,
 }
 
 static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
@@ -435,6 +437,7 @@ static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
         last_used: Instant::now(),
         failed_at: None,
         reaper_running: false,
+        model_loaded: false,
     })
 });
 
@@ -445,44 +448,100 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
         return Ok(());
     }
     let mut server = SERVER.lock();
+    let previous_use = server.last_used;
     server.last_used = Instant::now();
 
-    if let Some(child) = server.child.as_mut() {
-        match child.try_wait() {
-            Ok(None) => return Ok(()),
-            _ => {
-                warn!("local model server exited; restarting");
-                server.child = None;
+    let running = match server.child.as_mut().map(Child::try_wait) {
+        Some(Ok(None)) => true,
+        Some(_) => {
+            warn!("local model server exited; restarting");
+            server.child = None;
+            server.model_loaded = false;
+            false
+        }
+        None => false,
+    };
+    if !running {
+        // Something else (a server the user started) already answers there.
+        if !server_answers(Duration::from_millis(500)) {
+            if server
+                .failed_at
+                .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE)
+            {
+                return Err(LocalLlmError::RecentlyFailed);
+            }
+            match start_server() {
+                Ok(child) => {
+                    server.child = Some(child);
+                    server.model_loaded = false;
+                    if !server.reaper_running {
+                        server.reaper_running = true;
+                        std::thread::spawn(reap_when_idle);
+                    }
+                }
+                Err(error) => {
+                    server.failed_at = Some(Instant::now());
+                    return Err(error);
+                }
             }
         }
-    }
-    // Something else (a server the user started) already answers there.
-    if server_answers(Duration::from_millis(500)) {
-        return Ok(());
-    }
-    if server
-        .failed_at
-        .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE)
-    {
-        return Err(LocalLlmError::RecentlyFailed);
     }
 
-    let result = start_server();
-    match result {
-        Ok(child) => {
-            server.child = Some(child);
-            server.failed_at = None;
-            if !server.reaper_running {
-                server.reaper_running = true;
-                std::thread::spawn(reap_when_idle);
+    // The server answers before its model is on the NPU, and GenieX unloads
+    // the model after five idle minutes. The first request after either has
+    // to wait for the load, which takes far longer than a cleanup request may
+    // wait, so load it here, once, before any real request is sent.
+    if !server.model_loaded || previous_use.elapsed() >= MODEL_RESIDENT {
+        info!("loading the local model");
+        let started = Instant::now();
+        match load_model() {
+            Ok(()) => {
+                info!(took = ?started.elapsed(), "local model is loaded");
+                server.model_loaded = true;
+                server.failed_at = None;
             }
-            Ok(())
-        }
-        Err(error) => {
-            server.failed_at = Some(Instant::now());
-            Err(error)
+            Err(error) => {
+                warn!(error = %error, took = ?started.elapsed(), "loading the local model failed");
+                server.model_loaded = false;
+                server.failed_at = Some(Instant::now());
+                return Err(LocalLlmError::StartFailed(format!(
+                    "the model did not load: {error}"
+                )));
+            }
         }
     }
+    server.failed_at = None;
+    Ok(())
+}
+
+/// How long GenieX keeps an idle model loaded (its default is 300 s); a
+/// little less, so a request just before the unload is not trusted.
+const MODEL_RESIDENT: Duration = Duration::from_secs(240);
+/// The longest a model load may take.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Make the server load [`DEFAULT_MODEL`] by asking it for one token.
+fn load_model() -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(LOAD_TIMEOUT)
+        .build()?;
+    let response = client
+        .post(format!("{MANAGED_BASE_URL}/chat/completions"))
+        .json(&serde_json::json!({
+            "model": DEFAULT_MODEL,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        }))
+        .send()
+        .context("no answer")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        let detail: String = detail.chars().take(160).collect();
+        bail!("the server answered with {status} {detail}");
+    }
+    Ok(())
 }
 
 fn start_server() -> std::result::Result<Child, LocalLlmError> {
@@ -551,7 +610,11 @@ fn stop_locked(server: &mut Server) {
 
 /// Stop the server (called when OpenWritr exits or the model is removed).
 pub fn shutdown() {
-    stop_locked(&mut SERVER.lock());
+    // A model load can hold the lock for minutes; do not make quitting wait
+    // for it (Windows ends the server with the app anyway).
+    if let Some(mut server) = SERVER.try_lock_for(Duration::from_secs(2)) {
+        stop_locked(&mut server);
+    }
 }
 
 /// Tie the child's life to ours: when OpenWritr exits for any reason, even a
