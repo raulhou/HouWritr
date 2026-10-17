@@ -54,7 +54,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"] }
 ndarray = "0.17"
 sentencepiece = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 half = "2.7"
 tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
 
