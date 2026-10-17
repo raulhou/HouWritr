@@ -20,26 +20,22 @@ pub enum ShutdownMode {
     Discard,
 }
 
+/// Whether a short recording is cleaned up. The app only queues files,
+/// meetings and retries, which follow the cleanup setting; short jobs remain
+/// for the worker's own tests.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingIntent {
     Raw,
     Enhance,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeliveryTarget {
-    pub hwnd: isize,
-    pub process_id: u32,
-    pub process_creation_time_100ns: Option<u64>,
-}
-
 #[derive(Clone, Debug)]
 pub struct JobConfig {
     settings: Settings,
     intent: RecordingIntent,
-    delivery_target: Option<DeliveryTarget>,
     /// Imported files and meetings: transcribed in silence-aligned windows
-    /// instead of one pass, never LLM-enhanced, never pasted.
+    /// instead of one pass.
     long_form: bool,
     /// Label speakers (long-form jobs only; needs the diarization models).
     diarize: bool,
@@ -53,16 +49,12 @@ pub struct JobConfig {
 }
 
 impl JobConfig {
-    pub fn new(
-        settings: Settings,
-        intent: RecordingIntent,
-        delivery_target: Option<DeliveryTarget>,
-        _enhancement_disabled: bool,
-    ) -> Self {
+    /// A short recording transcribed in one pass.
+    #[cfg(test)]
+    pub fn new(settings: Settings, intent: RecordingIntent) -> Self {
         Self {
             settings,
             intent,
-            delivery_target,
             long_form: false,
             diarize: false,
             session: None,
@@ -76,7 +68,6 @@ impl JobConfig {
             diarize: settings.diarize_speakers,
             settings,
             intent: RecordingIntent::Raw,
-            delivery_target: None,
             long_form: true,
             session: None,
             rerun: None,
@@ -110,7 +101,7 @@ impl JobConfig {
 
     fn should_enhance(&self) -> bool {
         if self.long_form {
-            // Imported files and meetings have no Shift key to consult, so any
+            // Imported files and meetings follow the cleanup setting: any
             // mode other than Never opts them into cleanup.
             return self.settings.enhance.mode.is_enabled();
         }
@@ -198,7 +189,7 @@ pub enum Rerun {
 /// What happened to the optional "label the speakers" step of a job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiarizationOutcome {
-    /// Not requested (dictation, or the setting is off).
+    /// Not requested (a short job, or the setting is off).
     NotRequested,
     /// The transcript carries `Speaker N:` labels for this many speakers.
     Labelled { speakers: usize },
@@ -255,9 +246,7 @@ pub enum WorkerEvent {
         /// caller can save them as their own file. `Some` only for notes jobs
         /// whose generation succeeded.
         notes: Option<String>,
-        auto_paste: bool,
         enhancement_warning: Option<FallbackReason>,
-        delivery_target: Option<DeliveryTarget>,
     },
     JobFailed {
         id: u64,
@@ -763,7 +752,7 @@ fn worker_main(
                 // gives the NPU back instead of keeping the text model loaded.
                 let _release_local_model = ReleaseLocalModel::after(&job.config);
                 // Everything logged for this job also goes to its own log;
-                // the app ends it once it has saved or pasted the result.
+                // the app ends it once it has saved the result.
                 crate::log_files::begin(job.id, recording_kind(&job.config));
                 {
                     let _transition = transition_gate.lock();
@@ -810,9 +799,7 @@ fn worker_main(
                                     cleanup: None,
                                     repair: None,
                                     notes: None,
-                                    auto_paste: false,
                                     enhancement_warning: warning,
-                                    delivery_target: None,
                                 });
                                 continue;
                             }
@@ -1077,9 +1064,7 @@ fn worker_main(
                                     cleanup: None,
                                     repair: None,
                                     notes: None,
-                                    auto_paste: false,
                                     enhancement_warning: None,
-                                    delivery_target: None,
                                 },
                             );
                             let _ = event_tx.send(event);
@@ -1156,9 +1141,7 @@ fn worker_main(
                             cleanup: final_report,
                             repair: repair_plan.filter(|plan| !plan.is_complete()),
                             notes: notes_text,
-                            auto_paste: job.config.settings.auto_paste,
                             enhancement_warning,
-                            delivery_target: job.config.delivery_target,
                         }
                     });
                 if matches!(&event, WorkerEvent::JobCompleted { .. }) {
@@ -1213,8 +1196,8 @@ fn recording_kind(config: &JobConfig) -> crate::log_files::RecordingKind {
 
 /// Whether the local text model is unloaded right after this job: imported
 /// files, finished meetings and background cleanup retries that used AI
-/// cleanup or notes. Dictation keeps it for the next one (it is released after
-/// a few idle minutes), and so does a meeting between its parts.
+/// cleanup or notes. A meeting keeps it between its parts (it is released
+/// after a few idle minutes).
 fn releases_local_model(config: &JobConfig) -> bool {
     config.long_form
         && config.session.map_or(true, |part| part.last)
@@ -1542,8 +1525,8 @@ impl SessionState {
 
 /// Remembers that the AI provider could not be reached, so the next requests
 /// are not even attempted for a minute. Without this every meeting part (and
-/// every dictation queued behind it) would wait out a request timeout while
-/// the connection is down.
+/// every file queued behind it) would wait out a request timeout while the
+/// connection is down.
 #[derive(Default)]
 struct CleanupGate {
     unreachable_until: Option<Instant>,
@@ -1671,9 +1654,7 @@ fn run_rerun(
             cleanup,
             repair: None,
             notes,
-            auto_paste: false,
             enhancement_warning: warning,
-            delivery_target: None,
         }
     };
     let event = match rerun {
@@ -1965,7 +1946,7 @@ mod tests {
     }
 
     fn job_config(settings: Settings, intent: RecordingIntent) -> JobConfig {
-        JobConfig::new(settings, intent, None, false)
+        JobConfig::new(settings, intent)
     }
 
     #[test]
@@ -2044,43 +2025,6 @@ mod tests {
     }
 
     #[test]
-    fn delivery_target_metadata_is_carried_to_completion() {
-        let (mut worker, _, _, _) = worker(&[], None);
-        worker.load("ready".into()).unwrap();
-        wait_ready(&worker, "ready");
-        let target = DeliveryTarget {
-            hwnd: 17,
-            process_id: 23,
-            process_creation_time_100ns: Some(42),
-        };
-        let job = worker
-            .enqueue(
-                vec![1.0],
-                16_000,
-                JobConfig::new(
-                    Settings::default(),
-                    RecordingIntent::Raw,
-                    Some(target),
-                    false,
-                ),
-            )
-            .unwrap();
-
-        let events = wait_until(
-            &worker,
-            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
-        );
-        let completed_target = events.into_iter().find_map(|event| match event {
-            WorkerEvent::JobCompleted {
-                delivery_target, ..
-            } => Some(delivery_target),
-            _ => None,
-        });
-
-        assert_eq!(completed_target, Some(Some(target)));
-    }
-
-    #[test]
     fn job_snapshot_drives_provider_model_endpoint_and_prompt_resolution() {
         let mut live = Settings::default();
         live.enhance.mode = crate::settings::EnhanceMode::Always;
@@ -2091,7 +2035,7 @@ mod tests {
         live.prompt_overrides
             .set(target, "Use the frozen prompt.".into());
 
-        let config = JobConfig::new(live.clone(), RecordingIntent::Enhance, None, false);
+        let config = JobConfig::new(live.clone(), RecordingIntent::Enhance);
         live.enhance.provider = "github_copilot".into();
         live.enhance.base_url = "https://changed.example/v1".into();
         live.enhance.model = "changed-model".into();
@@ -2214,9 +2158,7 @@ mod tests {
                     cleanup: None,
                     repair: None,
                     notes: None,
-                    auto_paste: true,
                     enhancement_warning: None,
-                    delivery_target: None,
                 },
                 false,
             ),
@@ -2234,9 +2176,7 @@ mod tests {
                     cleanup: None,
                     repair: None,
                     notes: None,
-                    auto_paste: true,
                     enhancement_warning: None,
-                    delivery_target: None,
                 },
                 false,
             )
@@ -2953,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn dictation_jobs_never_report_progress() {
+    fn short_jobs_never_report_progress() {
         let (mut worker, _, _, _) = worker(&[], None);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
@@ -3275,9 +3215,7 @@ mod tests {
         )));
         assert!(!releases_local_model(&JobConfig::new(
             settings.clone(),
-            RecordingIntent::Enhance,
-            None,
-            false
+            RecordingIntent::Enhance
         )));
 
         let mut off = settings.clone();

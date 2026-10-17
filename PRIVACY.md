@@ -2,26 +2,28 @@
 
 *Last updated: October 2026*
 
-HouWritr is a local-first push-to-talk voice-to-text tool. Audio capture and
-speech recognition run **entirely on your device**.
+HouWritr is a local-first tool for recording meetings and transcribing audio
+and video files. Audio capture and speech recognition run **entirely on your
+device**.
 
 ## What we collect
 
 **Nothing.** HouWritr has no telemetry, no analytics, no accounts, and no
 servers operated by us.
 
-## How your voice is processed
+## How your audio is processed
 
-- Audio is captured from your microphone **only while you hold the hotkey**.
+- Audio is captured from your microphone and the PC's sound output **only
+  while you record a meeting** (started and stopped from the tray menu; a
+  paused meeting releases the microphone). Audio and video files are read only
+  when you choose them.
 - Transcription runs **locally on your device** (NVIDIA Parakeet on your CPU
   or NPU, or Whisper on the NPU). Your audio never leaves your machine.
-- Dictated text is pasted at your cursor or copied to the Windows clipboard,
-  depending on your Settings choice. HouWritr keeps no history of dictations.
-  When it pastes, the text is on the clipboard only for a moment and is marked
-  so that Windows Clipboard History and cloud clipboard sync do not keep it.
+- HouWritr never pastes text or puts it on the Windows clipboard.
 - **Files you transcribe and meetings you record are saved as transcript
   files**: next to the imported file, and meetings under
-  `Documents\OpenWritr\Meetings`. They stay on your PC until you delete them.
+  `Documents\OpenWritr\Meetings`. A transcript that cannot be saved there
+  goes to `Documents\HouWritr`. They stay on your PC until you delete them.
 
 ## Network access
 
@@ -34,12 +36,11 @@ HouWritr connects to the internet only for:
    speakers in file and meeting transcripts*, two small models (about 32 MB)
    are downloaded once from Hugging Face. The labelling itself runs entirely
    on your device; no audio or text is sent anywhere for it.
-3. **Optional text cleanup ("Enhance")** — *off by default*. You can run it
-   only when Shift is additionally held or for every recording. If enabled,
+3. **Optional text cleanup ("Enhance")** — *off by default*. If turned on,
    the **recognized text** (never audio) is sent to GitHub Copilot or your
    configured OpenAI-compatible API for grammar and punctuation cleanup using
-   your own credentials. The provider's privacy policy applies. Set enhancement
-   to **Never** to keep all processing local.
+   your own credentials. The provider's privacy policy applies. Leave
+   enhancement **Off** to keep all processing local.
    For GitHub Copilot, HouWritr uses the GitHub sign-in already on your PC: a
    `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` variable, the token
    GitHub Copilot CLI saved (`copilot login`), or the GitHub CLI's. It is sent

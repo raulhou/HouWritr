@@ -4,7 +4,8 @@ use super::qnn_ffi::{
     acquire_qnn_provider, enumerate_qnn_npu_devices, initialize_ort_runtime, QnnSession,
 };
 use super::whisper_decoder::{
-    decode_chunk, decoder_contract, encoder_contract, run_encoder, QnnDecoderBackend,
+    decode_chunk, decoder_contract, encoder_contract, run_encoder, DecodedChunk, Ending,
+    QnnDecoderBackend,
 };
 use super::whisper_mel::{log_mel_30s, SAMPLE_RATE};
 use super::whisper_tokenizer::WhisperTokenizer;
@@ -13,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ort::AsPointer;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 const CHUNK_SECONDS: usize = 30;
 const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * CHUNK_SECONDS;
@@ -94,47 +95,36 @@ impl Engine for WhisperNpuEngine {
         let mut transcript_tokens = Vec::new();
 
         for (index, chunk) in audio.chunks(CHUNK_SAMPLES).enumerate() {
-            let features = log_mel_30s(chunk)
-                .with_context(|| format!("prepare Whisper chunk {}", index + 1))?;
-
-            let encoder_started = Instant::now();
-            let cross_cache = run_encoder(&mut self.encoder, &features)
-                .with_context(|| format!("encode Whisper chunk {}", index + 1))?;
-            let encoder_ms = encoder_started.elapsed().as_millis() as u64;
-
-            let decoder_started = Instant::now();
-            let mut decoder = QnnDecoderBackend::new(&mut self.decoder);
-            let decoded = decode_chunk(&mut decoder, &cross_cache, language_token)
-                .with_context(|| format!("decode Whisper chunk {}", index + 1))?;
-            let decoder_ms = decoder_started.elapsed().as_millis() as u64;
-
-            if language_token.is_none() {
-                let language = self
-                    .tokenizer
-                    .language_code(decoded.language_token)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Whisper returned unsupported language token {}",
-                            decoded.language_token
-                        )
-                    })?;
-                info!(
-                    language,
-                    token = decoded.language_token,
-                    "Whisper recording language detected"
-                );
-                language_token = Some(decoded.language_token);
+            let decoded = self.run_chunk(chunk, &mut language_token, index, chunk_count)?;
+            if decoded.ending == Ending::Finished || chunk.len() < MIN_SPLIT_SAMPLES {
+                if decoded.ending != Ending::Finished {
+                    warn!(chunk = index + 1, ending = ?decoded.ending, "Whisper did not finish this chunk; some speech may be missing");
+                }
+                transcript_tokens.extend(decoded.tokens);
+                continue;
             }
-
-            transcript_tokens.extend(decoded.tokens);
-            info!(
+            // Fast speech needs more than the decoder's 199 steps, and a
+            // looping model has lost its place: half the audio each fits.
+            warn!(
                 chunk = index + 1,
-                chunks = chunk_count,
-                encoder_ms,
-                decoder_ms,
-                decode_steps = decoded.steps,
-                "Whisper NPU chunk complete"
+                ending = ?decoded.ending,
+                steps = decoded.steps,
+                "Whisper did not finish this chunk; decoding it again in two halves"
             );
+            let third = chunk.len() / 3;
+            let cut = crate::media::quietest_point(
+                chunk,
+                third..chunk.len() - third,
+                SAMPLE_RATE as usize / 10,
+            )
+            .unwrap_or(chunk.len() / 2);
+            for half in [&chunk[..cut], &chunk[cut..]] {
+                let decoded = self.run_chunk(half, &mut language_token, index, chunk_count)?;
+                if decoded.ending != Ending::Finished {
+                    warn!(chunk = index + 1, ending = ?decoded.ending, "Whisper did not finish half of this chunk; some speech may be missing");
+                }
+                transcript_tokens.extend(decoded.tokens);
+            }
         }
 
         info!(
@@ -143,6 +133,64 @@ impl Engine for WhisperNpuEngine {
             "Whisper NPU recording complete"
         );
         self.tokenizer.decode(&transcript_tokens)
+    }
+}
+
+/// Chunks shorter than this are not split again when Whisper does not
+/// finish them.
+const MIN_SPLIT_SAMPLES: usize = SAMPLE_RATE as usize * 4;
+
+impl WhisperNpuEngine {
+    /// Encode and decode up to 30 s of 16 kHz audio. The first chunk detects
+    /// the language; later ones reuse it.
+    fn run_chunk(
+        &mut self,
+        chunk: &[f32],
+        language_token: &mut Option<i32>,
+        index: usize,
+        chunk_count: usize,
+    ) -> Result<DecodedChunk> {
+        let features =
+            log_mel_30s(chunk).with_context(|| format!("prepare Whisper chunk {}", index + 1))?;
+
+        let encoder_started = Instant::now();
+        let cross_cache = run_encoder(&mut self.encoder, &features)
+            .with_context(|| format!("encode Whisper chunk {}", index + 1))?;
+        let encoder_ms = encoder_started.elapsed().as_millis() as u64;
+
+        let decoder_started = Instant::now();
+        let mut decoder = QnnDecoderBackend::new(&mut self.decoder);
+        let decoded = decode_chunk(&mut decoder, &cross_cache, *language_token)
+            .with_context(|| format!("decode Whisper chunk {}", index + 1))?;
+        let decoder_ms = decoder_started.elapsed().as_millis() as u64;
+
+        if language_token.is_none() {
+            let language = self
+                .tokenizer
+                .language_code(decoded.language_token)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Whisper returned unsupported language token {}",
+                        decoded.language_token
+                    )
+                })?;
+            info!(
+                language,
+                token = decoded.language_token,
+                "Whisper recording language detected"
+            );
+            *language_token = Some(decoded.language_token);
+        }
+
+        info!(
+            chunk = index + 1,
+            chunks = chunk_count,
+            encoder_ms,
+            decoder_ms,
+            decode_steps = decoded.steps,
+            "Whisper NPU chunk complete"
+        );
+        Ok(decoded)
     }
 }
 

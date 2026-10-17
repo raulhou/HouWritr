@@ -1,33 +1,28 @@
-//! HouWritr: native push to talk voice to text for Windows.
+//! HouWritr: meeting recording and audio/video transcription for Windows.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod about;
 mod app;
 mod asr;
-mod audio;
 mod autostart;
 mod cleanup;
 mod copilot_auth;
 mod credentials;
 mod diagnostics;
 mod enhance;
-mod hotkey;
-mod key_hook;
 mod local_llm;
 mod log_files;
 mod media;
 mod meeting;
 mod model_manager;
 mod overlay;
-mod paste;
 mod paths;
 mod power;
 mod self_check;
 mod settings;
 mod settings_ui;
 mod single_instance;
-mod sounds;
 mod transcript_window;
 mod tray;
 mod worker;
@@ -94,10 +89,6 @@ fn main() -> Result<()> {
         build = build_id(),
         "process starting"
     );
-    // Install the global low-level keyboard hook before any subsystem starts
-    // polling for keys. It tracks physical key state across focus changes,
-    // which GetAsyncKeyState cannot.
-    key_hook::install_once();
     // The tray process does the heavy work (transcription, speaker labels,
     // cleanup) without ever having a foreground window.
     power::opt_out_for_this_process();

@@ -1,27 +1,21 @@
-//! App orchestration: tray + winit event loop + hotkey thread + ASR.
+//! App orchestration: tray + winit event loop + speech engine.
 //!
-//! The hotkey FSM runs on its own background thread now, completely
-//! independent of the winit event loop. That way the tray menu spawning
-//! the settings subprocess, or any other event loop weirdness, cannot
-//! stall recording. The hotkey thread sends `Event::Start` / `Event::Stop`
-//! over a crossbeam-style channel into the winit loop, which translates
-//! them into recorder/tray/engine actions.
+//! HouWritr records meetings and transcribes audio and video files. The tray
+//! menu starts both; the work runs on the worker thread and progress shows
+//! in the transcript window, the tray and the status pill.
 
 use crate::{
-    audio::Recorder,
     cleanup::FallbackReason,
-    diagnostics, enhance, hotkey, key_hook, media,
+    diagnostics, enhance, media,
     meeting::{self, MeetingRecorder},
     model_manager::ModelState,
-    overlay::{self, ListeningIntent, NoticeKind, OverlayViewState, ProcessingPhase},
-    paste,
-    settings::{CredentialHealth, EnhanceMode, MeetingNotesMode, Settings, SettingsRevision},
-    sounds,
+    overlay::{self, NoticeKind, OverlayViewState, ProcessingPhase},
+    settings::{CredentialHealth, MeetingNotesMode, Settings, SettingsRevision},
     transcript_window::{self, WindowMsg},
     tray,
     worker::{
-        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, RepairPlan,
-        Rerun, SessionPart, ShutdownMode, Worker, WorkerEvent,
+        DiarizationOutcome, JobConfig, JobStage, RepairPlan, Rerun, SessionPart, ShutdownMode,
+        Worker, WorkerEvent,
     },
 };
 use anyhow::Result;
@@ -45,15 +39,6 @@ use winit::window::WindowId;
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
-    HotkeyPress {
-        epoch: u64,
-        shift_down: bool,
-        delivery_target: Option<DeliveryTarget>,
-    },
-    HotkeyShiftChanged {
-        shift_down: bool,
-    },
-    HotkeyRelease,
     DiagnosticsExported,
     DiagnosticsExportFailed(String),
     /// A file picked from the tray menu was decoded to 16 kHz mono. `window`
@@ -107,7 +92,7 @@ struct FileJob {
 }
 
 impl FileJob {
-    /// Jobs that must stay out of the dictation overlay's job queue: the
+    /// Jobs that must stay out of the status pill's job queue: the
     /// popup shows file jobs, and background meeting parts show nothing.
     fn overlay_free(&self) -> bool {
         self.window.is_some() || self.background
@@ -157,8 +142,7 @@ struct Repair {
 const REPAIR_BACKOFF_SECONDS: [u64; 5] = [120, 300, 600, 1_200, 1_800];
 /// Pause between steps of one productive round.
 const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
-/// How often the main loop looks for a changed settings file (the hotkey
-/// thread uses the same interval).
+/// How often the main loop looks for a changed settings file.
 const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long to wait before the next round after `failed_rounds` fruitless
@@ -199,8 +183,21 @@ fn render_notes(title: &str, details: &str, transcript_name: &str, notes: &str) 
 /// Overwrite a transcript or notes file the user already has. Atomic, so a
 /// crash in the middle never leaves it empty or half written.
 fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(folder) = path
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(folder)?;
+    }
     crate::settings::atomic_write_bytes(path, content.as_bytes())
         .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Where a transcript goes when its own folder cannot be written:
+/// `Documents\HouWritr\<file name>`.
+fn fallback_output(output: &std::path::Path) -> Option<PathBuf> {
+    let documents = directories::UserDirs::new()?.document_dir()?.to_path_buf();
+    Some(documents.join("HouWritr").join(output.file_name()?))
 }
 
 /// "cleaned 21 of 25 sections" when some of the text is still as recognised.
@@ -253,32 +250,10 @@ fn notes_decision(mode: MeetingNotesMode, provider_ready: bool, may_ask: bool) -
     }
 }
 
-/// Rolling parts are queued as pieces of at most this long so that a
-/// dictation job never waits behind more than one short transcription.
+/// Rolling parts are queued as pieces of at most this long, so a file queued
+/// during a meeting never waits behind a long one.
 const MEETING_PIECE_SECONDS: usize = 300;
 const MEETING_PIECE_SEARCH_SECONDS: usize = 10;
-
-struct ActiveRecording {
-    started: Instant,
-    settings: Settings,
-    intent: RecordingIntent,
-    delivery_target: Option<DeliveryTarget>,
-}
-
-impl ActiveRecording {
-    fn new(
-        settings: Settings,
-        intent: RecordingIntent,
-        delivery_target: Option<DeliveryTarget>,
-    ) -> Self {
-        Self {
-            started: Instant::now(),
-            settings,
-            intent,
-            delivery_target,
-        }
-    }
-}
 
 #[derive(Clone)]
 struct OverlayNotice {
@@ -288,7 +263,6 @@ struct OverlayNotice {
 }
 
 struct OverlayReducer {
-    recording: Option<ListeningIntent>,
     jobs: BTreeMap<u64, ProcessingPhase>,
     active_job: Option<u64>,
     notice: Option<OverlayNotice>,
@@ -298,7 +272,6 @@ struct OverlayReducer {
 impl Default for OverlayReducer {
     fn default() -> Self {
         Self {
-            recording: None,
             jobs: BTreeMap::new(),
             active_job: None,
             notice: None,
@@ -308,17 +281,6 @@ impl Default for OverlayReducer {
 }
 
 impl OverlayReducer {
-    fn recording_started(&mut self, intent: RecordingIntent) {
-        self.recording = Some(match intent {
-            RecordingIntent::Raw => ListeningIntent::Raw,
-            RecordingIntent::Enhance => ListeningIntent::Enhance,
-        });
-    }
-
-    fn recording_finished(&mut self) {
-        self.recording = None;
-    }
-
     fn job_queued(&mut self, id: u64) {
         self.jobs.entry(id).or_insert(ProcessingPhase::Queued);
     }
@@ -366,10 +328,7 @@ impl OverlayReducer {
         let duration = match kind {
             NoticeKind::Success => Duration::from_millis(2500),
             NoticeKind::Info => Duration::from_secs(3),
-            NoticeKind::Warning
-            | NoticeKind::RawFallback
-            | NoticeKind::ProviderWarning
-            | NoticeKind::DeliveryWarning => Duration::from_secs(4),
+            NoticeKind::Warning => Duration::from_secs(4),
             NoticeKind::Error => Duration::from_secs(5),
         };
         self.notice = Some(OverlayNotice {
@@ -386,9 +345,6 @@ impl OverlayReducer {
             .is_some_and(|notice| now >= notice.expires_at)
         {
             self.notice = None;
-        }
-        if let Some(intent) = self.recording {
-            return OverlayViewState::listening(intent);
         }
         if let Some(id) = self.active_job {
             if let Some(phase) = self.jobs.get(&id) {
@@ -435,11 +391,9 @@ struct State {
     settings: Settings,
     credential_health: CredentialHealth,
     settings_error: Option<String>,
-    recorder: Recorder,
     tray: tray::Tray,
     overlay: overlay::OverlayController,
     overlay_state: OverlayReducer,
-    active_recording: Option<ActiveRecording>,
     worker: Worker,
     engine_state: EngineState,
     model_state: Option<ModelState>,
@@ -449,7 +403,6 @@ struct State {
     shutting_down: bool,
     discarding_jobs: bool,
     hk_stop: Arc<AtomicBool>,
-    delivery_interlock: Arc<paste::DeliveryInterlock>,
     settings_revision: Option<SettingsRevision>,
     /// When the settings file was last checked for changes (see
     /// [`SETTINGS_CHECK_INTERVAL`]).
@@ -459,8 +412,8 @@ struct State {
     meeting: Option<MeetingRecorder>,
     /// Live meeting input level feeding the recording indicator.
     meeting_level: Arc<AtomicU32>,
-    /// The meeting pill: same position as the dictation pill, shown for the
-    /// whole recording except while the dictation pill is on screen.
+    /// The meeting pill: same position as the status pill, shown for the
+    /// whole recording except while the status pill is on screen.
     meeting_overlay: overlay::OverlayController,
     meeting_overlay_view: OverlayViewState,
     meeting_overlay_enabled: bool,
@@ -511,12 +464,9 @@ pub fn run() -> Result<()> {
     }
     info!(
         engine = %settings.engine,
-        auto_paste = settings.auto_paste,
         overlay = settings.overlay,
-        sounds = settings.sounds,
         "settings loaded"
     );
-    let recorder = Recorder::new()?;
     let tray = tray::Tray::new(&settings)?;
     tray.set_meeting_indicator_visible(settings.show_meeting_indicator);
     let worker = Worker::spawn()?;
@@ -524,23 +474,15 @@ pub fn run() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
+    // Tells the status pills' threads to stop when HouWritr quits.
     let hk_stop = Arc::new(AtomicBool::new(false));
-    let delivery_interlock = Arc::new(paste::DeliveryInterlock::default());
-    spawn_hotkey_thread(
-        settings.clone(),
-        settings_revision.clone(),
-        proxy.clone(),
-        hk_stop.clone(),
-        delivery_interlock.clone(),
-    )?;
     spawn_tick_thread(proxy.clone());
 
-    // Visual recording indicator on its own thread + own Win32 message loop.
-    // It only reads atomics from the recorder, so there's no shared state with
-    // the main winit/tray loop that could deadlock.
+    // Status pill (job progress and notices) on its own thread and Win32
+    // message loop, so it can never stall the tray loop.
     let overlay = overlay::spawn(
         overlay::OverlayHandles {
-            level_x10000: recorder.last_rms_x10000.clone(),
+            level_x10000: Arc::new(AtomicU32::new(0)),
             stop: hk_stop.clone(),
         },
         settings.overlay,
@@ -560,11 +502,9 @@ pub fn run() -> Result<()> {
         settings,
         credential_health,
         settings_error,
-        recorder,
         tray,
         overlay,
         overlay_state: OverlayReducer::default(),
-        active_recording: None,
         worker,
         engine_state: EngineState::NotStarted,
         model_state: None,
@@ -574,7 +514,6 @@ pub fn run() -> Result<()> {
         shutting_down: false,
         discarding_jobs: false,
         hk_stop,
-        delivery_interlock,
         settings_revision,
         settings_checked_at: Instant::now(),
         proxy,
@@ -596,26 +535,13 @@ pub fn run() -> Result<()> {
     };
 
     // Wait mode: loop sleeps until a message arrives (tray click, user event,
-    // window event). The hotkey + tick threads wake it via EventLoopProxy.
+    // window event). The tick thread wakes it via EventLoopProxy.
     // No more thread::sleep inside the message pump → tray stays responsive.
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = AppHandler { state };
     app.start_engine_load();
     event_loop.run_app(&mut app)?;
-    Ok(())
-}
-
-fn spawn_hotkey_thread(
-    initial: Settings,
-    initial_revision: Option<SettingsRevision>,
-    proxy: EventLoopProxy<UserEvent>,
-    stop: Arc<AtomicBool>,
-    delivery_interlock: Arc<paste::DeliveryInterlock>,
-) -> Result<()> {
-    thread::Builder::new()
-        .name("hotkey".into())
-        .spawn(move || hotkey_loop(initial, initial_revision, proxy, stop, delivery_interlock))?;
     Ok(())
 }
 
@@ -632,240 +558,6 @@ fn spawn_tick_thread(proxy: EventLoopProxy<UserEvent>) {
             }
         })
         .ok();
-}
-
-fn hotkey_loop(
-    initial: Settings,
-    initial_revision: Option<SettingsRevision>,
-    proxy: EventLoopProxy<UserEvent>,
-    stop: Arc<AtomicBool>,
-    delivery_interlock: Arc<paste::DeliveryInterlock>,
-) {
-    let mut settings = initial;
-    let mut settings_revision = initial_revision;
-    let mut last_settings_error: Option<String> = None;
-    let mut next_press_epoch = 0_u64;
-    // Try OS-level registration so other apps know the combo is taken.
-    // If that fails (e.g. Windows already reserved it), fall through to
-    // physical key-hook polling, which does not require RegisterHotKey.
-    let mut _mgr: Option<hotkey::HotkeyManager> = match hotkey::HotkeyManager::register(&settings) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            warn!(error = %e, "RegisterHotKey failed; using key-state polling only");
-            None
-        }
-    };
-    // Track combo vk codes manually so polling works without a HotkeyManager.
-    let mut trigger_vk = hotkey::trigger_vk_for(&settings.hotkey_trigger);
-    let mut mod_vks: Vec<u32> = settings
-        .hotkey_modifiers
-        .iter()
-        .map(|m| hotkey::mod_vk_for(m))
-        .collect();
-    let mut poll_state = hotkey::PollState::default();
-    let mut hook_health = key_hook::HealthMonitor::new(
-        hotkey::configured_vks(trigger_vk, &mod_vks),
-        hotkey::secondary_key_down,
-    );
-    let mut last_check = Instant::now();
-
-    'polling: while !stop.load(Ordering::Relaxed) {
-        if let Some(ev) = hotkey::poll_combo(trigger_vk, &mod_vks, &mut poll_state) {
-            let mut posted_press_epoch = None;
-            let user_ev = match ev {
-                hotkey::Event::Press { shift_down } => {
-                    let epoch =
-                        mark_press_pending(delivery_interlock.as_ref(), &mut next_press_epoch);
-                    posted_press_epoch = Some(epoch);
-                    UserEvent::HotkeyPress {
-                        epoch,
-                        shift_down,
-                        delivery_target: capture_delivery_target(),
-                    }
-                }
-                hotkey::Event::ShiftChanged { shift_down } => {
-                    UserEvent::HotkeyShiftChanged { shift_down }
-                }
-                hotkey::Event::Release => UserEvent::HotkeyRelease,
-            };
-            if proxy.send_event(user_ev).is_err() {
-                if let Some(epoch) = posted_press_epoch {
-                    consume_press_pending(delivery_interlock.as_ref(), epoch);
-                }
-                break;
-            }
-        }
-        if hook_health.observe(
-            Instant::now(),
-            hotkey::secondary_key_down,
-            hotkey::configured_key_down,
-        ) {
-            warn!(
-                events_seen = key_hook::events_seen(),
-                "configured key transitions were repeatedly absent from the keyboard hook; requesting reinstall"
-            );
-            if !emit_release_before_poll_reset(&proxy, &mut poll_state) {
-                break;
-            }
-            key_hook::request_reinstall();
-        }
-
-        if last_check.elapsed() >= Duration::from_millis(500) {
-            last_check = Instant::now();
-            match Settings::revision() {
-                Ok(revision) if settings_revision.as_ref() != Some(&revision) => {
-                    settings_revision = Some(revision);
-                    match Settings::load() {
-                        Ok(new) => {
-                            last_settings_error = None;
-                            if new.hotkey_modifiers != settings.hotkey_modifiers
-                                || new.hotkey_trigger != settings.hotkey_trigger
-                            {
-                                info!(
-                                    "hotkey changed: {:?}+{} -> {:?}+{}",
-                                    settings.hotkey_modifiers,
-                                    settings.hotkey_trigger,
-                                    new.hotkey_modifiers,
-                                    new.hotkey_trigger
-                                );
-                                if !emit_release_before_poll_reset(&proxy, &mut poll_state) {
-                                    break 'polling;
-                                }
-                                drop(_mgr.take());
-                                _mgr = hotkey::HotkeyManager::register(&new).ok();
-                                trigger_vk = hotkey::trigger_vk_for(&new.hotkey_trigger);
-                                mod_vks = new
-                                    .hotkey_modifiers
-                                    .iter()
-                                    .map(|modifier| hotkey::mod_vk_for(modifier))
-                                    .collect();
-                                hook_health = key_hook::HealthMonitor::new(
-                                    hotkey::configured_vks(trigger_vk, &mod_vks),
-                                    hotkey::secondary_key_down,
-                                );
-                            }
-                            settings = new;
-                        }
-                        Err(error) => {
-                            let message = error.to_string();
-                            if last_settings_error.as_deref() != Some(message.as_str()) {
-                                warn!(error = %message, "hotkey settings reload failed; keeping the last valid hotkey");
-                                last_settings_error = Some(message);
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    if last_settings_error.as_deref() != Some(message.as_str()) {
-                        warn!(error = %message, "hotkey settings revision check failed; keeping the last valid hotkey");
-                        last_settings_error = Some(message);
-                    }
-                }
-            }
-        }
-
-        thread::sleep(Duration::from_millis(8));
-    }
-    info!("hotkey thread exiting");
-}
-
-fn emit_release_before_poll_reset(
-    proxy: &EventLoopProxy<UserEvent>,
-    poll_state: &mut hotkey::PollState,
-) -> bool {
-    match hotkey::release_before_reset(poll_state) {
-        Some(hotkey::Event::Release) => proxy.send_event(UserEvent::HotkeyRelease).is_ok(),
-        Some(hotkey::Event::Press { .. } | hotkey::Event::ShiftChanged { .. }) => {
-            unreachable!("reset can only synthesize release")
-        }
-        None => true,
-    }
-}
-
-fn mark_press_pending(interlock: &paste::DeliveryInterlock, next_epoch: &mut u64) -> u64 {
-    interlock.mark_press_pending(next_epoch)
-}
-
-fn consume_press_pending(interlock: &paste::DeliveryInterlock, epoch: u64) {
-    interlock.consume_press(epoch);
-}
-
-fn recording_or_press_pending(
-    recording_active: bool,
-    interlock: &paste::DeliveryInterlock,
-) -> bool {
-    recording_active || interlock.press_pending()
-}
-
-fn capture_delivery_target() -> Option<DeliveryTarget> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, GA_ROOT,
-    };
-
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.0.is_null() {
-        return None;
-    }
-    let hwnd = unsafe { GetAncestor(foreground, GA_ROOT) };
-    if hwnd.0.is_null() {
-        return None;
-    }
-    let mut process_id = 0;
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    }
-    if process_id == 0 {
-        return None;
-    }
-    let process_creation_time_100ns = process_creation_time_100ns(process_id)?;
-    Some(DeliveryTarget {
-        hwnd: hwnd.0 as isize,
-        process_id,
-        process_creation_time_100ns: Some(process_creation_time_100ns),
-    })
-}
-
-fn delivery_target_is_current(target: DeliveryTarget) -> bool {
-    capture_delivery_target().is_some_and(|current| current == target)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeliveryBlockReason {
-    RecordingActive,
-    TargetChanged,
-    Cancelled,
-    ClipboardChanged,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeliveryPlan {
-    Paste,
-    ClipboardExplicit,
-    ClipboardSafety(DeliveryBlockReason),
-}
-
-fn decide_delivery(
-    auto_paste: bool,
-    recording_active: bool,
-    target_present: bool,
-    target_matches: bool,
-    cancelled_or_tombstoned: bool,
-) -> DeliveryPlan {
-    if !auto_paste {
-        return DeliveryPlan::ClipboardExplicit;
-    }
-    if cancelled_or_tombstoned {
-        return DeliveryPlan::ClipboardSafety(DeliveryBlockReason::Cancelled);
-    }
-    if recording_active {
-        return DeliveryPlan::ClipboardSafety(DeliveryBlockReason::RecordingActive);
-    }
-    if !target_present || !target_matches {
-        return DeliveryPlan::ClipboardSafety(DeliveryBlockReason::TargetChanged);
-    }
-    DeliveryPlan::Paste
 }
 
 /// Why AI cleanup gave no output, in words for the transcript window and
@@ -894,48 +586,6 @@ fn cleanup_failure_text(reason: &FallbackReason) -> String {
         }
         FallbackReason::ValidatorError => "the cleaned text could not be checked".into(),
     }
-}
-
-fn cleanup_notice_kind(reason: &FallbackReason) -> NoticeKind {
-    match reason {
-        FallbackReason::UnknownProvider
-        | FallbackReason::MissingCredential
-        | FallbackReason::CredentialTargetChanged
-        | FallbackReason::InvalidEndpoint
-        | FallbackReason::EmptyModelId
-        | FallbackReason::RequestFailed
-        | FallbackReason::ProviderRejected(_)
-        | FallbackReason::ResponseUnparseable => NoticeKind::ProviderWarning,
-        FallbackReason::EmptyCandidate
-        | FallbackReason::IntegrityRejected(_)
-        | FallbackReason::ValidatorError => NoticeKind::RawFallback,
-    }
-}
-
-fn process_creation_time_100ns(process_id: u32) -> Option<u64> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        return None;
-    }
-    let empty_time = || FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let mut creation = empty_time();
-    let mut exit = empty_time();
-    let mut kernel = empty_time();
-    let mut user = empty_time();
-    let success =
-        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } != 0;
-    unsafe {
-        let _ = CloseHandle(process);
-    }
-    success.then(|| ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
 }
 
 struct AppHandler {
@@ -994,18 +644,6 @@ impl ApplicationHandler<UserEvent> for AppHandler {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         match ev {
-            UserEvent::HotkeyPress {
-                epoch,
-                shift_down,
-                delivery_target,
-            } => {
-                consume_press_pending(self.state.delivery_interlock.as_ref(), epoch);
-                self.on_press(shift_down, delivery_target);
-            }
-            UserEvent::HotkeyShiftChanged { shift_down } => {
-                self.on_shift_changed(shift_down);
-            }
-            UserEvent::HotkeyRelease => self.on_release(),
             UserEvent::DiagnosticsExported => {
                 self.state.diagnostics_exporting = false;
                 self.state
@@ -1066,65 +704,13 @@ impl AppHandler {
                 _ => None,
             };
             self.handle_worker_event(el, event);
-            // The job's own log ends once its result is saved or pasted.
+            // The job's own log ends once its result is saved.
             if let Some(id) = finished {
                 crate::log_files::end(id);
             }
         }
         self.sync_overlay();
         self.sync_meeting_indicator();
-
-        if self.state.active_recording.is_some() {
-            let stream_failed = self.state.recorder.stream_failed();
-            let stream_stalled = self
-                .state
-                .recorder
-                .callback_stalled(Duration::from_millis(500));
-            if stream_failed || stream_stalled {
-                let max_record_seconds = self
-                    .state
-                    .active_recording
-                    .as_ref()
-                    .map(|recording| recording.settings.max_record_seconds)
-                    .expect("active recording disappeared");
-                match self.state.recorder.recover_stream(max_record_seconds) {
-                    Ok(capture) => {
-                        warn!(
-                            stream_failed,
-                            stream_stalled,
-                            device = %capture.device_name,
-                            "capture stream recovered during active recording"
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            stream_failed,
-                            stream_stalled,
-                            error = %error,
-                            "capture stream recovery failed"
-                        );
-                        self.state.recorder.mark_stream_failed(error.to_string());
-                        self.finish_recording(false);
-                    }
-                }
-            } else {
-                let active_recording = self
-                    .state
-                    .active_recording
-                    .as_ref()
-                    .expect("active recording disappeared");
-                let max_seconds = active_recording.settings.max_record_seconds;
-                let timer_limit_reached = self
-                    .state
-                    .active_recording
-                    .as_ref()
-                    .map(|recording| recording.started.elapsed().as_secs_f32() >= max_seconds)
-                    .unwrap_or(false);
-                if self.state.recorder.limit_reached() || timer_limit_reached {
-                    self.finish_recording(true);
-                }
-            }
-        }
 
         let meeting_status = self
             .state
@@ -1252,7 +838,7 @@ impl AppHandler {
                 // Windows ARM64 (especially with Defender real-time scanning)
                 // can block for several seconds. If we call it from inside the
                 // winit pump, the tray's message queue stalls → app goes
-                // "Not Responding" → hotkey dies. From a worker thread the
+                // "Not Responding" → meeting capture stalls. From a worker thread the
                 // main pump keeps draining messages while the child boots.
                 if let Ok(exe) = std::env::current_exe() {
                     thread::spawn(move || {
@@ -1353,219 +939,9 @@ impl AppHandler {
             }
         }
     }
-
-    fn on_press(&mut self, shift_down: bool, delivery_target: Option<DeliveryTarget>) {
-        if self.state.shutting_down || self.state.active_recording.is_some() {
-            return;
-        }
-        if !matches!(self.state.engine_state, EngineState::Ready { .. }) {
-            let (color, status) = self.blocked_recording_status();
-            self.state.tray.set_status(color, &status);
-            self.show_overlay_notice(
-                NoticeKind::Error,
-                status
-                    .strip_prefix("HouWritr — ")
-                    .unwrap_or(&status)
-                    .to_string(),
-            );
-            info!(status, "recording blocked while engine is unavailable");
-            return;
-        }
-
-        if self.state.active_recording.is_none() {
-            let settings = self.state.settings.clone();
-            let shift_is_modifier = settings
-                .hotkey_modifiers
-                .iter()
-                .any(|modifier| modifier == "shift");
-            let intent = recording_intent(settings.enhance.mode, shift_is_modifier, shift_down);
-            if settings.enhance.mode != crate::settings::EnhanceMode::Never
-                && settings.enhance.provider == "openai_compatible"
-            {
-                crate::local_llm::prewarm(&settings.enhance.base_url, &settings.enhance.model);
-            }
-            match self.state.recorder.start(settings.max_record_seconds) {
-                Ok(capture) => {
-                    self.state.tray.set_status(
-                        tray::IconColor::Recording,
-                        &format!("HouWritr — recording from {}", capture.device_name),
-                    );
-                    let active_recording = ActiveRecording::new(settings, intent, delivery_target);
-                    if active_recording.settings.sounds {
-                        sounds::play_start();
-                    }
-                    self.state.active_recording = Some(active_recording);
-                    self.state.overlay_state.recording_started(intent);
-                    self.sync_overlay();
-                    info!(
-                        device = %capture.device_name,
-                        sample_rate = capture.sample_rate,
-                        channels = capture.channels,
-                        ?intent,
-                        ?delivery_target,
-                        "recording start"
-                    );
-                }
-                Err(e) => {
-                    self.state.tray.set_status(
-                        tray::IconColor::Error,
-                        "HouWritr — microphone unavailable (see log)",
-                    );
-                    self.show_overlay_notice(NoticeKind::Error, "Microphone unavailable");
-                    warn!(error = %e, "failed to start recording");
-                }
-            }
-        }
-    }
-
-    fn on_release(&mut self) {
-        if self.state.active_recording.is_some() {
-            self.finish_recording(false);
-        }
-    }
-
-    fn on_shift_changed(&mut self, shift_down: bool) {
-        let Some(active_recording) = self.state.active_recording.as_mut() else {
-            return;
-        };
-        let shift_is_modifier = active_recording
-            .settings
-            .hotkey_modifiers
-            .iter()
-            .any(|modifier| modifier == "shift");
-        let intent = recording_intent(
-            active_recording.settings.enhance.mode,
-            shift_is_modifier,
-            shift_down,
-        );
-        if intent == active_recording.intent {
-            return;
-        }
-
-        active_recording.intent = intent;
-        self.state.overlay_state.recording_started(intent);
-        self.sync_overlay();
-        info!(?intent, "recording enhancement intent changed");
-    }
-
-    fn finish_recording(&mut self, timer_limit_reached: bool) {
-        let Some(active_recording) = self.state.active_recording.take() else {
-            return;
-        };
-        self.state.overlay_state.recording_finished();
-        let recording = match self.state.recorder.stop() {
-            Ok(recording) => recording,
-            Err(e) => {
-                self.state.tray.set_status(
-                    tray::IconColor::Error,
-                    "HouWritr — microphone error (see log)",
-                );
-                self.show_overlay_notice(NoticeKind::Error, "Microphone error");
-                warn!(error = %e, "failed to stop recording");
-                return;
-            }
-        };
-        if active_recording.settings.sounds {
-            sounds::play_stop();
-        }
-        if let Some(error) = recording.stream_error {
-            self.state.tray.set_status(
-                tray::IconColor::Error,
-                "HouWritr — microphone stream failed (see log)",
-            );
-            self.show_overlay_notice(NoticeKind::Error, "Microphone stream failed");
-            warn!(error = %error, "recording aborted after stream failure");
-            return;
-        }
-
-        self.state
-            .tray
-            .set_status(tray::IconColor::Idle, "HouWritr");
-        let reached_limit = timer_limit_reached || recording.reached_limit;
-        if reached_limit {
-            info!(
-                max_seconds = active_recording.settings.max_record_seconds,
-                "maximum recording duration reached"
-            );
-        }
-
-        let dur = active_recording.started.elapsed();
-        let min = active_recording.settings.min_record_seconds;
-        if dur.as_secs_f32() < min {
-            info!(secs = dur.as_secs_f32(), "below min — discarded");
-            self.sync_overlay();
-        } else {
-            info!(
-                device = %recording.device_name,
-                sample_rate = recording.sample_rate,
-                channels = recording.channels,
-                samples = recording.samples.len(),
-                drained_samples = recording.drained_samples,
-                stream_recoveries = recording.stream_recoveries,
-                reached_limit,
-                "recording stop"
-            );
-            self.dispatch_transcribe(recording.samples, recording.sample_rate, active_recording);
-        }
-    }
-}
-
-fn recording_intent(
-    mode: EnhanceMode,
-    shift_is_modifier: bool,
-    shift_is_down: bool,
-) -> RecordingIntent {
-    let additional_shift_is_down = shift_is_down && !shift_is_modifier;
-    match mode {
-        EnhanceMode::Never => RecordingIntent::Raw,
-        EnhanceMode::WithShift if additional_shift_is_down => RecordingIntent::Enhance,
-        EnhanceMode::WithShift => RecordingIntent::Raw,
-        EnhanceMode::Always if additional_shift_is_down => RecordingIntent::Raw,
-        EnhanceMode::Always => RecordingIntent::Enhance,
-    }
 }
 
 impl AppHandler {
-    fn dispatch_transcribe(
-        &mut self,
-        samples: Vec<f32>,
-        sr: u32,
-        active_recording: ActiveRecording,
-    ) {
-        if self.state.shutting_down {
-            warn!("discarding completed recording because shutdown has started");
-            self.sync_overlay();
-            return;
-        }
-        let config = JobConfig::new(
-            active_recording.settings,
-            active_recording.intent,
-            active_recording.delivery_target,
-            false,
-        );
-        match self.state.worker.enqueue(samples, sr, config) {
-            Ok(id) => {
-                self.state.pending_jobs = self.state.pending_jobs.saturating_add(1);
-                self.state.overlay_state.job_queued(id);
-                info!(
-                    id,
-                    queue_depth = self.state.pending_jobs,
-                    "transcription job queued"
-                );
-                self.update_job_status();
-                self.sync_overlay();
-            }
-            Err(error) => {
-                warn!(error = %error, "failed to queue transcription");
-                self.state.tray.set_status(
-                    tray::IconColor::Error,
-                    "HouWritr — could not queue transcription (see log)",
-                );
-                self.show_overlay_notice(NoticeKind::Error, "Could not queue transcription");
-            }
-        }
-    }
-
     /// Gate shared by file import and meetings: they need a loaded engine.
     fn require_ready_engine(&mut self) -> bool {
         if self.state.shutting_down {
@@ -1719,13 +1095,13 @@ impl AppHandler {
             }
             self.state.tray.set_meeting_indicator_visible(visible);
         }
-        // The meeting pill occupies the same spot as the dictation pill, so
-        // it steps aside while that one is on screen (listening, writing, or
-        // a notice) and returns as soon as it clears.
-        let dictation_pill_showing =
+        // The meeting pill occupies the same spot as the status pill, so it
+        // steps aside while that one is on screen (writing or a notice) and
+        // returns as soon as it clears.
+        let status_pill_showing =
             self.state.settings.overlay && !self.state.overlay_state.last_view.is_hidden();
         let desired = match &self.state.meeting {
-            Some(recorder) if !dictation_pill_showing => {
+            Some(recorder) if !status_pill_showing => {
                 OverlayViewState::meeting(recorder.elapsed().as_secs(), recorder.is_paused())
             }
             _ => OverlayViewState::Hidden,
@@ -2029,7 +1405,7 @@ impl AppHandler {
 
     fn deliver_file_transcript(
         &mut self,
-        job: FileJob,
+        mut job: FileJob,
         text: &str,
         notes: Option<String>,
         diarization: DiarizationOutcome,
@@ -2046,40 +1422,46 @@ impl AppHandler {
             return;
         }
         let document = render_transcript(job.markdown, &job.title, &job.details, text);
-        let output = job.output.clone();
         let text = document.as_str();
-        let written = output
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&output, text));
-        if let Err(error) = written {
-            warn!(error = %error, file = %output.display(), "failed to write transcript");
-            // Never lose a long transcription to a bad path.
-            let _ = paste::deliver(text, paste::DeliveryMode::Clipboard);
-            job.tell_window(WindowMsg::Failed {
-                error: format!(
-                    "could not save {}: {error}. The transcript was copied to the clipboard.",
-                    output.display()
-                ),
-            });
-            self.report_long_form(
-                windowed,
-                true,
-                &format!(
-                    "Could not save transcript ({}); copied to clipboard",
-                    short_error(&error.to_string())
-                ),
-            );
-            return;
-        }
+        let output = match write_file(&job.output, text) {
+            Ok(()) => job.output.clone(),
+            Err(error) => {
+                warn!(error = %error, file = %job.output.display(), "failed to write transcript");
+                // Never lose a long transcription to a bad path: save it in
+                // Documents\HouWritr instead.
+                let fallback = fallback_output(&job.output);
+                match fallback
+                    .as_deref()
+                    .map(|path| (path, write_file(path, text)))
+                {
+                    Some((path, Ok(()))) => {
+                        warn!(file = %path.display(), "transcript saved in the fallback folder");
+                        let path = path.to_path_buf();
+                        job.output = path.clone();
+                        path
+                    }
+                    _ => {
+                        job.tell_window(WindowMsg::Failed {
+                            error: format!("could not save {}: {error}", job.output.display()),
+                        });
+                        self.report_long_form(
+                            windowed,
+                            true,
+                            &format!(
+                                "Could not save transcript ({})",
+                                short_error(&error.to_string())
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
         info!(file = %output.display(), chars = text.chars().count(), "transcript saved");
         // The finished transcript supersedes the in-progress one. (If saving
         // failed above we returned earlier and the partial file is kept.)
         if let Some(partial) = &job.partial {
             let _ = std::fs::remove_file(partial);
-        }
-        if let Err(error) = paste::deliver(text, paste::DeliveryMode::Clipboard) {
-            warn!(error = %error, "failed to copy transcript to clipboard");
         }
 
         // Meeting notes go next to the transcript as their own file.
@@ -2188,7 +1570,7 @@ impl AppHandler {
             let mut message = if notes_saved {
                 format!("Saved {name} and meeting notes")
             } else {
-                format!("Saved {name} and copied to clipboard")
+                format!("Saved {name}")
             };
             if let DiarizationOutcome::Labelled { speakers } = &diarization {
                 message.push_str(&format!(" · {speakers} speakers"));
@@ -2620,9 +2002,7 @@ impl AppHandler {
                 cleanup,
                 repair,
                 notes,
-                auto_paste,
                 enhancement_warning,
-                delivery_target,
             } => {
                 let file_output = self.state.file_jobs.remove(&id);
                 let windowed = file_output.as_ref().is_some_and(FileJob::overlay_free);
@@ -2662,106 +2042,9 @@ impl AppHandler {
                     );
                     return;
                 }
-                if text.is_empty() {
-                    return;
-                }
-                let target_matches = delivery_target
-                    .map(delivery_target_is_current)
-                    .unwrap_or(false);
-                let recording_active = recording_or_press_pending(
-                    self.state.active_recording.is_some(),
-                    self.state.delivery_interlock.as_ref(),
-                );
-                let plan = decide_delivery(
-                    auto_paste,
-                    recording_active,
-                    delivery_target.is_some(),
-                    target_matches,
-                    false,
-                );
-                let (mode, safety_warning) = match plan {
-                    DeliveryPlan::Paste => (paste::DeliveryMode::Paste, None),
-                    DeliveryPlan::ClipboardExplicit => (paste::DeliveryMode::Clipboard, None),
-                    DeliveryPlan::ClipboardSafety(reason) => {
-                        (paste::DeliveryMode::Clipboard, Some(reason))
-                    }
-                };
-                let delivery = match mode {
-                    paste::DeliveryMode::Paste => paste::deliver_guarded(
-                        &text,
-                        mode,
-                        Some(self.state.delivery_interlock.as_ref()),
-                        || {
-                            delivery_target
-                                .map(delivery_target_is_current)
-                                .unwrap_or(false)
-                        },
-                    ),
-                    paste::DeliveryMode::Clipboard => paste::deliver(&text, mode),
-                };
-                match delivery {
-                    Ok(paste::DeliveryOutcome::Pasted) => {
-                        if let Some(reason) = enhancement_warning {
-                            self.show_cleanup_fallback(reason, "pasted");
-                        } else {
-                            self.show_job_success("Transcript pasted");
-                        }
-                    }
-                    Ok(paste::DeliveryOutcome::Copied) => {
-                        let guarded_paste_rejected =
-                            auto_paste && matches!(plan, DeliveryPlan::Paste);
-                        if let Some(reason) = safety_warning.or_else(|| {
-                            guarded_paste_rejected.then(|| {
-                                if recording_or_press_pending(
-                                    self.state.active_recording.is_some(),
-                                    self.state.delivery_interlock.as_ref(),
-                                ) {
-                                    DeliveryBlockReason::RecordingActive
-                                } else {
-                                    DeliveryBlockReason::TargetChanged
-                                }
-                            })
-                        }) {
-                            self.show_delivery_fallback(reason);
-                        } else if let Some(reason) = enhancement_warning {
-                            self.show_cleanup_fallback(reason, "copied");
-                        } else {
-                            self.state.tray.set_status(
-                                tray::IconColor::Idle,
-                                "HouWritr — copied transcript to clipboard",
-                            );
-                            self.show_overlay_notice(
-                                NoticeKind::Success,
-                                "Copied transcript to clipboard",
-                            );
-                        }
-                    }
-                    Ok(paste::DeliveryOutcome::CopiedWithWarning { warning, detail }) => {
-                        warn!(?warning, detail, "automatic paste fell back to clipboard");
-                        let summary = match warning {
-                            paste::DeliveryWarning::ClipboardPreparationFailed => {
-                                "Clipboard preservation was unavailable"
-                            }
-                            paste::DeliveryWarning::KeyInjectionFailed => {
-                                "Keyboard paste was unavailable"
-                            }
-                        };
-                        self.show_job_warning_kind(
-                            NoticeKind::DeliveryWarning,
-                            &format!(
-                                "{summary}; transcript copied to clipboard: {}",
-                                short_error(&detail)
-                            ),
-                        );
-                    }
-                    Ok(paste::DeliveryOutcome::CancelledClipboardChanged) => {
-                        self.show_delivery_fallback(DeliveryBlockReason::ClipboardChanged);
-                    }
-                    Err(error) => self.show_job_warning(&format!(
-                        "Transcript delivery failed: {}",
-                        short_error(&error.to_string())
-                    )),
-                }
+                // Every job the app starts is a file, a meeting or a retry,
+                // all handled above.
+                warn!(id, "ignoring completion of a job with no transcript file");
             }
             WorkerEvent::JobFailed { id, error } => {
                 let file_job = self.state.file_jobs.remove(&id);
@@ -2817,7 +2100,7 @@ impl AppHandler {
             }
             WorkerEvent::ShutdownComplete => {
                 info!("worker shutdown complete");
-                self.exit_after_clipboard_settles(el);
+                self.exit(el);
             }
         }
     }
@@ -2945,64 +2228,6 @@ impl AppHandler {
         self.show_overlay_notice(kind, message);
     }
 
-    fn show_cleanup_fallback(&mut self, reason: FallbackReason, action: &str) {
-        let kind = cleanup_notice_kind(&reason);
-        let message = match reason {
-            FallbackReason::UnknownProvider => {
-                format!("Provider is invalid; raw transcript was {action}")
-            }
-            FallbackReason::MissingCredential => {
-                format!("Credential unavailable; raw transcript was {action}")
-            }
-            FallbackReason::CredentialTargetChanged => {
-                format!("Provider changed after recording; raw transcript was {action}")
-            }
-            FallbackReason::InvalidEndpoint => {
-                format!("Provider endpoint is invalid; raw transcript was {action}")
-            }
-            FallbackReason::EmptyModelId => {
-                format!("Provider model is invalid; raw transcript was {action}")
-            }
-            FallbackReason::RequestFailed => {
-                format!("Provider request failed; raw transcript was {action}")
-            }
-            FallbackReason::ProviderRejected(status) => format!(
-                "Provider rejected the request (HTTP {status}, see the log); raw transcript was {action}"
-            ),
-            FallbackReason::ResponseUnparseable => {
-                format!("Provider response was invalid; raw transcript was {action}")
-            }
-            FallbackReason::EmptyCandidate => {
-                format!("Cleanup returned no text; raw transcript was {action}")
-            }
-            FallbackReason::IntegrityRejected(_) => {
-                format!("Cleanup changed critical content; raw transcript was {action}")
-            }
-            FallbackReason::ValidatorError => {
-                format!("Cleanup validation failed; raw transcript was {action}")
-            }
-        };
-        self.show_job_warning_kind(kind, &message);
-    }
-
-    fn show_delivery_fallback(&mut self, reason: DeliveryBlockReason) {
-        let message = match reason {
-            DeliveryBlockReason::RecordingActive => {
-                "Another recording is active; transcript copied to clipboard"
-            }
-            DeliveryBlockReason::TargetChanged => {
-                "Target window changed; transcript copied to clipboard"
-            }
-            DeliveryBlockReason::Cancelled => {
-                "Delivery was cancelled; transcript copied to clipboard"
-            }
-            DeliveryBlockReason::ClipboardChanged => {
-                "Delivery cancelled because the clipboard changed; newer clipboard contents were preserved"
-            }
-        };
-        self.show_job_warning_kind(NoticeKind::DeliveryWarning, message);
-    }
-
     fn configuration_issue(&self) -> Option<&str> {
         self.state
             .settings_error
@@ -3019,7 +2244,7 @@ impl AppHandler {
             return (
                 color,
                 format!(
-                    "HouWritr — recording blocked: {}",
+                    "HouWritr — transcription blocked: {}",
                     state.status_text(&self.state.settings.engine)
                 ),
             );
@@ -3027,18 +2252,18 @@ impl AppHandler {
         match &self.state.engine_state {
             EngineState::Loading => (
                 tray::IconColor::Transcribing,
-                "HouWritr — recording blocked: engine is loading".into(),
+                "HouWritr — transcription blocked: engine is loading".into(),
             ),
             EngineState::Failed { error } => (
                 tray::IconColor::Error,
                 format!(
-                    "HouWritr — recording blocked: engine failed: {}",
+                    "HouWritr — transcription blocked: engine failed: {}",
                     short_error(error)
                 ),
             ),
             EngineState::NotStarted => (
                 tray::IconColor::Error,
-                "HouWritr — recording blocked: engine is not ready".into(),
+                "HouWritr — transcription blocked: engine is not ready".into(),
             ),
             EngineState::Ready { .. } => (tray::IconColor::Idle, "HouWritr — engine ready".into()),
         }
@@ -3058,11 +2283,6 @@ impl AppHandler {
         info!(pending_jobs = self.state.pending_jobs, "quit requested");
         self.state.shutting_down = true;
         self.state.hk_stop.store(true, Ordering::Relaxed);
-        if self.state.active_recording.take().is_some() {
-            let _ = self.state.recorder.stop();
-            self.state.overlay_state.recording_finished();
-            info!("active recording discarded during shutdown");
-        }
 
         let mode = if self.state.pending_jobs > 0 {
             prompt_shutdown_mode(self.state.pending_jobs)
@@ -3071,7 +2291,6 @@ impl AppHandler {
         };
         self.state.discarding_jobs = mode == ShutdownMode::Discard;
         if mode == ShutdownMode::Discard {
-            paste::cancel_pending_restorations();
             // A cleanup request can wait minutes on a slow connection; quitting
             // must not wait for it.
             crate::enhance::cancel_requests();
@@ -3088,14 +2307,11 @@ impl AppHandler {
             .set_status(tray::IconColor::Transcribing, &status);
         if let Err(error) = self.state.worker.shutdown(mode) {
             warn!(error = %error, "worker shutdown command failed");
-            self.exit_after_clipboard_settles(el);
+            self.exit(el);
         }
     }
 
-    fn exit_after_clipboard_settles(&self, el: &ActiveEventLoop) {
-        if !paste::wait_for_pending_restorations(Duration::from_secs(2)) {
-            warn!("clipboard restoration did not settle before the shutdown timeout");
-        }
+    fn exit(&self, el: &ActiveEventLoop) {
         crate::local_llm::shutdown();
         el.exit();
     }
@@ -3210,16 +2426,8 @@ fn prompt_shutdown_mode(pending_jobs: usize) -> ShutdownMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cleanup_notice_kind, consume_press_pending, decide_delivery, mark_press_pending,
-        recording_intent, recording_or_press_pending, ActiveRecording, DeliveryBlockReason,
-        DeliveryPlan, OverlayReducer,
-    };
-    use crate::cleanup::{EndpointScope, FallbackReason, PromptSource, PromptTarget};
-    use crate::overlay::{ListeningIntent, NoticeKind, OverlayViewState, ProcessingPhase};
-    use crate::paste::DeliveryInterlock;
-    use crate::settings::{EnhanceMode, Settings};
-    use crate::worker::RecordingIntent;
+    use super::OverlayReducer;
+    use crate::overlay::{NoticeKind, OverlayViewState, ProcessingPhase};
     use std::time::Instant;
 
     fn file_job(window: bool, background: bool) -> super::FileJob {
@@ -3336,8 +2544,8 @@ mod tests {
     }
 
     #[test]
-    fn popup_and_background_jobs_stay_out_of_the_dictation_overlay() {
-        // Dictation-style meeting jobs (the final part, with the pill) use it.
+    fn popup_and_background_jobs_stay_out_of_the_status_pill() {
+        // The final part of a meeting (shown in the pill) uses it.
         assert!(!file_job(false, false).overlay_free());
         // A file job shows in its popup, a background meeting part nowhere.
         assert!(file_job(true, false).overlay_free());
@@ -3345,78 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_intent_covers_the_full_shift_truth_table() {
-        use RecordingIntent::{Enhance, Raw};
-
-        let cases = [
-            (EnhanceMode::Never, false, false, Raw),
-            (EnhanceMode::Never, false, true, Raw),
-            (EnhanceMode::Never, true, false, Raw),
-            (EnhanceMode::Never, true, true, Raw),
-            (EnhanceMode::WithShift, false, false, Raw),
-            (EnhanceMode::WithShift, false, true, Enhance),
-            (EnhanceMode::WithShift, true, false, Raw),
-            (EnhanceMode::WithShift, true, true, Raw),
-            (EnhanceMode::Always, false, false, Enhance),
-            (EnhanceMode::Always, false, true, Raw),
-            (EnhanceMode::Always, true, false, Enhance),
-            (EnhanceMode::Always, true, true, Enhance),
-        ];
-
-        for (mode, shift_is_modifier, shift_is_down, expected) in cases {
-            assert_eq!(
-                recording_intent(mode, shift_is_modifier, shift_is_down),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn active_recording_keeps_the_press_time_settings_snapshot() {
-        let mut live = Settings::default();
-        live.auto_paste = false;
-        live.min_record_seconds = 0.5;
-        live.max_record_seconds = 12.0;
-        live.enhance.mode = EnhanceMode::Always;
-        live.enhance.provider = "openai_compatible".into();
-        live.enhance.base_url = "https://snapshot.example/v1".into();
-        live.enhance.model = "snapshot-model".into();
-        let target = PromptTarget::openai_compatible(
-            EndpointScope::parse(&live.enhance.base_url).unwrap(),
-            &live.enhance.model,
-        )
-        .unwrap();
-        live.prompt_overrides
-            .set(target.clone(), "snapshot prompt".into());
-
-        let active = ActiveRecording::new(live.clone(), RecordingIntent::Enhance, None);
-        live.auto_paste = true;
-        live.min_record_seconds = 2.0;
-        live.max_record_seconds = 30.0;
-        live.enhance.mode = EnhanceMode::Never;
-        live.enhance.provider = "github_copilot".into();
-        live.enhance.base_url = "https://changed.example/v1".into();
-        live.enhance.model = "changed-model".into();
-
-        assert!(!active.settings.auto_paste);
-        assert_eq!(active.settings.min_record_seconds, 0.5);
-        assert_eq!(active.settings.max_record_seconds, 12.0);
-        assert_eq!(active.settings.enhance.mode, EnhanceMode::Always);
-        assert_eq!(active.settings.prompt_target().unwrap(), target);
-        let resolved = active.settings.resolve_prompt(&target);
-        assert_eq!(resolved.source, PromptSource::CustomOverride);
-        assert_eq!(
-            resolved.system,
-            format!(
-                "snapshot prompt\n\n{}",
-                crate::cleanup::prompt::TRANSCRIPT_ONLY_POLICY
-            )
-        );
-        assert_eq!(active.intent, RecordingIntent::Enhance);
-    }
-
-    #[test]
-    fn overlay_reducer_enforces_recording_job_queue_notice_priority() {
+    fn overlay_reducer_enforces_job_queue_notice_priority() {
         let now = Instant::now();
         let mut reducer = OverlayReducer::default();
         reducer.show_notice(NoticeKind::Warning, "old notice", now);
@@ -3433,12 +2570,6 @@ mod tests {
             OverlayViewState::processing(10, ProcessingPhase::Transcribing, 1)
         );
 
-        reducer.recording_started(RecordingIntent::Enhance);
-        assert_eq!(
-            reducer.desired_view(now),
-            OverlayViewState::listening(ListeningIntent::Enhance)
-        );
-        reducer.recording_finished();
         assert!(reducer.enhancement_started(10));
         assert_eq!(
             reducer.desired_view(now),
@@ -3472,86 +2603,6 @@ mod tests {
         assert_eq!(
             reducer.desired_view(now),
             OverlayViewState::processing(2, ProcessingPhase::Transcribing, 0)
-        );
-    }
-
-    #[test]
-    fn delivery_safety_falls_back_for_target_change_and_cancellation() {
-        assert_eq!(
-            decide_delivery(true, false, true, false, false),
-            DeliveryPlan::ClipboardSafety(DeliveryBlockReason::TargetChanged)
-        );
-        assert_eq!(
-            decide_delivery(true, false, true, true, true),
-            DeliveryPlan::ClipboardSafety(DeliveryBlockReason::Cancelled)
-        );
-        assert_eq!(
-            decide_delivery(true, true, true, true, false),
-            DeliveryPlan::ClipboardSafety(DeliveryBlockReason::RecordingActive)
-        );
-        assert_eq!(
-            decide_delivery(false, true, false, false, true),
-            DeliveryPlan::ClipboardExplicit
-        );
-        assert_eq!(
-            decide_delivery(true, false, true, true, false),
-            DeliveryPlan::Paste
-        );
-    }
-
-    #[test]
-    fn pending_press_blocks_older_completion_until_app_consumes_its_epoch() {
-        let pending = DeliveryInterlock::default();
-        let mut next_epoch = 0;
-        let epoch = mark_press_pending(&pending, &mut next_epoch);
-
-        assert!(recording_or_press_pending(false, &pending));
-        assert_eq!(
-            decide_delivery(
-                true,
-                recording_or_press_pending(false, &pending),
-                true,
-                true,
-                false,
-            ),
-            DeliveryPlan::ClipboardSafety(DeliveryBlockReason::RecordingActive)
-        );
-
-        consume_press_pending(&pending, epoch);
-        assert!(!recording_or_press_pending(false, &pending));
-    }
-
-    #[test]
-    fn consuming_an_older_press_epoch_does_not_clear_a_newer_pending_press() {
-        let pending = DeliveryInterlock::default();
-        let mut next_epoch = 0;
-        let first = mark_press_pending(&pending, &mut next_epoch);
-        let second = mark_press_pending(&pending, &mut next_epoch);
-
-        consume_press_pending(&pending, first);
-
-        assert!(pending.press_pending());
-        consume_press_pending(&pending, second);
-        assert!(!pending.press_pending());
-    }
-
-    #[test]
-    fn cleanup_fallback_notices_distinguish_provider_and_validator_failures() {
-        assert_eq!(
-            cleanup_notice_kind(&FallbackReason::MissingCredential),
-            NoticeKind::ProviderWarning
-        );
-        assert_eq!(
-            cleanup_notice_kind(&FallbackReason::RequestFailed),
-            NoticeKind::ProviderWarning
-        );
-        assert_eq!(
-            cleanup_notice_kind(&FallbackReason::ValidatorError),
-            NoticeKind::RawFallback
-        );
-        assert_eq!(
-            cleanup_notice_kind(&FallbackReason::IntegrityRejected(vec![])),
-            NoticeKind::RawFallback
         );
     }
 }

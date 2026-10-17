@@ -18,26 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-const MAX_RECORD_SECONDS: f32 = 60.0 * 60.0;
-const VALID_MODIFIERS: &[&str] = &["ctrl", "shift", "alt", "win"];
-const VALID_TRIGGERS: &[&str] = &[
-    "none",
-    "space",
-    "tab",
-    "caps_lock",
-    "scroll_lock",
-    "pause",
-    "insert",
-    "right_ctrl",
-    "f13",
-    "f14",
-    "f15",
-    "f16",
-    "f17",
-    "f18",
-    "f19",
-    "f20",
-];
 const VALID_ENGINES: &[&str] = &["parakeet_cpu", "parakeet_npu", "whisper_npu"];
 const PROMPT_OVERRIDES_VERSION: u64 = 1;
 
@@ -344,26 +324,21 @@ fn prompt_override_entry(target: &PromptTarget, prompt: &str) -> Value {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub hotkey_modifiers: Vec<String>,
-    pub hotkey_trigger: String,
     pub engine: String,
-    pub auto_paste: bool,
+    /// Show the status pill for job progress and notices.
     pub overlay: bool,
     /// Keep a "Recording 12:34" pill on screen for the whole meeting
-    /// recording (independent of the dictation overlay).
+    /// recording (independent of the status pill).
     pub show_meeting_indicator: bool,
     /// Whether stopping a meeting recording creates AI notes: ask, always
     /// or never.
     pub meeting_notes: MeetingNotesMode,
-    pub sounds: bool,
     /// Save imported-file and meeting transcripts as Markdown (`.md`, with a
     /// title and paragraphs) instead of plain `.txt`.
     pub markdown_transcripts: bool,
     /// Label speakers ("Speaker 1: …") in file and meeting transcripts using
     /// the on-device diarization models.
     pub diarize_speakers: bool,
-    pub min_record_seconds: f32,
-    pub max_record_seconds: f32,
     pub enhance: Enhance,
     pub prompt_overrides: PromptOverridesDocument,
 }
@@ -371,18 +346,12 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey_modifiers: vec!["ctrl".into(), "win".into()],
-            hotkey_trigger: "none".into(),
             engine: "parakeet_cpu".into(),
-            auto_paste: true,
             overlay: true,
             show_meeting_indicator: true,
             meeting_notes: MeetingNotesMode::Ask,
-            sounds: true,
             markdown_transcripts: false,
             diarize_speakers: false,
-            min_record_seconds: 0.25,
-            max_record_seconds: 60.0,
             enhance: Enhance::default(),
             prompt_overrides: PromptOverridesDocument::default(),
         }
@@ -458,65 +427,6 @@ impl Settings {
         settings_revision(path)
     }
 
-    fn validate_compatible_shortcut(&self) -> Result<(), SettingsError> {
-        if self.hotkey_modifiers.is_empty() && self.hotkey_trigger == "none" {
-            return Err(SettingsError::Validation(
-                "select at least one modifier or trigger key".into(),
-            ));
-        }
-        for modifier in &self.hotkey_modifiers {
-            if !VALID_MODIFIERS.contains(&modifier.as_str()) {
-                return Err(SettingsError::Validation(format!(
-                    "unsupported hotkey modifier `{modifier}`"
-                )));
-            }
-        }
-        let mut unique = self.hotkey_modifiers.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != self.hotkey_modifiers.len() {
-            return Err(SettingsError::Validation(
-                "hotkey modifiers must not contain duplicates".into(),
-            ));
-        }
-        if !VALID_TRIGGERS.contains(&self.hotkey_trigger.as_str()) {
-            return Err(SettingsError::Validation(format!(
-                "unsupported trigger key `{}`",
-                self.hotkey_trigger
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn validate_shortcut(&self) -> Result<(), SettingsError> {
-        self.validate_compatible_shortcut()?;
-        if self.hotkey_trigger == "none" && self.hotkey_modifiers.len() < 2 {
-            return Err(SettingsError::Validation(
-                "a modifier-only shortcut requires at least two modifier keys".into(),
-            ));
-        }
-        if self.hotkey_trigger != "none"
-            && self.hotkey_modifiers.is_empty()
-            && !is_standalone_function_trigger(&self.hotkey_trigger)
-        {
-            return Err(SettingsError::Validation(
-                "a shortcut without modifiers may use only F13 through F20".into(),
-            ));
-        }
-        if self.enhance.mode == EnhanceMode::WithShift
-            && self
-                .hotkey_modifiers
-                .iter()
-                .any(|modifier| modifier == "shift")
-        {
-            return Err(SettingsError::Validation(
-                "Shift cannot be both part of the recording shortcut and the additional enhancement key"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
     pub fn validate_enhancement(&self) -> Result<(), SettingsError> {
         let provider = self
             .enhance
@@ -569,7 +479,7 @@ impl Settings {
         self.prompt_overrides.warning()
     }
 
-    fn validate_non_shortcut_fields(&self) -> Result<(), SettingsError> {
+    fn validate_fields(&self) -> Result<(), SettingsError> {
         if !VALID_ENGINES.contains(&self.engine.as_str()) {
             return Err(SettingsError::Validation(format!(
                 "unsupported transcription engine `{}`",
@@ -577,35 +487,15 @@ impl Settings {
             )));
         }
         self.validate_enhancement()?;
-        if !self.min_record_seconds.is_finite() || self.min_record_seconds < 0.0 {
-            return Err(SettingsError::Validation(
-                "minimum recording duration must be a finite non-negative number".into(),
-            ));
-        }
-        if !self.max_record_seconds.is_finite()
-            || self.max_record_seconds <= 0.0
-            || self.max_record_seconds > MAX_RECORD_SECONDS
-        {
-            return Err(SettingsError::Validation(format!(
-                "maximum recording duration must be between 0 and {MAX_RECORD_SECONDS} seconds"
-            )));
-        }
-        if self.min_record_seconds > self.max_record_seconds {
-            return Err(SettingsError::Validation(
-                "minimum recording duration cannot exceed the maximum".into(),
-            ));
-        }
         Ok(())
     }
 
     fn validate_for_load(&self) -> Result<(), SettingsError> {
-        self.validate_compatible_shortcut()?;
-        self.validate_non_shortcut_fields()
+        self.validate_fields()
     }
 
     pub fn validate(&self) -> Result<(), SettingsError> {
-        self.validate_shortcut()?;
-        self.validate_non_shortcut_fields()
+        self.validate_fields()
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
@@ -618,13 +508,6 @@ impl Settings {
     pub fn save(&self) -> Result<(), SettingsError> {
         self.save_to(&settings_path())
     }
-}
-
-fn is_standalone_function_trigger(trigger: &str) -> bool {
-    matches!(
-        trigger,
-        "f13" | "f14" | "f15" | "f16" | "f17" | "f18" | "f19" | "f20"
-    )
 }
 
 fn load_with_migration(
@@ -1248,7 +1131,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
 
         let mut settings = Settings::load_from(&path).unwrap();
-        settings.sounds = false;
+        settings.markdown_transcripts = !settings.markdown_transcripts;
         settings.save_to(&path).unwrap();
 
         let saved: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -1276,60 +1159,22 @@ mod tests {
     }
 
     #[test]
-    fn validates_safe_shortcut_classes() {
-        let mut settings = Settings::default();
-        assert!(settings.validate_shortcut().is_ok());
-
-        settings.hotkey_modifiers = vec!["ctrl".into()];
-        assert!(settings.validate_shortcut().is_err());
-
-        settings.hotkey_modifiers.clear();
-        settings.hotkey_trigger = "space".into();
-        assert!(settings.validate_shortcut().is_err());
-
-        settings.hotkey_trigger = "f13".into();
-        assert!(settings.validate_shortcut().is_ok());
-    }
-
-    #[test]
-    fn loads_legacy_shortcuts_but_requires_a_safe_replacement_before_saving() {
-        let mut single_modifier = Settings::default();
-        single_modifier.hotkey_modifiers = vec!["ctrl".into()];
-
-        let mut bare_trigger = Settings::default();
-        bare_trigger.hotkey_modifiers.clear();
-        bare_trigger.hotkey_trigger = "space".into();
-
-        let mut shift_conflict = Settings::default();
-        shift_conflict.hotkey_modifiers = vec!["ctrl".into(), "shift".into()];
-        shift_conflict.enhance.mode = EnhanceMode::WithShift;
-
+    fn settings_from_the_dictation_era_still_load() {
         let temp = tempfile::tempdir().unwrap();
-        for (index, settings) in [single_modifier, bare_trigger, shift_conflict]
-            .into_iter()
-            .enumerate()
-        {
-            let path = temp.path().join(format!("settings-{index}.json"));
-            fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        let path = temp.path().join("settings.json");
+        let mut document = serde_json::to_value(Settings::default()).unwrap();
+        document["hotkey_modifiers"] = json!(["ctrl", "shift"]);
+        document["hotkey_trigger"] = json!("space");
+        document["auto_paste"] = json!(true);
+        document["sounds"] = json!(false);
+        document["max_record_seconds"] = json!(-1.0);
+        document["enhance"]["mode"] = json!("with_shift");
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
 
-            let loaded = Settings::load_from(&path).unwrap();
-
-            assert_eq!(loaded.hotkey_modifiers, settings.hotkey_modifiers);
-            assert_eq!(loaded.hotkey_trigger, settings.hotkey_trigger);
-            assert_eq!(loaded.enhance.mode, settings.enhance.mode);
-            assert!(loaded.validate().is_err());
-        }
-    }
-
-    #[test]
-    fn rejects_shift_enhancement_conflicts() {
-        let mut settings = Settings::default();
-        settings.hotkey_modifiers = vec!["ctrl".into(), "shift".into()];
-        settings.enhance.mode = EnhanceMode::WithShift;
-        assert!(settings.validate_shortcut().is_err());
-
-        settings.enhance.mode = EnhanceMode::Always;
-        assert!(settings.validate_shortcut().is_ok());
+        let loaded = Settings::load_from(&path).unwrap();
+        assert!(loaded.validate().is_ok());
+        // Cleanup that used to need Shift is simply on.
+        assert!(loaded.enhance.mode.is_enabled());
     }
 
     #[test]
@@ -1342,21 +1187,6 @@ mod tests {
 
         settings.enhance.base_url = "http://localhost:11434/v1".into();
         assert!(settings.validate_enhancement().is_ok());
-    }
-
-    #[test]
-    fn rejects_empty_hotkey_and_invalid_limits() {
-        let mut settings = Settings::default();
-        settings.hotkey_modifiers.clear();
-        assert!(settings.validate().is_err());
-
-        settings.hotkey_trigger = "space".into();
-        settings.max_record_seconds = f32::NAN;
-        assert!(settings.validate().is_err());
-
-        settings.max_record_seconds = 1.0;
-        settings.min_record_seconds = 2.0;
-        assert!(settings.validate().is_err());
     }
 
     #[test]
@@ -1380,7 +1210,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let mut configured = Settings::default();
-        configured.hotkey_trigger = "f13".into();
+        configured.markdown_transcripts = !configured.markdown_transcripts;
         configured.save_to(&path).unwrap();
         let existing_revision = Settings::revision_from(&path).unwrap();
 
@@ -1390,10 +1220,9 @@ mod tests {
         assert_ne!(existing_revision, deleted_revision);
         let reloaded = Settings::load_from(&path).unwrap();
         assert_eq!(
-            reloaded.hotkey_modifiers,
-            Settings::default().hotkey_modifiers
+            reloaded.markdown_transcripts,
+            Settings::default().markdown_transcripts
         );
-        assert_eq!(reloaded.hotkey_trigger, Settings::default().hotkey_trigger);
     }
 
     #[test]
@@ -1429,7 +1258,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let mut document = legacy_document("only-copy");
-        document["max_record_seconds"] = Value::from(-1.0);
+        document["engine"] = Value::from("no_such_engine");
         atomic_write_json(&path, &document).unwrap();
         let store = FakeStore::default();
 
@@ -1446,7 +1275,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let mut document = legacy_document("only-copy");
-        document["max_record_seconds"] = Value::from(-1.0);
+        document["engine"] = Value::from("no_such_engine");
         let original = serde_json::to_vec_pretty(&document).unwrap();
         fs::write(&path, &original).unwrap();
         let store = FakeStore::default();

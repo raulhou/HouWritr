@@ -11,7 +11,6 @@ use crate::cleanup::{
 };
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
-use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -345,14 +344,29 @@ pub(crate) struct PreparedCleanupRequest {
 
 /// Resolve provider/model/endpoint/prompt and build the exact adapter request
 /// from a frozen settings snapshot. Credentials are intentionally absent.
+#[cfg(test)]
 pub(crate) fn prepare_cleanup_request(
     text: &str,
     settings: &Settings,
 ) -> std::result::Result<PreparedCleanupRequest, FallbackReason> {
+    prepare_cleanup_request_with(text, settings, None)
+}
+
+/// [`prepare_cleanup_request`] with an extra instruction appended to the
+/// system prompt (for example which Chinese script to write).
+fn prepare_cleanup_request_with(
+    text: &str,
+    settings: &Settings,
+    extra_instruction: Option<&str>,
+) -> std::result::Result<PreparedCleanupRequest, FallbackReason> {
     let (provider, target) = resolve_target(settings)?;
     let resolved = settings.resolve_prompt(&target);
+    let system = match extra_instruction {
+        Some(extra) => format!("{}\n\n{extra}", resolved.system),
+        None => resolved.system,
+    };
     let transcript = Transcript::new(text);
-    let mut body = pipeline::build_request(&target, &resolved.system, &transcript);
+    let mut body = pipeline::build_request(&target, &system, &transcript);
     if is_local_target(&target) {
         body["max_tokens"] = serde_json::json!(local_max_tokens(text));
     }
@@ -437,6 +451,16 @@ pub fn enhance_outcome(
     settings: &Settings,
     before_validate: impl FnOnce() -> bool,
 ) -> Option<EnhanceOutcome> {
+    enhance_outcome_with(text, settings, None, before_validate)
+}
+
+/// [`enhance_outcome`] with an extra instruction for the model.
+fn enhance_outcome_with(
+    text: &str,
+    settings: &Settings,
+    extra_instruction: Option<&str>,
+    before_validate: impl FnOnce() -> bool,
+) -> Option<EnhanceOutcome> {
     let cfg = &settings.enhance;
     if cfg.mode == EnhanceMode::Never {
         return Some(EnhanceOutcome::skipped(
@@ -448,7 +472,7 @@ pub fn enhance_outcome(
         return Some(EnhanceOutcome::skipped(text, SkipReason::EmptyTranscript));
     }
 
-    let prepared = match prepare_cleanup_request(text, settings) {
+    let prepared = match prepare_cleanup_request_with(text, settings, extra_instruction) {
         Ok(prepared) => prepared,
         Err(reason) => {
             warn!(?reason, "cleanup request configuration is invalid");
@@ -999,14 +1023,265 @@ pub fn enhance_long_form(
         "long-form cleanup started"
     );
     let managed = uses_managed_model(settings);
-    clean_slices(
-        slices,
-        &joins,
-        |slice| enhance_outcome(slice, settings, || !interrupted()),
-        &|| managed && crate::local_llm::keeps_writing_slowly(),
-        &interrupted,
-        progress,
-    )
+    // Whisper sometimes drifts into Traditional characters in a Simplified
+    // recording (or the other way round); each slice is told the script of
+    // the whole transcript.
+    let script = chinese_script(text);
+    if let Some(script) = script {
+        info!(?script, "cleanup keeps one Chinese script");
+    }
+    let instruction = script.map(ChineseScript::instruction);
+    let give_up = || managed && crate::local_llm::keeps_writing_slowly();
+    // A model on this PC handles one request at a time; a hosted one can
+    // clean several slices at once.
+    let local = resolve_target(settings).is_ok_and(|(_, target)| is_local_target(&target));
+    if local || slices.len() < 3 {
+        return clean_slices(
+            slices,
+            &joins,
+            |slice| enhance_outcome_with(slice, settings, instruction, || !interrupted()),
+            &give_up,
+            &interrupted,
+            progress,
+        );
+    }
+    // Workers cannot see `interrupted`; it is checked as results are taken.
+    let clean = |slice: &str| enhance_outcome_with(slice, settings, instruction, || true);
+    let all: Vec<&str> = slices.clone();
+    with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, &clean, |take| {
+        clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
+    })
+}
+
+/// Slices a hosted provider cleans at the same time.
+const HOSTED_PARALLEL_SLICES: usize = 3;
+
+/// Work shared between the slice workers and the thread putting the
+/// transcript back together.
+struct ParallelSlices {
+    /// The outcome of each slice once a worker has it.
+    results: Vec<Option<Option<EnhanceOutcome>>>,
+    /// The next slice no one has started.
+    next: usize,
+    /// Workers run once one slice was cleaned on its own (that request finds
+    /// a working model; three at once would each search for one).
+    started: bool,
+    stop: bool,
+}
+
+/// Run `consume` with a `take` function that returns the cleanup of each
+/// slice in order, while up to `workers` threads clean the slices ahead.
+/// `consume` must ask for the slices in order, one call per slice, and may
+/// stop early.
+fn with_parallel_cleaner<R>(
+    slices: &[&str],
+    workers: usize,
+    clean: &(dyn Fn(&str) -> Option<EnhanceOutcome> + Sync),
+    consume: impl FnOnce(&mut dyn FnMut(&str) -> Option<EnhanceOutcome>) -> R,
+) -> R {
+    let state = parking_lot::Mutex::new(ParallelSlices {
+        results: (0..slices.len()).map(|_| None).collect(),
+        next: 0,
+        started: false,
+        stop: false,
+    });
+    let changed = parking_lot::Condvar::new();
+    std::thread::scope(|scope| {
+        let mut spawned = 0;
+        for _ in 0..workers {
+            let worker = || loop {
+                let index = {
+                    let mut shared = state.lock();
+                    while !shared.started && !shared.stop {
+                        changed.wait(&mut shared);
+                    }
+                    if shared.stop || shared.next >= slices.len() {
+                        return;
+                    }
+                    shared.next += 1;
+                    shared.next - 1
+                };
+                let outcome = clean(slices[index]);
+                let rejected = matches!(
+                    &outcome,
+                    Some(EnhanceOutcome::RawFallback {
+                        reason: FallbackReason::ProviderRejected(_),
+                        ..
+                    })
+                );
+                let mut shared = state.lock();
+                shared.results[index] = Some(outcome);
+                // The provider refuses these requests: the rest would be too.
+                shared.stop |= rejected;
+                changed.notify_all();
+            };
+            if std::thread::Builder::new()
+                .name("cleanup-slice".into())
+                .spawn_scoped(scope, worker)
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+
+        let mut position = 0usize;
+        let mut take = |slice: &str| -> Option<EnhanceOutcome> {
+            let index = position;
+            position += 1;
+            let mut shared = state.lock();
+            if spawned == 0 || !shared.started {
+                // One at a time until a slice comes back cleaned.
+                shared.next = index + 1;
+                drop(shared);
+                let outcome = clean(slice);
+                if matches!(outcome, Some(EnhanceOutcome::Enhanced { .. })) {
+                    let mut shared = state.lock();
+                    shared.started = true;
+                    changed.notify_all();
+                }
+                return outcome;
+            }
+            loop {
+                if let Some(outcome) = shared.results.get_mut(index).and_then(Option::take) {
+                    return outcome;
+                }
+                if shared.stop && index >= shared.next {
+                    // Workers stopped before reaching this slice.
+                    drop(shared);
+                    return clean(slice);
+                }
+                changed.wait(&mut shared);
+            }
+        };
+        let result = consume(&mut take);
+        state.lock().stop = true;
+        changed.notify_all();
+        result
+    })
+}
+
+/// The Chinese script a transcript is written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChineseScript {
+    Simplified,
+    Traditional,
+}
+
+impl ChineseScript {
+    fn instruction(self) -> &'static str {
+        match self {
+            ChineseScript::Simplified => "Write all Chinese in Simplified Chinese characters (简体字): convert any Traditional characters in the transcript to Simplified. Do not change anything else because of this.",
+            ChineseScript::Traditional => "Write all Chinese in Traditional Chinese characters (繁體字): convert any Simplified characters in the transcript to Traditional. Do not change anything else because of this.",
+        }
+    }
+}
+
+/// Common characters written differently in the two scripts, as
+/// (Traditional, Simplified) pairs.
+const SCRIPT_PAIRS: &[(char, char)] = &[
+    ('們', '们'),
+    ('個', '个'),
+    ('這', '这'),
+    ('說', '说'),
+    ('對', '对'),
+    ('來', '来'),
+    ('會', '会'),
+    ('時', '时'),
+    ('為', '为'),
+    ('麼', '么'),
+    ('還', '还'),
+    ('開', '开'),
+    ('過', '过'),
+    ('點', '点'),
+    ('現', '现'),
+    ('樣', '样'),
+    ('學', '学'),
+    ('種', '种'),
+    ('國', '国'),
+    ('讓', '让'),
+    ('長', '长'),
+    ('東', '东'),
+    ('經', '经'),
+    ('發', '发'),
+    ('與', '与'),
+    ('關', '关'),
+    ('問', '问'),
+    ('見', '见'),
+    ('給', '给'),
+    ('從', '从'),
+    ('話', '话'),
+    ('動', '动'),
+    ('間', '间'),
+    ('機', '机'),
+    ('實', '实'),
+    ('錢', '钱'),
+    ('體', '体'),
+    ('驗', '验'),
+    ('號', '号'),
+    ('帳', '账'),
+    ('聽', '听'),
+    ('應', '应'),
+    ('該', '该'),
+    ('頭', '头'),
+    ('業', '业'),
+    ('無', '无'),
+    ('員', '员'),
+    ('單', '单'),
+    ('筆', '笔'),
+    ('題', '题'),
+    ('寫', '写'),
+    ('買', '买'),
+    ('賣', '卖'),
+    ('費', '费'),
+    ('認', '认'),
+    ('識', '识'),
+    ('書', '书'),
+    ('場', '场'),
+    ('電', '电'),
+    ('網', '网'),
+    ('線', '线'),
+    ('處', '处'),
+    ('產', '产'),
+    ('紅', '红'),
+    ('視', '视'),
+    ('頻', '频'),
+    ('邊', '边'),
+    ('師', '师'),
+    ('專', '专'),
+    ('進', '进'),
+    ('達', '达'),
+    ('選', '选'),
+    ('變', '变'),
+    ('總', '总'),
+    ('數', '数'),
+    ('歡', '欢'),
+    ('頁', '页'),
+    ('戶', '户'),
+    ('連', '连'),
+    ('樂', '乐'),
+];
+
+/// Which script most of the Chinese in `text` uses, when it is clear: at
+/// least 20 telling characters, four in five of one kind.
+fn chinese_script(text: &str) -> Option<ChineseScript> {
+    let (mut traditional, mut simplified) = (0usize, 0usize);
+    for ch in text.chars() {
+        if SCRIPT_PAIRS.iter().any(|(t, _)| *t == ch) {
+            traditional += 1;
+        } else if SCRIPT_PAIRS.iter().any(|(_, s)| *s == ch) {
+            simplified += 1;
+        }
+    }
+    let total = traditional + simplified;
+    if total < 20 {
+        None
+    } else if simplified * 5 >= total * 4 {
+        Some(ChineseScript::Simplified)
+    } else if traditional * 5 >= total * 4 {
+        Some(ChineseScript::Traditional)
+    } else {
+        None
+    }
 }
 
 /// What to put back between each slice and the one before it: the kind of
@@ -1115,6 +1390,12 @@ fn clean_slices(
             }
             EnhanceOutcome::Skipped { text, .. } => joined.push_str(&text),
             EnhanceOutcome::RawFallback { text, reason } => {
+                warn!(
+                    slice = index + 1,
+                    total,
+                    ?reason,
+                    "cleanup slice kept its raw text"
+                );
                 if is_unreachable(&reason) {
                     report.unreachable += 1;
                     in_a_row += 1;
@@ -1262,49 +1543,6 @@ pub fn generate_meeting_notes(
     ) {
         Ok(notes) => NotesOutcome::Notes(notes),
         Err(reason) => NotesOutcome::Failed(reason),
-    }
-}
-
-/// Compatibility facade retained for callers that still expect provider and
-/// credential failures as `Err`. New worker code consumes [`EnhanceOutcome`]
-/// directly.
-pub fn enhance(text: &str, settings: &Settings) -> Result<String> {
-    let outcome = enhance_outcome(text, settings, || true)
-        .ok_or_else(|| anyhow!("enhancement was cancelled"))?;
-    match outcome {
-        EnhanceOutcome::RawFallback { reason, .. }
-            if matches!(
-                reason,
-                FallbackReason::UnknownProvider
-                    | FallbackReason::MissingCredential
-                    | FallbackReason::CredentialTargetChanged
-                    | FallbackReason::InvalidEndpoint
-                    | FallbackReason::EmptyModelId
-                    | FallbackReason::RequestFailed
-                    | FallbackReason::ResponseUnparseable
-            ) =>
-        {
-            Err(anyhow!(fallback_diagnostic(&reason)))
-        }
-        outcome => Ok(outcome.into_text()),
-    }
-}
-
-fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
-    match reason {
-        FallbackReason::UnknownProvider => "unknown enhancement provider",
-        FallbackReason::MissingCredential => "enhancement credential is not configured",
-        FallbackReason::CredentialTargetChanged => {
-            "enhancement provider or endpoint changed before send"
-        }
-        FallbackReason::InvalidEndpoint => "invalid OpenAI-compatible endpoint",
-        FallbackReason::EmptyModelId => "enhancement model ID is empty",
-        FallbackReason::RequestFailed => "enhancement provider request failed",
-        FallbackReason::ProviderRejected(_) => "enhancement provider rejected the request",
-        FallbackReason::ResponseUnparseable => "enhancement provider response was invalid",
-        FallbackReason::EmptyCandidate => "enhancement returned an empty candidate",
-        FallbackReason::IntegrityRejected(_) => "enhancement failed integrity validation",
-        FallbackReason::ValidatorError => "enhancement validator failed",
     }
 }
 
@@ -1850,6 +2088,62 @@ mod long_form_tests {
             "{ \"error\": \"model not supported\" }"
         );
         assert!(error_excerpt(&"x".repeat(400)).ends_with('…'));
+    }
+
+    #[test]
+    fn parallel_cleanup_keeps_the_slices_in_order() {
+        let parts = ["one", "two", "three", "four", "five", "six", "seven"];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let clean = |slice: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            // Later slices answer sooner, so they finish out of order.
+            let wait = 8 - parts.iter().position(|part| *part == slice).unwrap();
+            std::thread::sleep(Duration::from_millis(wait as u64 * 5));
+            enhanced(&slice.to_uppercase())
+        };
+        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+            clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(
+            result.outcome.text(),
+            "ONE\n\nTWO\n\nTHREE\n\nFOUR\n\nFIVE\n\nSIX\n\nSEVEN"
+        );
+        assert_eq!(result.report.cleaned, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn parallel_cleanup_stops_after_a_rejection() {
+        let parts = ["one", "two", "three", "four", "five", "six"];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let clean = |_: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            failed(FallbackReason::ProviderRejected(400))
+        };
+        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+            clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
+        })
+        .unwrap();
+        // The first slice runs alone and is refused: nothing else is sent.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.report.cleaned, 0);
+    }
+
+    #[test]
+    fn the_chinese_script_of_most_of_the_transcript_is_kept() {
+        let simplified = "我们这个时候说的话还是对的，现在开始学习这种东西。".repeat(3);
+        let traditional = "我們這個時候說的話還是對的，現在開始學習這種東西。".repeat(3);
+        assert_eq!(chinese_script(&simplified), Some(ChineseScript::Simplified));
+        assert_eq!(
+            chinese_script(&traditional),
+            Some(ChineseScript::Traditional)
+        );
+        let mixed = format!("{}{}", simplified, traditional);
+        assert_eq!(chinese_script(&mixed), None);
+        assert_eq!(chinese_script("Hello there, nothing Chinese here."), None);
+        let mostly = format!("{}{}", simplified.repeat(5), "這個");
+        assert_eq!(chinese_script(&mostly), Some(ChineseScript::Simplified));
     }
 
     #[test]

@@ -42,8 +42,6 @@ egui = "0.30"
 # Hotkey + audio + paste
 global-hotkey = "0.7"
 cpal = "0.16"
-arboard = "3"
-enigo = "0.6"
 
 # Packaging
 zip = { version = "2", default-features = false, features = ["deflate"] }

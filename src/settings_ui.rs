@@ -766,106 +766,6 @@ fn error_with_rollback(
 }
 
 impl SettingsApp {
-    fn render_shortcut(&mut self, ui: &mut egui::Ui) {
-        ui.label("Modifier keys");
-        let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            for (name, label) in [
-                ("ctrl", "Ctrl"),
-                ("shift", "Shift"),
-                ("alt", "Alt"),
-                ("win", "Win"),
-            ] {
-                let mut enabled = self
-                    .settings
-                    .hotkey_modifiers
-                    .iter()
-                    .any(|modifier| modifier == name);
-                if ui.checkbox(&mut enabled, label).changed() {
-                    self.settings
-                        .hotkey_modifiers
-                        .retain(|modifier| modifier != name);
-                    if enabled {
-                        self.settings.hotkey_modifiers.push(name.to_string());
-                    }
-                    changed = true;
-                }
-            }
-        });
-        self.settings
-            .hotkey_modifiers
-            .sort_by_key(|modifier| modifier_order(modifier));
-
-        ui.add_space(6.0);
-        ui.label("Optional trigger key");
-        let triggers = [
-            "none",
-            "space",
-            "tab",
-            "caps_lock",
-            "scroll_lock",
-            "pause",
-            "insert",
-            "right_ctrl",
-            "f13",
-            "f14",
-            "f15",
-            "f16",
-            "f17",
-            "f18",
-            "f19",
-            "f20",
-        ];
-        egui::ComboBox::from_id_salt("trigger")
-            .selected_text(label_for_trigger(&self.settings.hotkey_trigger))
-            .show_ui(ui, |ui| {
-                for trigger in triggers {
-                    changed |= ui
-                        .selectable_value(
-                            &mut self.settings.hotkey_trigger,
-                            trigger.to_string(),
-                            label_for_trigger(trigger),
-                        )
-                        .changed();
-                }
-            });
-        self.dirty |= changed;
-
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                "Hold {} to record; release any shortcut key to transcribe.",
-                format_shortcut(&self.settings, false)
-                ))
-                .strong(),
-            );
-            match self.settings.enhance.mode {
-                EnhanceMode::Never => {}
-                EnhanceMode::WithShift => info_button(
-                    ui,
-                    "Press or release additional Shift at any time while recording to turn enhancement on or off.",
-                ),
-                EnhanceMode::Always => {
-                    let shift_is_base_modifier = self
-                        .settings
-                        .hotkey_modifiers
-                        .iter()
-                        .any(|modifier| modifier == "shift");
-                    let behavior = if shift_is_base_modifier {
-                        "Every transcript is enhanced. Shift is part of the recording shortcut, so the additional-Shift bypass is unavailable."
-                    } else {
-                        "Press or release additional Shift at any time while recording to bypass or restore enhancement."
-                    };
-                    info_button(ui, behavior);
-                }
-            }
-        });
-        if let Err(error) = self.settings.validate_shortcut() {
-            inline_error(ui, error.to_string());
-        }
-    }
-
     fn render_engines(&mut self, ui: &mut egui::Ui) {
         for descriptor in ENGINE_DESCRIPTORS {
             let state = self.engine_states.get(descriptor.id).cloned();
@@ -1179,37 +1079,10 @@ impl SettingsApp {
     }
 
     fn render_output(&mut self, ui: &mut egui::Ui) {
-        let before = self.settings.auto_paste;
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(
-                &mut self.settings.auto_paste,
-                true,
-                "Paste into the active app",
-            );
-            info_button(
-                ui,
-                "Uses the clipboard temporarily, pastes at the cursor, then restores unchanged clipboard text.",
-            );
-        });
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(
-                &mut self.settings.auto_paste,
-                false,
-                "Copy to the clipboard",
-            );
-            info_button(
-                ui,
-                "Keeps the completed transcript on the clipboard for manual use.",
-            );
-        });
-        self.dirty |= before != self.settings.auto_paste;
-
-        ui.add_space(8.0);
         self.dirty |= ui
             .checkbox(
                 &mut self.settings.overlay,
-                "Show recording waveform and status messages",
+                "Show transcription progress and status messages",
             )
             .changed();
         self.dirty |= ui
@@ -1237,12 +1110,6 @@ impl SettingsApp {
                     .changed();
             }
         });
-        self.dirty |= ui
-            .checkbox(
-                &mut self.settings.sounds,
-                "Play recording start and stop sounds",
-            )
-            .changed();
         ui.horizontal_wrapped(|ui| {
             self.dirty |= ui
                 .checkbox(
@@ -1259,44 +1126,30 @@ impl SettingsApp {
 
     fn render_enhancement(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("When should HouWritr improve punctuation and wording?");
+            ui.label("Improve punctuation and wording of transcripts?");
             info_button(
                 ui,
                 "Enhancement sends recognized transcript text, never recorded audio, to the selected provider.",
             );
         });
         let before_mode = self.settings.enhance.mode;
-        let shift_is_base_modifier = self
-            .settings
-            .hotkey_modifiers
-            .iter()
-            .any(|modifier| modifier == "shift");
+        let mut enabled = before_mode.is_enabled();
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.settings.enhance.mode, EnhanceMode::Never, "Never");
+            ui.radio_value(&mut enabled, false, "Off");
             info_button(ui, "Transcript text never leaves this PC for cleanup.");
-            ui.radio_value(
-                &mut self.settings.enhance.mode,
-                EnhanceMode::WithShift,
-                "When Shift is additionally held",
-            );
+            ui.radio_value(&mut enabled, true, "On");
             info_button(
                 ui,
-                "Press or release additional Shift during recording to turn enhancement on or off.",
-            );
-            ui.radio_value(
-                &mut self.settings.enhance.mode,
-                EnhanceMode::Always,
-                "Always",
-            );
-            info_button(
-                ui,
-                if shift_is_base_modifier {
-                    "Every transcript is enhanced. Bypass is unavailable because Shift is part of the recording shortcut."
-                } else {
-                    "Every transcript is enhanced unless additional Shift is held. Shift can be pressed or released during recording."
-                },
+                "Every file and meeting transcript is cleaned up after transcription.",
             );
         });
+        if enabled != before_mode.is_enabled() {
+            self.settings.enhance.mode = if enabled {
+                EnhanceMode::Always
+            } else {
+                EnhanceMode::Never
+            };
+        }
         if before_mode != self.settings.enhance.mode {
             if self.settings.enhance.mode == EnhanceMode::Never {
                 self.api_key_input.clear();
@@ -1343,11 +1196,6 @@ impl SettingsApp {
 
         if let Err(error) = self.settings.validate_enhancement() {
             inline_error(ui, error.to_string());
-        }
-        if let Err(error) = self.settings.validate_shortcut() {
-            if self.settings.enhance.mode == EnhanceMode::WithShift {
-                inline_error(ui, error.to_string());
-            }
         }
     }
 
@@ -1734,31 +1582,9 @@ impl SettingsApp {
         }
     }
 
-    fn render_advanced(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Stop recording automatically after");
-            self.dirty |= ui
-                .add(
-                    egui::DragValue::new(&mut self.settings.max_record_seconds)
-                        .range(1.0..=3600.0)
-                        .clamp_existing_to_range(false)
-                        .speed(1.0)
-                        .suffix(" s"),
-                )
-                .changed();
-            info_button(
-                ui,
-                &format!(
-                    "The current limit is {}. Reaching it finishes and transcribes the recording automatically.",
-                    format_duration(self.settings.max_record_seconds)
-                ),
-            );
-        });
-    }
-
     fn render_about(&mut self, ui: &mut egui::Ui) {
         ui.heading("About HouWritr");
-        ui.label("Local push-to-talk voice-to-text for Windows.");
+        ui.label("Meeting recording and audio/video transcription for Windows, on this PC.");
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(format!(
@@ -1807,7 +1633,7 @@ impl SettingsApp {
         }
         ui.label(
             egui::RichText::new(
-                "Tray menu → Export diagnostics creates a bounded bundle without audio, transcript text, clipboard contents, or API keys.",
+                "Tray menu → Export diagnostics creates a bounded bundle without audio, transcript text or API keys.",
             )
             .small()
             .color(secondary_text()),
@@ -1975,12 +1801,6 @@ impl eframe::App for SettingsApp {
 
                     section(
                         ui,
-                        "Recording shortcut",
-                        "Choose the keys you hold while speaking.",
-                        |ui| self.render_shortcut(ui),
-                    );
-                    section(
-                        ui,
                         "Transcription",
                         "Choose where local speech recognition runs.",
                         |ui| self.render_engines(ui),
@@ -1988,7 +1808,7 @@ impl eframe::App for SettingsApp {
                     section(
                         ui,
                         "Output and feedback",
-                        "Choose where completed text goes and what HouWritr shows.",
+                        "Choose how transcripts are saved and what HouWritr shows.",
                         |ui| self.render_output(ui),
                     );
                     section(
@@ -2009,9 +1829,6 @@ impl eframe::App for SettingsApp {
                         "Control whether HouWritr runs automatically when you sign in.",
                         |ui| self.render_startup(ui),
                     );
-                    section(ui, "Advanced", "Recording safety limits.", |ui| {
-                        self.render_advanced(ui)
-                    });
                     ui.add_space(12.0);
                 });
         });
@@ -2230,42 +2047,6 @@ fn architecture_label() -> &'static str {
     }
 }
 
-fn modifier_order(modifier: &str) -> usize {
-    match modifier {
-        "ctrl" => 0,
-        "shift" => 1,
-        "alt" => 2,
-        "win" => 3,
-        _ => usize::MAX,
-    }
-}
-
-fn format_shortcut(settings: &Settings, add_shift: bool) -> String {
-    let mut modifiers = settings.hotkey_modifiers.clone();
-    if add_shift && !modifiers.iter().any(|modifier| modifier == "shift") {
-        modifiers.push("shift".into());
-    }
-    modifiers.sort_by_key(|modifier| modifier_order(modifier));
-    let mut parts = modifiers
-        .iter()
-        .map(|modifier| match modifier.as_str() {
-            "ctrl" => "Ctrl".to_string(),
-            "shift" => "Shift".to_string(),
-            "alt" => "Alt".to_string(),
-            "win" => "Win".to_string(),
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>();
-    if settings.hotkey_trigger != "none" {
-        parts.push(label_for_trigger(&settings.hotkey_trigger));
-    }
-    if parts.is_empty() {
-        "an incomplete shortcut".into()
-    } else {
-        parts.join(" + ")
-    }
-}
-
 fn prompt_target_label(target: &PromptTarget) -> String {
     match target.endpoint() {
         Some(endpoint) => format!(
@@ -2302,21 +2083,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_duration(seconds: f32) -> String {
-    if seconds >= 60.0 && seconds % 60.0 == 0.0 {
-        let minutes = seconds / 60.0;
-        if minutes == 1.0 {
-            "1 minute".into()
-        } else {
-            format!("{minutes:.0} minutes")
-        }
-    } else if seconds == 1.0 {
-        "1 second".into()
-    } else {
-        format!("{seconds:.0} seconds")
-    }
-}
-
 fn insecure_remote_http(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
@@ -2333,21 +2099,6 @@ fn insecure_remote_http(base_url: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|address| !address.is_loopback())
         .unwrap_or(true)
-}
-
-fn label_for_trigger(trigger: &str) -> String {
-    match trigger {
-        "none" => "None (modifiers only)".into(),
-        "space" => "Space".into(),
-        "tab" => "Tab".into(),
-        "caps_lock" => "Caps Lock".into(),
-        "scroll_lock" => "Scroll Lock".into(),
-        "pause" => "Pause / Break".into(),
-        "insert" => "Insert".into(),
-        "right_ctrl" => "Right Ctrl".into(),
-        other if other.starts_with('f') => other.to_uppercase(),
-        other => other.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -2486,14 +2237,6 @@ mod tests {
             read_credential_status(&store),
             CredentialStatus::Saved
         ));
-    }
-
-    #[test]
-    fn shortcut_preview_is_ordered_and_includes_optional_shift() {
-        let mut settings = Settings::default();
-        settings.hotkey_modifiers = vec!["win".into(), "ctrl".into()];
-        assert_eq!(format_shortcut(&settings, false), "Ctrl + Win");
-        assert_eq!(format_shortcut(&settings, true), "Ctrl + Shift + Win");
     }
 
     #[test]

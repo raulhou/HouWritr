@@ -7,210 +7,159 @@
 [![Hexagon NPU](https://img.shields.io/badge/Hexagon-NPU-FF2A00?logo=qualcomm&logoColor=white)](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)
 [![Release](https://img.shields.io/github/v/release/raulhou/HouWritr)](https://github.com/raulhou/HouWritr/releases/latest)
 
-Push-to-talk voice-to-text for Windows. Local transcription uses **NVIDIA
-Parakeet TDT 0.6B v3** on CPU or Qualcomm Hexagon NPU, plus native
-**Whisper Large v3 Turbo** on the Snapdragon X Elite NPU.
-Optional LLM cleanup via **GitHub Copilot** (Claude Haiku 4.5, GPT-5 Mini,
-GPT-4.1), any OpenAI-compatible endpoint, or a **model that runs on your PC**
-(on the Snapdragon NPU via Qualcomm GenieX, or a local server such as LM Studio).
+Meeting recording and audio/video transcription for Windows, on your own PC.
+Speech recognition runs locally with **NVIDIA Parakeet TDT 0.6B v3** (CPU or
+Qualcomm Hexagon NPU) or **Whisper Large v3 Turbo** (Snapdragon X Elite NPU).
+Speaker labels run on the device too. Optional AI cleanup and meeting notes
+use **GitHub Copilot**, any OpenAI compatible API, or a **model on this PC**
+(the Snapdragon NPU through Qualcomm GenieX, or a local server such as LM
+Studio).
 
-**[Releases](https://github.com/raulhou/HouWritr/releases)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)**
+**[Releases](https://github.com/raulhou/HouWritr/releases)** · **[Overview](docs/OVERVIEW.md)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)**
 
-HouWritr started as a fork of [OpenWritr for Windows](https://github.com/trsdn/openwritr-windows) by trsdn (MIT licence), and is now developed separately. It adds file and meeting transcription, speaker labels, Whisper on the NPU, a local text model on the NPU through GenieX, and GitHub Copilot CLI sign-in.
+HouWritr started as a fork of [OpenWritr for Windows](https://github.com/trsdn/openwritr-windows)
+by trsdn (MIT licence), a push to talk dictation tool, and is now developed
+separately. HouWritr dropped dictation and focuses on two jobs: **recording
+meetings** and **transcribing audio and video files**, each saved as a
+transcript file.
+
+## Contents
+
+* [Quick start](#quick-start)
+* [Using HouWritr](#using-houwritr)
+* [Transcribing a file](#transcribing-a-file)
+* [Recording a meeting](#recording-a-meeting)
+* [Speaker labels](#speaker-labels)
+* [AI cleanup and meeting notes](#ai-cleanup-and-meeting-notes)
+* [Settings](#settings)
+* [Files and folders](#files-and-folders)
+* [Logs and diagnostics](#logs-and-diagnostics)
+* [Architecture](#architecture)
+* [NPU pipeline](#npu-pipeline), [Models](#models), [Licenses](#licenses), [Development](#development), [Releases](#releases)
 
 ## Quick start
 
 HouWritr is not in the Microsoft Store (the OpenWritr listing there is the
-original project's). Pick the build for your CPU, both per-user (no
-admin / UAC required):
+original project's). Pick the build for your CPU; both install per user, with
+no admin rights needed:
 
-| Your machine | Build | Engine |
+| Your machine | Build | Engines |
 |---|---|---|
-| **Snapdragon X Elite** (Surface Pro 11, etc.) | `…-arm64-…` | Parakeet CPU/NPU and Whisper NPU |
-| **Intel / AMD** laptop | `…-x64-…` | CPU INT8 |
+| **Snapdragon X Elite** (Surface Pro 11, etc.) | `…arm64…` | Parakeet CPU and NPU, Whisper NPU |
+| **Intel / AMD** laptop | `…x64…` | Parakeet CPU |
 
-Not sure? Snapdragon laptops report "ARM-based processor" in Settings →
+Not sure? Snapdragon laptops report "ARM based processor" in Settings →
 System → About. Everything else is x64.
 
-**Installer.** Download
-`openwritr-windows-<arch>-vX.Y.Z-setup.exe` from
-[Releases](https://github.com/raulhou/HouWritr/releases/latest)
-and run it. Sets up the Start Menu shortcut, an optional autostart-at-logon
-entry, and a proper uninstaller you'll find under Settings → Apps. You can
-turn autostart on or off any time later under Settings → Startup.
+**Installer.** Download `openwritr-windows-<arch>-vX.Y.Z-setup.exe` from
+[Releases](https://github.com/raulhou/HouWritr/releases/latest) and run it.
+It adds a Start menu entry, an optional start at sign in entry and an
+uninstaller under Settings → Apps.
 
-**Portable zip.** Download `openwritr-windows-<arch>-vX.Y.Z.zip` and unzip
-it into **any folder you like** (e.g. `C:\Tools\OpenWritr\`), then run
-`openwritr.exe`. The app finds its DLLs next to the exe — the install
-location doesn't matter. Same binaries as the installer, just no shortcuts.
-Autostart is available here too: enable "Run at startup" under Settings →
-Startup, and HouWritr repairs the entry automatically if you later move the
-folder.
+**Portable zip.** Download `openwritr-windows-<arch>-vX.Y.Z.zip`, unzip it
+into any folder and run `openwritr.exe`. The app finds its DLLs next to the
+exe. Start at sign in is available here too (Settings → Startup) and is
+repaired automatically if you move the folder.
 
-> **Note:** user data (settings, downloaded models, logs) always lives under
-> `%LOCALAPPDATA%\OpenWritr\` — the app creates that folder automatically on
-> first run, you never need to create it yourself. `AppData` is a hidden
-> folder; if you want to look inside, paste `%LOCALAPPDATA%\OpenWritr` into
-> the Explorer address bar.
+> **Windows SmartScreen.** The binaries are not code signed yet, so the first
+> launch shows "Windows protected your PC". Click **More info → Run anyway**.
+> To check a download, compare its SHA-256 with `SHA256SUMS.txt` on the
+> release: `Get-FileHash .\openwritr-windows-<arch>-vX.Y.Z-setup.exe`.
 
-Logs are under `%LOCALAPPDATA%\OpenWritr\logs`: `sessions` holds one file
-per run of the app (its windows included), and `recordings` one file per
-recording or transcript, named by its start time in UTC. The newest 30
-sessions and 300 recordings are kept. Tray actions **Open logs**
-and **Export diagnostics** provide bounded logs plus redacted runtime/model
-status; diagnostics never include audio, transcript text, clipboard contents,
-or API keys.
+On first use the selected engine downloads its verified model files into
+`%LOCALAPPDATA%\OpenWritr\models\`: Parakeet CPU about 670 MB, Parakeet NPU
+about 650 MB more, Whisper NPU a 2.0 GB archive (about 2.2 GB unpacked).
+Progress shows in the tray.
 
-The x64 build runs Parakeet on the CPU (no Hexagon NPU on Intel/AMD); the
-arm64 build adds the NPU engine. Both share the same multilingual model and
-UX.
+## Using HouWritr
 
-> **Windows SmartScreen warning.** The binaries are not code-signed (yet), so
-> the first launch shows "Windows protected your PC". Click **More info →
-> Run anyway**. To verify your download is authentic, compare its SHA-256
-> against `SHA256SUMS.txt` attached to the release:
-> `Get-FileHash .\openwritr-windows-<arch>-vX.Y.Z-setup.exe` in PowerShell.
+HouWritr lives in the system tray. Right click the icon:
 
-The default engine is Parakeet CPU. Its verified model files are fetched on
-first use into `%LOCALAPPDATA%\OpenWritr\models\` (~670 MB). Selecting an NPU
-engine downloads its own pinned assets with visible progress and verification:
-Parakeet NPU adds ~650 MB; Whisper NPU downloads a ~2.0 GB archive and uses
-about 2.2 GB after extraction.
-
-## Usage
-
-| Combo | Action |
+| Tray menu | What it does |
 |---|---|
-| **Hold Ctrl + Win** | Record. Release to transcribe and paste at the caret. |
-| **Press or release Shift while recording** | Toggle cleanup live in **Additional Shift** mode; the overlay changes between Listening and Enhanced immediately. |
-| **Press or release Shift while recording in Always mode** | Bypass or restore cleanup for the current recording. |
-| **Tray right-click → Settings** | Change hotkey, engine, LLM provider. |
+| **Transcribe audio or video file…** | Pick a file; a window shows progress and the result. |
+| **Start / Stop meeting recording** | Record your microphone and the PC's sound, transcribed while you record. |
+| **Pause / Resume meeting recording** | Stop capturing for a while without ending the meeting. |
+| **Hide / Show recording indicator** | Toggle the meeting pill for this session only. |
+| **Settings** | Engine, speaker labels, AI cleanup, output format, startup. |
+| **Open logs / Export diagnostics…** | See [Logs and diagnostics](#logs-and-diagnostics). |
+| **Retry model / engine, Cancel model download** | Recover from a failed or unwanted download. |
+| **About, credits & support…** | Version, licences, links. |
 
-A small dark pill appears at the bottom-center of the primary monitor. Its
-waveform and current state share one centered line, distinguishing raw and
-enhanced listening, queued work, transcription, enhancement, success, safe raw
-fallbacks, provider/credential warnings, and errors. Active recording always
-takes priority over background job status. Settings changes take effect after
-saving — no restart required.
+Transcripts are always saved as files. HouWritr never pastes text and never
+puts anything on the clipboard. A small dark pill at the bottom centre of the
+main screen shows queued work, transcription, AI cleanup and short notices
+(it can be turned off in Settings). Settings take effect as soon as they are
+saved, with no restart.
 
-### Transcribe files and meetings
+## Transcribing a file
 
-Both live in the tray menu and run fully offline on the selected engine.
+**Transcribe audio or video file…** accepts WAV, MP3, M4A/AAC, FLAC, OGG and
+MP4/M4V/MOV/MKV with a supported audio track. A progress window opens with:
 
-- **Transcribe audio or video file…** opens a file picker (WAV, MP3, M4A/AAC,
-  FLAC, OGG, MP4/MOV/MKV with a supported audio track) and then a small
-  progress window instead of the bottom-center indicator. The window shows the
-  stage (reading audio, transcribing n/m, AI cleanup), elapsed time and an
-  estimate, the source, length, engine, whether AI cleanup is on, the output
-  format and file, and, when finished, the word count, a preview, and **Open
-  file / Show in folder / Copy text** buttons. Minimize it like any window;
-  closing it does not cancel the job. The transcript is saved next to the
-  source as `<name>.txt` (or `.md`) and copied to the clipboard.
-- **Start meeting recording / Stop meeting recording** captures your
-  microphone and everything playing on the default output device (WASAPI
-  loopback) into one timeline, up to 12 hours. **Pause meeting recording**
-  stops capturing and releases the microphone (Windows' mic-in-use indicator
-  turns off); **Resume** continues the same recording with no gap, and paused
-  time is not recorded or counted. When you stop, HouWritr asks whether to
-  **also create meeting notes** (see below). The transcript is saved to
-  `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` (named after when
-  the meeting *started*) and copied to the clipboard. Quitting while a
-  meeting is recording, or while the question is open, saves the transcript
-  without notes.
+* the stage (reading audio, finding speakers, transcribing n of m, AI
+  cleanup), elapsed time and an estimate;
+* the source, its length, the engine, whether AI cleanup is on, and the
+  output file;
+* when finished: the word count (Chinese and Japanese characters count one
+  each), a preview, and **Open file**, **Show in folder** and **Close**.
 
-  **Rolling transcription.** Meetings are transcribed while they are being
-  recorded: every five minutes of audio, and whenever you pause, the finished
-  part is cut off (at a quiet moment, so words are not split) and transcribed
-  in the background while recording continues. As each part is ready its text
-  is appended to `Meeting <date> <time> (in progress).txt` next to the final
-  transcript, so you can read the meeting so far, and nothing is lost if the
-  app or the PC dies mid-meeting. When you stop, only the last few minutes are
-  left to transcribe; the parts are stuck together into one transcript, saved
-  as the normal transcript file, and the in-progress file is deleted. Memory
-  use stays around five minutes of audio however long the meeting runs, and
-  the tray icon and recording indicator keep showing that you are recording
-  (the tray tooltip mentions that earlier parts are being transcribed).
-  Dictating with the hotkey still works during a meeting: it waits at most for
-  the part being transcribed. Speaker labels stay consistent across parts
-  (Speaker 1 in the first part is Speaker 1 in the last), and `[m:ss]` markers
-  count from the start of the meeting. If a part cannot be transcribed, the
-  transcript says so at that point and the rest is still delivered. If the
-  engine is much slower than real time the backlog of untranscribed audio
-  grows in memory (about 230 MB per hour of audio).
+Minimise it like any window; closing it does not cancel the job. The
+transcript is saved next to the source as `<name>.txt` (or `.md`, see
+[Settings](#settings)); an existing file is never overwritten, a number is
+added instead.
 
-Long audio is split into windows of at most 30 s at the quietest nearby point
-and transcribed in order. These jobs never paste. Transcription itself never
-leaves the machine.
+Long audio is cut into windows of at most 30 seconds at the quietest nearby
+moment, so words are not split. With Whisper, a window the model cannot
+finish (it starts repeating itself, or runs out of its 199 decoding steps on
+fast speech) is decoded again in two halves, and any repetition loop is cut
+to a single copy.
 
-**Turning a meeting into a full report.** [`docs/meeting-report-prompt.md`](docs/meeting-report-prompt.md)
-is a ready-made prompt for Claude: give it the saved transcript (with
-`[m:ss] Speaker N:` markers) plus the agenda, slides and other material from
-the meeting and it builds a single self-contained HTML file with an executive
-summary, decisions, action items, a topic-by-topic digest, a materials
-cross-reference, and the full verbatim transcript with a searchable index.
+## Recording a meeting
 
-**Recording indicator.** While a meeting is being recorded, a pill in the
-same style as the dictation indicator stays on screen, in exactly the same
-place: red `Recording 12:34` with live level bars, or amber `Paused 12:34`.
-When the dictation pill needs the spot (you dictate, a job is queued, or a
-notice appears) the meeting pill steps aside and comes straight back when it
-clears. Turn it off under *Settings → Output and feedback → Show a recording
-indicator during meeting recordings*, or flip it for the current session with
-**Hide / Show recording indicator** in the tray menu (the tray menu does not
-change the saved setting). The tray icon still turns red (recording) or amber
-(paused) either way, and hiding the indicator mid-meeting shows a short notice
-so it is never silent.
+**Start meeting recording** captures your microphone and everything playing
+on the default output device (WASAPI loopback) into one timeline, up to 12
+hours. It works for online calls and for meetings in a room (with nothing
+playing, only the microphone contributes).
 
-**AI cleanup.** If text enhancement is set to anything other than **Never**
-(Settings → Text enhancement), file and meeting transcripts are also cleaned up
-by your configured provider (GitHub Copilot or an OpenAI-compatible API). The
-transcript is sent in slices of up to ~3,000 characters, split at sentence ends
-and returned as paragraphs. Each slice is checked by the same integrity
-validator as dictation; a slice that fails keeps its raw text, and if no slice
-can be cleaned the raw transcript is saved with a warning. Set enhancement to
-**Never** to keep these transcripts fully offline. Note that cleanup sends the
-transcript text to the provider you chose, so avoid it for confidential
-meetings unless that provider is acceptable.
+* **Pause** stops capturing and releases the microphone (Windows' microphone
+  indicator turns off). **Resume** continues the same recording; paused time
+  is not recorded or counted.
+* **Rolling transcription.** Every five minutes of audio, and whenever you
+  pause, the finished part is cut off at a quiet moment and transcribed in the
+  background while recording continues. Each part is appended to
+  `Meeting <date> <time> (in progress).txt`, so you can read the meeting so
+  far and nothing is lost if the app or the PC stops. When you stop, only the
+  last few minutes are left to transcribe; the parts are joined into the final
+  transcript and the in progress file is deleted. Memory use stays around five
+  minutes of audio however long the meeting runs.
+* Speaker labels and `[m:ss]` markers stay consistent across parts (Speaker 1
+  in the first part is Speaker 1 in the last; times count from the start of
+  the meeting). A part that fails to transcribe leaves a visible gap and the
+  rest is still saved.
+* **Recording indicator.** A pill shows red `Recording 12:34` with live level
+  bars, or amber `Paused 12:34`. It steps aside while the status pill needs the
+  same spot. Turn it off in Settings, or for the session from the tray. The
+  tray icon turns red (recording) or amber (paused) either way.
+* Transcripts are saved to `Documents\OpenWritr\Meetings\Meeting <date>
+  <time>.txt`, named after when the meeting started. Quitting while recording
+  saves what was recorded.
 
-**Meeting notes.** Under *Settings → Output and feedback* choose what happens
-when a meeting recording stops: **Ask every time** (the default), **Always**
-create notes, or **Never**. With an AI provider configured (Settings → Text
-enhancement), *Ask every time* shows *Also create meeting notes with AI?* **Yes** saves, next to the transcript, a separate
-`Meeting notes <date> <time>.md` with a *Summary*, *Key points*, *Decisions*,
-*Action items* (a `- [ ]` checklist) and *Open questions*. **No** saves the
-transcript only. **Always** creates the notes without asking, also when you quit mid-meeting; **Never** never asks. Without a provider the question is skipped and a hint is shown. The prompt forbids
-inventing names, owners, dates or decisions, but speakers are not labelled and
-recognition errors can slip through, so review notes before acting on them.
-**When the connection is unreliable.** Cleanup never holds up your transcript.
-A request that cannot reach the provider keeps that section as recognised;
-after three failures in a row the rest is skipped instead of waiting out each
-timeout, and for the next minute no further requests are attempted (so
-dictation is not held up either). Sections that could not be cleaned during a
-meeting get a second try when you press Stop (for up to 90 seconds, and only
-while the provider answers). Whatever is still unfinished is retried
-**automatically in the background** after the transcript is saved, 2, 5, 10,
-20 and 30 minutes later, and the saved transcript (and meeting notes, if they
-could not be generated) are updated in place when it works. The saved-file
-notice tells you what happened, for example *cleaned 21 of 25 sections;
-retrying automatically*. HouWritr leaves a file alone if you have edited,
-moved or deleted it, and the retries stop when you quit the app (the
-transcript stays as recognised; the in-progress and saved files are never
-lost).
+For in person meetings, use the best microphone available (a conference or
+USB microphone beats a laptop's), keep it near the speakers, and expect quiet
+or distant voices and overlapping speech to be missed.
 
-Notes work even when cleanup is set to **Never**; if cleanup is on it runs
-first and the notes are built from the cleaned text. If the provider fails, the
-transcript is still saved and the notice says the notes are missing. Very long
-meetings are noted in parts and merged. The whole transcript is sent to the
-provider, so answer *No* where that is not acceptable.
+Record meetings only where everyone present has agreed to it.
 
-**In-person meetings.** Recording works without a call: with nothing playing,
-only the microphone contributes. Use the best input device Windows offers (a
-conference or USB mic beats a laptop mic), keep it near the speakers, and
-expect quieter or distant voices to be missed. Overlapping speech and room
-echo reduce accuracy, and speakers are not separated.
+**Turning a meeting into a report.** [`docs/meeting-report-prompt.md`](docs/meeting-report-prompt.md)
+is a ready made prompt for Claude: give it the saved transcript plus the
+agenda and slides, and it builds a single HTML report with a summary,
+decisions, action items, a topic digest and the full transcript with an index.
 
-**Speaker labels.** Turn on *Label speakers in file and meeting transcripts*
-(Settings → Output and feedback) and transcripts are split by who is talking:
+## Speaker labels
+
+Turn on *Label speakers in file and meeting transcripts* (Settings → Speaker
+labels) and transcripts are split by who is talking:
 
 ```
 [0:00] Speaker 1: Thanks everyone for joining…
@@ -218,210 +167,211 @@ echo reduce accuracy, and speakers are not separated.
 [0:12] Speaker 2: Happy to be here. Can we start with the roadmap?
 ```
 
-The `[m:ss]` marker is the time into the recording where that person starts
-talking (paused time in a meeting is not counted).
+`[m:ss]` is the time into the recording where that person starts talking.
 
-HouWritr finds the speaker turns with two small on-device models (pyannote
-segmentation 3.0 and a WeSpeaker voice-print model, about 32 MB, downloaded the
-first time you use it), then transcribes each turn separately. It runs on the
-CPU, takes roughly a minute or two per hour of audio on a recent PC, and works
-for files and meeting recordings alike. Labels never remove speech: audio the models can't
-attribute (a short "yes", a first word at a segment edge) is transcribed with
-the neighbouring speaker, so a labelled transcript has every word an unlabelled
-one would. Labels are numbered in order of first
-appearance and are **not** names. Accuracy drops with overlapping speech, very
-short interjections, similar voices and poor audio, and a voice is sometimes
-split into two labels. If only one speaker is found the transcript is left
-unlabelled; if the models cannot be downloaded or run, you still get the normal
-transcript and a note saying labels were unavailable. AI cleanup keeps the
-labels and markers (the markers are held back from the AI request and put back
-afterwards), and meeting notes may attribute action items to "Speaker N".
+Two small models (pyannote segmentation 3.0 and a WeSpeaker voice print model,
+about 32 MB, downloaded once) find the speaker turns on the CPU, roughly a
+minute or two per hour of audio; each turn is then transcribed separately.
+Labels never remove speech: audio that cannot be attributed is transcribed with
+the neighbouring speaker. Labels are numbered in order of appearance and are
+**not** names. Accuracy drops with overlapping speech, short interjections,
+similar voices and poor audio, and one voice is sometimes split into two
+labels. With a single speaker the transcript stays unlabelled; if the models
+cannot run you still get the transcript and a note saying so.
 
-**Managing the speaker-label models.** *Settings → Speaker labels* holds the
-on/off switch and the local model status: *Installed*, *Not downloaded* or
-*Incomplete*, the size, and the folder they live in. **Download and install**
-fetches them now (with a progress bar and **Cancel**) instead of waiting for
-the first labelled transcript, **Verify files** re-checks sizes and SHA-256
-hashes, and **Open model folder** opens the install location. For machines
-without direct access, expand *Install manually*: it lists each file with its
-exact name, size, hash and download link; save the files into the model folder
-and click **Verify files**. Files that do not match the pinned hashes are
-rejected.
+The Speaker labels section also shows whether the models are installed, with
+**Download and install**, **Verify files** (sizes and SHA-256) and **Open
+model folder**, plus an *Install manually* list (names, sizes, hashes, links)
+for machines without direct internet access.
 
-**Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
-(Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`
-title, an italic details line (source file or meeting length), and paragraphs.
-The formatting is added by HouWritr itself, not requested from the AI
-provider, so the cleanup integrity checks are unaffected and the same words
-are kept in both formats.
+## AI cleanup and meeting notes
 
-Record meetings only where everyone present has agreed to it.
+### Cleanup
+
+With *Text enhancement* **On**, each file and meeting transcript is sent, as
+text and never as audio, to the provider you chose, which fixes punctuation
+and recognition slips:
+
+* The transcript is sent in slices: about 3,000 characters for a hosted
+  provider, 1,200 for a local server and 600 for the built in NPU model (local
+  models get a third of that for Chinese and Japanese, which take more tokens
+  per character). Slices are cut at sentence ends and never split a speaker's
+  block.
+* With a hosted provider the first slice goes alone, then three slices are
+  cleaned at a time; the results are put back in order. A model on this PC
+  gets one slice at a time.
+* `[m:ss]` markers are held back from the request and put back afterwards.
+* If most of the Chinese in a transcript is Simplified (or Traditional), every
+  slice is told to write in that script, so a transcript does not drift
+  between the two.
+* Each cleaned slice is checked by an integrity validator (numbers, negations,
+  acronyms, URLs, language, length). A slice that fails keeps its recognised
+  text, and the log says why. If no slice can be cleaned, the raw transcript is
+  saved with a warning that names the reason.
+
+**Unreliable connections.** Cleanup never holds up a transcript. A slice that
+cannot reach the provider keeps its recognised text; after three failures in a
+row the rest is skipped, and for a minute no further requests are made.
+Unfinished sections of a meeting get a second try when you press Stop (up to
+90 seconds). Anything still unfinished is retried in the background 2, 5, 10,
+20 and 30 minutes after saving, and the file is updated in place, unless you
+have edited, moved or deleted it. Timeouts grow with the slice length (up to
+10 minutes), for slow networks.
+
+Leave enhancement **Off** to keep everything on this PC. With it on, the
+transcript text goes to your provider, so think twice for confidential
+meetings.
+
+### Providers
+
+* **GitHub Copilot.** Uses the account GitHub Copilot CLI is signed in with
+  (`winget install GitHub.Copilot`, then `copilot login`), found in the order
+  the CLI uses: the `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`
+  variable, its Windows Credential Manager entry, its config file, and finally
+  the GitHub CLI (`gh auth login`). If Copilot refuses the chosen model for
+  your account, HouWritr asks Copilot which models are on offer and tries the
+  closest few under both the Copilot CLI and VS Code identities, then keeps
+  using the one that worked for the rest of the session. The log shows each
+  model's policy and every attempt; a model whose policy is `disabled` has to
+  be enabled in your GitHub Copilot settings, or pick another.
+* **OpenAI compatible API.** Needs a base URL, model ID and API key. The key is
+  kept in Windows Credential Manager, never in the settings file, and is only
+  sent over https (or to a server on this PC).
+* **Local model (on this PC).**
+  * *Built in model (NPU)*: on a Snapdragon PC, HouWritr uses Qualcomm's
+    [GenieX](https://github.com/qualcomm/GenieX) to run
+    `Qwen3-4B-Instruct-2507` on the Hexagon NPU. Press **Install GenieX…**
+    (the pinned v0.8.0 installer, checked against its SHA-256, installed for
+    your user only), then **Download model** (several GB, resumable), then
+    **Test model**. HouWritr starts `geniex serve` on a private port (18651)
+    only when needed and stops it as soon as a transcript is finished, after
+    5 idle minutes, or when it stops answering or slows down sharply.
+  * *Another local server*: any OpenAI compatible server on `localhost`
+    (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
+    models**, **Test connection** and a setup guide are in Settings.
+
+  Local models are slower and weaker than hosted ones, so they get smaller
+  slices, longer waits, and `<think>…</think>` blocks removed from replies.
+  The same integrity checks apply. GenieX is a Qualcomm developer preview.
+
+Cleanup prompts can be customised per provider, endpoint and model; the
+transcript always travels as a separate, untrusted message that the model must
+not answer or obey.
+
+### Meeting notes
+
+Under *Settings → Output and feedback* choose what happens when a meeting
+stops: **Ask every time** (default), **Always** or **Never**. Notes are saved
+next to the transcript as `Meeting notes <date> <time>.md` with *Summary*, *Key
+points*, *Decisions*, *Action items* (a `- [ ]` checklist) and *Open
+questions*. They need a provider, work even with cleanup off (with cleanup on
+they are built from the cleaned text), and very long meetings are noted in
+parts and merged. The prompt forbids inventing names, owners, dates or
+decisions, but review notes before acting on them.
 
 ## Settings
 
-Tray icon → right-click → **Settings**. All fields:
+Tray icon → right click → **Settings**:
 
-- **Recording shortcut**: Ctrl / Shift / Alt / Win modifiers plus an optional
-  trigger key. Modifier-only shortcuts require at least two modifiers; F13-F20
-  may be used alone. The dialog shows a live shortcut preview and prevents
-  ambiguous Shift-enhancement combinations. With Ctrl+Win held, Shift can be
-  pressed or released during the recording to change the enhancement intent
-  immediately. Default: Ctrl+Win.
-- **Transcription engine**: Parakeet CPU INT8 (default), Parakeet NPU, or
-  Whisper Large v3 Turbo NPU. Each choice shows hardware availability,
-  first-use download size, and local cache status. NPU engines remain visible
-  but disabled unless the ARM64 build is running on Snapdragon X Elite.
-- **Output and feedback**: either paste into the active app or keep the
-  transcript on the clipboard. Auto-paste is tied to the foreground top-level
-  window captured when recording starts. If focus or the target process
-  changes, or another recording is active when the job completes, HouWritr
-  does not inject keystrokes: it copies the final text to the clipboard and
-  shows a warning. Copy-only mode always remains explicit. The overlay option
-  covers both the recording waveform and typed job/status messages.
-  Start/stop sounds are optional.
-- **Text enhancement**: choose **Never**, **When Shift is additionally held**,
-  or **Always**, then select GitHub Copilot, an OpenAI-compatible API, or a
-  **Local model (on this PC)** (see below).
-  Shift is monitored throughout the recording, so the mode and purple overlay
-  indicator update immediately instead of being fixed at the initial key
-  press. In **Always** mode, additional Shift bypasses cleanup while held. The
-  model picker provides advisory presets while preserving
-  arbitrary provider-specific model or deployment IDs and legacy settings.
-  GitHub mode uses the account GitHub Copilot CLI is signed in with
-  (`winget install GitHub.Copilot`, then `copilot login`), found in the same
-  order the CLI uses: the `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`
-  variable, its Windows Credential Manager entry, its config file, and finally
-  the GitHub CLI (`gh auth login`). OpenAI-compatible
-  mode requires a valid base URL, model ID, and API key. API keys are stored in
-  Windows Credential Manager, not in the settings file. Cleanup prompts can be
-  customized per exact provider, endpoint, and model target; transcript text
-  stays a separate untrusted user message. Provider/credential failures use
-  the raw transcript with a provider warning. Empty or critically changed
-  output, or an integrity-validator failure, also falls back to the raw
-  transcript with a distinct safety warning.
-- **Advanced**: set the maximum recording duration.
-- Explanatory settings copy is kept behind immediate `i` hover help so the
-  dialog remains compact; warnings, failures, and live availability remain
-  visible.
-- **About, credits & support** (also available directly from the tray menu):
-  view the installed version and architecture,
-  source, releases, issue reporting,
-  privacy and license links, model/runtime credits, local third-party notices,
-  and guidance for exporting privacy-safe diagnostics.
+* **Transcription**: Parakeet CPU INT8 (default), Parakeet NPU, or Whisper
+  Large v3 Turbo NPU, each with hardware availability, download size and cache
+  status. NPU engines are shown but disabled unless the ARM64 build runs on a
+  Snapdragon X Elite.
+* **Output and feedback**: save transcripts as Markdown (`.md` with a title,
+  details line and paragraphs; added by HouWritr, not the AI) or plain text;
+  show the status pill; show the meeting recording indicator; and what to do
+  about meeting notes.
+* **Speaker labels**: on or off, model status and management (see above).
+* **Text enhancement**: **Off** or **On**, the provider, model and prompt.
+* **Startup**: start HouWritr when you sign in.
+* **About, credits & support**: version, architecture, source, issues,
+  privacy, licences, model and runtime credits.
 
-Settings are stored at `%LOCALAPPDATA%\OpenWritr\settings.json`. The app polls
-the file's mtime so external edits also take effect live. Writes use an atomic
-replacement, and legacy plaintext API keys are migrated only after the secure
-credential can be written and read back successfully. Unsaved changes require
-confirmation before the Settings window closes.
+Settings are stored in `%LOCALAPPDATA%\OpenWritr\settings.json`, written
+atomically and picked up live, including edits made outside the app. Settings
+files from older (dictation) versions still load; their shortcut and paste
+options are ignored, and cleanup that used to need Shift is simply on.
 
-### Local model for AI cleanup (NPU)
+## Files and folders
 
-Settings → Text enhancement → **Local model (on this PC)** runs cleanup and
-meeting notes on a model that never leaves your computer. Two sources:
+| What | Where |
+|---|---|
+| File transcripts | Next to the source file |
+| Meeting transcripts and notes | `Documents\OpenWritr\Meetings\` |
+| Transcripts that could not be saved where they belong | `Documents\HouWritr\` |
+| Settings, models, logs | `%LOCALAPPDATA%\OpenWritr\` |
+| API keys | Windows Credential Manager |
 
-- **Built-in model (NPU)** – on a Snapdragon (Windows on ARM) PC, HouWritr
-  uses Qualcomm's [GenieX](https://github.com/qualcomm/GenieX) to run
-  `ai-hub-models/Qwen3-4B-Instruct-2507` on the Hexagon NPU. In Settings press
-  **Install GenieX…** (downloads the pinned official v0.8.0 installer, checks its
-  SHA-256, installs for your Windows user only, adds `geniex` to your PATH),
-  then **Download model** (several GB, resumable), then **Test model**.
-  HouWritr starts `geniex serve` on a private port (18651) when a cleanup needs
-  it and ties it to the app so the NPU is never left occupied. It is stopped as
-  soon as a file or meeting transcript is finished, after 5 idle minutes
-  following dictation, and whenever it stops answering in time or suddenly
-  writes far slower than it did (the next cleanup starts a fresh one). If the
-  server cannot start, cleanup falls back to the raw text exactly like an
-  unreachable hosted provider.
-- **Another local server** – any OpenAI-compatible server on this PC
-  (a GenieX server you run yourself, LM Studio, Ollama, Foundry Local). Presets,
-  **Find models**, **Test connection**, and a setup guide are in Settings. Only
-  `localhost` / `127.0.0.1` / `::1` addresses are accepted here; no API key is
-  needed unless the server asks for one.
+The data folders keep the OpenWritr name so existing installs keep their
+models and settings. `AppData` is hidden; paste `%LOCALAPPDATA%\OpenWritr`
+into the Explorer address bar to open it.
 
-Local models are slower and weaker than hosted ones, so HouWritr sends them
-smaller slices (about 1,200 characters for cleanup, 8,000 for meeting notes),
-waits 8× longer for each answer, and removes `<think>…</think>` reasoning
-blocks from replies. The same integrity checks as for hosted models apply.
-Developer-preview note: GenieX is a Qualcomm developer preview; the pinned
-version is isolated in `src/local_llm.rs`.
+## Logs and diagnostics
+
+Logs are in `%LOCALAPPDATA%\OpenWritr\logs`:
+
+* `sessions\` holds one file per run of the app (the settings and transcript
+  windows it opens write into the same file).
+* `recordings\` holds one file per file transcript, meeting or cleanup retry,
+  with every line logged while it was worked on. All parts of a meeting share
+  one file.
+* File names start with the start time in **UTC**, matching the times inside.
+  The newest 30 sessions and 300 recordings are kept.
+* The first line of each session shows the app version and `build=<commit>`,
+  so you can tell which build ran.
+* `crash.log` records any crash with its backtrace.
+
+**Open logs** opens the folder. **Export diagnostics…** builds a bounded zip
+with recent logs (sanitised) and redacted settings, runtime and model status;
+it never contains audio, transcript text or API keys.
 
 ## Architecture
 
-### Native Rust app (what ships in the release zip)
+HouWritr is a native Rust app: no Electron, no web view, no Python at run
+time.
 
 ```
-openwritr-windows/
+HouWritr/
 ├── src/
-│   ├── main.rs              entry; dispatches `--settings` subprocess
-│   ├── app.rs               winit event loop, tray, hotkey thread, ASR dispatch
-│   ├── audio.rs             cpal WASAPI capture, multi-channel downmix
-│   ├── credentials.rs       Windows Credential Manager API-key storage
-│   ├── hotkey.rs            push-to-talk combo polling against key_hook state
-│   ├── key_hook.rs          global WH_KEYBOARD_LL hook → atomic key bitmap
-│   ├── overlay.rs           custom Win32 layered top-most window, GDI bars
+│   ├── main.rs              entry; tray, `--settings`, `--transcript-window` modes, logging
+│   ├── app.rs               winit event loop, tray menu, file and meeting jobs, repairs
+│   ├── worker.rs            inference thread: diarisation, transcription, cleanup
+│   ├── meeting.rs           microphone + loopback capture, rolling parts, file names
+│   ├── media.rs             file decoding (Symphonia), resampling, quiet point search
+│   ├── transcript_window.rs progress and result window (subprocess)
+│   ├── overlay.rs           status pill and meeting pill (layered Win32 window, GDI)
+│   ├── tray.rs              tray icon and menu
 │   ├── settings.rs          validation, migration, atomic JSON persistence
-│   ├── settings_ui.rs       eframe/egui dialog (subprocess)
-│   ├── asr/                 ONNX Runtime ASR pipelines
-│   │   ├── parakeet.rs      CPU/NPU Parakeet pipeline
-│   │   ├── whisper_npu.rs   native chunked Whisper NPU engine
-│   │   ├── whisper_mel.rs   128-bin Whisper log-mel frontend
-│   │   ├── whisper_decoder.rs  QNN encoder/decoder and KV-cache loop
-│   │   └── qnn_ffi.rs       reusable typed QNN C-API sessions
-│   ├── enhance.rs           Copilot / OpenAI / local-model cleanup pass
+│   ├── settings_ui.rs       eframe/egui settings dialog (subprocess)
+│   ├── asr/                 Parakeet (CPU/NPU), Whisper NPU, speaker diarisation
+│   ├── enhance.rs           cleanup and notes: slicing, parallel requests, retries
+│   ├── cleanup/             prompts, request building, integrity validator
+│   ├── copilot_auth.rs      GitHub Copilot sign-in lookup
 │   ├── local_llm.rs         GenieX install, model download, private `geniex serve`
-│   ├── sounds.rs            G3/E3 tone synth (start/stop pings)
-│   └── bin/
-│       ├── package.rs       distributable-zip builder
-│       └── cleanup_eval/    opt-in offline/live evaluator for the `cleanup`
-│                            core (see Development section below)
+│   ├── log_files.rs         session and recording logs
+│   ├── diagnostics.rs       log pruning, diagnostics export, Explorer helpers
+│   └── bin/                 `package` (release zip) and `cleanup_eval`
 └── Cargo.toml
 ```
 
 Key design decisions:
-- **Global low-level keyboard hook.** Push-to-talk detection reads physical
-  key state from `WH_KEYBOARD_LL` instead of `GetAsyncKeyState`. The OS
-  synthesises key-ups during focus changes (PowerShell launched mid-recording,
-  UAC prompt, system shortcut handler), which the polling API faithfully
-  reports — and which would abort the recording. The LL hook sees only
-  physical events.
-- **Settings UI as subprocess.** The settings dialog is the same exe re-launched
-  with `--settings`. Spawning happens from a worker thread because
-  `CreateProcessW` on Windows ARM64 with Defender real-time scanning can block
-  several seconds — doing it inline would freeze the tray pump.
-- **Overlay on its own message loop.** Layered top-most window with color-key
-  transparency, painted with double-buffered GDI. It reads the recorder
-  atomics and receives enable/status updates through a command channel, so
-  settings changes apply without restarting the app.
-- **Multi-channel downmix in the audio callback.** The Qualcomm Aqstic mic
-  array on Surface Pro exposes 4-8 interleaved channels at 48 kHz; we average
-  to mono before resampling to 16 kHz.
 
-### Python toolchain (`scripts/`)
-
-NPU model preparation lives in `scripts/`. `build_npu_encoder.py`,
-`aihub_compile_encoder.py`, `wrap_qnn_context_binary.py`, and
-`test_npu_encoder.py` are build-time tools used to produce the .bin
-hosted on HF. They are NOT invoked by the shipped `openwritr.exe` at
-runtime — the native build pulls the pre-compiled binary directly.
-
-The Rust app does not call into Python at runtime.
-
-### Build-time Python dependency
-
-Python is used only at build time to fetch hash-pinned runtime wheels and
-validate the canonical release manifest. The resulting packages are
-self-contained and Python-free.
-
-```powershell
-.\scripts\envup.ps1
-cargo build --release --bins
-cargo run --release --bin package
-```
-
-The package command fetches the exact runtime tuple, validates versions,
-SHA-256 hashes, PE architecture, required files, and licenses, then stages
-from `release-manifest.json`. The ZIP lands in `target/dist/`.
+* **Work off the tray thread.** File decoding, transcription, diarisation and
+  cleanup run on worker threads; the tray loop only routes events, so the menu
+  stays responsive during a two hour transcription.
+* **Windows as subprocesses.** Settings, About and the transcript window are
+  the same exe relaunched with a flag, spawned from a background thread
+  (`CreateProcessW` on Windows ARM64 with Defender can block for seconds), so
+  a slow or crashing window can never stall meeting capture.
+* **Pills on their own message loop.** The status and meeting pills are
+  layered top most windows painted with GDI on their own threads; they read
+  the meeting level from an atomic and take state through a channel.
+* **Multi channel downmix.** The Qualcomm Aqstic microphone array on Surface
+  Pro exposes 4 to 8 channels at 48 kHz; they are averaged to mono before
+  resampling to 16 kHz.
+* **Power.** HouWritr and its GenieX server opt out of Windows power
+  throttling, so long background jobs are not slowed when no window is in
+  front.
 
 ## NPU pipeline
 
@@ -429,10 +379,11 @@ Parakeet runs its pre-compiled encoder on the Hexagon HTP; mel preprocessing
 and the TDT decoder stay on CPU. Whisper runs both its encoder and
 autoregressive KV-cache decoder as pre-compiled QNN sessions. It processes
 sequential 30-second chunks, detects language once per recording, and reuses
-that language for every later chunk.
+that language for every later chunk. A chunk that loops or runs out of
+decoding steps is decoded again in two halves.
 
-The compiled binary expects a fixed **8-second audio window**. For
-push-to-talk utterances ≤ 8 s the encoder is run once on a padded window.
+The compiled binary expects a fixed **8-second audio window**. For audio of
+8 s or less the encoder is run once on a padded window.
 For longer audio the encoder is run in chunks (8 s window with 1 s
 overlap), feature streams are stitched at the seam, and the TDT decoder
 runs once over the concatenated features. Tested up to ~23 s without
@@ -510,7 +461,7 @@ recompilation via AI Hub.
 ## Repository layout
 
 ```
-openwritr-windows/
+HouWritr/
 ├── src/                   Rust native app
 ├── scripts/               pinned runtime and release tooling
 ├── models-manifest.json   pinned model assets and hashes
@@ -525,7 +476,7 @@ The shipped `openwritr.exe` does not call Python at runtime.
 
 ```powershell
 git clone https://github.com/raulhou/HouWritr.git
-cd openwritr-windows
+cd HouWritr
 .\scripts\envup.ps1
 cargo build --release --bins
 python scripts/fetch_runtime.py --arch arm64
@@ -552,7 +503,7 @@ synthetic DE/EN fixture corpus
 ([`fixtures/cleanup-eval/v1/corpus.json`](fixtures/cleanup-eval/v1/corpus.json))
 covering punctuation, fillers, repetition, negation, digits/dates/times/
 versions, commands/code/acronyms, URLs/emails, language preservation,
-filler-only/`[[EMPTY]]`, and known tricky cases. No private dictation is
+filler-only/`[[EMPTY]]`, and known tricky cases. No private recordings are
 included or ever required.
 
 ```powershell

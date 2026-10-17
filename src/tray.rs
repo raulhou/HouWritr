@@ -40,7 +40,11 @@ pub enum IconColor {
 impl Tray {
     pub fn new(_s: &Settings) -> Result<Self> {
         let menu = Menu::new();
-        let info = MenuItem::new("HouWritr — hold hotkey to dictate", false, None);
+        let info = MenuItem::new(
+            "HouWritr — meetings and audio/video transcription",
+            false,
+            None,
+        );
         let retry_engine = MenuItem::new("Retry model / engine", true, None);
         let cancel_model = MenuItem::new("Cancel model download", true, None);
         let model_sep = PredefinedMenuItem::separator();
