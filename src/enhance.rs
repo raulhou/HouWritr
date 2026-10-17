@@ -180,6 +180,26 @@ fn local_timeout(base: Duration, input_chars: usize) -> Duration {
     (base * LOCAL_TIMEOUT_FACTOR).max(Duration::from_millis(60_000 + input_chars as u64 * 250))
 }
 
+/// A hosted model on a poor connection: the request and the reply can crawl,
+/// and the reply is about as long as the text, so allow a generous fixed
+/// wait plus time per character of text.
+const HOSTED_BASE_WAIT: Duration = Duration::from_secs(45);
+const HOSTED_WAIT_PER_CHAR: Duration = Duration::from_millis(40);
+/// Nothing hosted waits longer than this.
+const HOSTED_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// How long to wait for a hosted model: never less than `base`, and growing
+/// with the text (a 3,000 character slice of Chinese, about as many tokens
+/// to write, gets close to three minutes).
+fn hosted_timeout(base: Duration, input_chars: usize) -> Duration {
+    let by_length = HOSTED_BASE_WAIT + HOSTED_WAIT_PER_CHAR * input_chars.min(1_000_000) as u32;
+    base.max(by_length).min(HOSTED_MAX_WAIT.max(base))
+}
+
+/// A connection that could not even be opened is tried once more after
+/// this pause (a dropped Wi-Fi or mobile link often recovers in seconds).
+const CONNECT_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
 /// Length of the user message in a chat request body.
 fn request_input_chars(body: &serde_json::Value) -> usize {
     body.get("messages")
@@ -362,7 +382,7 @@ fn request_content(
     let timeout = if local {
         local_timeout(timeout, request_input_chars(&prepared.body))
     } else {
-        timeout
+        hosted_timeout(timeout, request_input_chars(&prepared.body))
     };
 
     let client = match reqwest::blocking::Client::builder()
@@ -400,7 +420,18 @@ fn request_content(
 
     let managed = is_managed_target(&prepared.target);
     let sent = Instant::now();
-    let response = match request.send() {
+    // Only a hosted provider is worth a second try: a server on this machine
+    // that cannot be reached will not be there two seconds later either.
+    let retry = if local { None } else { request.try_clone() };
+    let mut result = request.send();
+    if let Some(again) = retry {
+        if result.as_ref().is_err_and(|error| error.is_connect()) {
+            warn!("could not connect to the cleanup provider; trying once more");
+            std::thread::sleep(CONNECT_RETRY_PAUSE);
+            result = again.send();
+        }
+    }
+    let response = match result {
         Ok(response) => response,
         Err(error) if error.is_timeout() => {
             warn!(
@@ -1036,6 +1067,16 @@ mod long_form_tests {
         let mixed_chars = scaled_for_script(1_200, &mixed);
         assert!(mixed_chars < 1_200 && mixed_chars > 400, "{mixed_chars}");
         assert_eq!(scaled_for_script(1_200, "   "), 1_200);
+
+        let dictation = hosted_timeout(CLEANUP_TIMEOUT, 100);
+        assert_eq!(dictation, Duration::from_secs(49));
+        assert!(hosted_timeout(CLEANUP_TIMEOUT, 3_000) > Duration::from_secs(160));
+        assert_eq!(hosted_timeout(CLEANUP_TIMEOUT, 40_000), HOSTED_MAX_WAIT);
+        assert_eq!(
+            hosted_timeout(NOTES_TIMEOUT, 10),
+            Duration::from_millis(120_000),
+            "never shorter than the caller's own limit"
+        );
 
         let short = local_timeout(CLEANUP_TIMEOUT, 100);
         assert_eq!(short, CLEANUP_TIMEOUT * LOCAL_TIMEOUT_FACTOR);
