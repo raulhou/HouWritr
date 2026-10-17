@@ -205,6 +205,36 @@ fn is_local_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(EndpointScope::is_loopback)
 }
 
+/// Whether the target is the server OpenWritr starts itself (GenieX on the NPU).
+fn is_managed_target(target: &PromptTarget) -> bool {
+    target.endpoint().is_some_and(crate::local_llm::is_managed)
+}
+
+/// Whether the configured cleanup provider is the built-in model on the NPU.
+fn uses_managed_model(settings: &Settings) -> bool {
+    settings
+        .prompt_target()
+        .map(|target| is_managed_target(&target))
+        .unwrap_or(false)
+}
+
+/// Replies shorter than this say too little about the writing speed.
+const SLOW_CHECK_MIN_TOKENS: u64 = 24;
+
+/// The writing speed the server reported for a reply, when the reply was long
+/// enough to judge it by.
+fn writing_speed(value: &serde_json::Value) -> Option<f64> {
+    let timings = value.get("timings")?;
+    let written = timings.get("predicted_n")?.as_u64()?;
+    if written < SLOW_CHECK_MIN_TOKENS {
+        return None;
+    }
+    timings
+        .get("predicted_per_second")?
+        .as_f64()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+}
+
 /// Whether the configured cleanup provider is a model on this machine.
 pub fn uses_local_model(settings: &Settings) -> bool {
     settings
@@ -243,6 +273,12 @@ fn local_max_tokens(text: &str) -> usize {
 /// Small local models have short context windows and generate slowly, so
 /// they get smaller slices than a hosted model.
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
+/// The built-in model gets smaller slices still, so a request (about 160
+/// tokens of instructions, the slice, and a reply as long as the slice)
+/// stays inside GenieX's smallest 512-token context. A request that outgrew
+/// it switched the model to its 1,024-token variant, and from that token on
+/// the NPU wrote about 20 times slower until the server was restarted.
+const MANAGED_CLEANUP_CHARS: usize = 600;
 const LOCAL_NOTES_PART_CHARS: usize = 8_000;
 
 /// Chinese, Japanese and Korean text costs about one token per character,
@@ -272,7 +308,9 @@ fn is_cjk(c: char) -> bool {
 }
 
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
-    if uses_local_model(settings) {
+    if uses_managed_model(settings) {
+        scaled_for_script(MANAGED_CLEANUP_CHARS, text)
+    } else if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
         LONG_FORM_CLEANUP_CHARS
@@ -370,9 +408,24 @@ fn request_content(
         return Err(reason);
     }
 
+    let managed = is_managed_target(&prepared.target);
     let sent = Instant::now();
     let response = match request.send() {
         Ok(response) => response,
+        Err(error) if error.is_timeout() => {
+            warn!(
+                waited = ?sent.elapsed(),
+                limit = ?timeout,
+                "cleanup provider did not answer in time"
+            );
+            if managed {
+                // The server keeps writing the reply nobody waits for, and
+                // every later request queues behind it. A fresh server also
+                // leaves the slow state the timeout most likely came from.
+                crate::local_llm::release("the local model did not answer in time");
+            }
+            return Err(FallbackReason::RequestFailed);
+        }
         Err(error) => {
             warn!(
                 error = %error,
@@ -401,6 +454,12 @@ fn request_content(
             timings = %value.get("timings").unwrap_or(&serde_json::Value::Null),
             "local model answered"
         );
+        if managed {
+            // This answer is still used; a restart is for the next one.
+            if let Some(rate) = writing_speed(&value) {
+                crate::local_llm::note_writing_speed(rate);
+            }
+        }
     }
     let content = match adapter::parse_chat_response(&value) {
         Ok(content) => content,
@@ -457,8 +516,9 @@ pub struct CleanupReport {
     pub total: usize,
     /// Slices the provider cleaned.
     pub cleaned: usize,
-    /// Slices left as recognised because the provider could not be reached
-    /// (or the circuit breaker skipped them): worth trying again later.
+    /// Slices left as recognised because the provider could not be reached or
+    /// did not answer in time (or the circuit breaker skipped them): worth
+    /// trying again later.
     pub unreachable: usize,
 }
 
@@ -574,7 +634,10 @@ fn clean_slices(
                     in_a_row += 1;
                     if in_a_row >= UNREACHABLE_TRIP {
                         tripped = true;
-                        warn!("cleanup provider unreachable; skipping the remaining slices");
+                        warn!(
+                            failures = in_a_row,
+                            "cleanup provider unreachable or too slow; skipping the remaining slices"
+                        );
                     }
                 } else {
                     in_a_row = 0;
@@ -998,8 +1061,17 @@ mod long_form_tests {
 
     #[test]
     fn local_profile_applies_only_to_loopback_endpoints() {
-        let local = openai_settings("http://127.0.0.1:18651/v1");
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        assert!(uses_local_model(&managed));
+        assert!(uses_managed_model(&managed));
+        assert_eq!(
+            cleanup_slice_chars(&managed, "plain english text"),
+            MANAGED_CLEANUP_CHARS
+        );
+
+        let local = openai_settings("http://127.0.0.1:11434/v1");
         assert!(uses_local_model(&local));
+        assert!(!uses_managed_model(&local), "a server the user runs");
         assert_eq!(
             cleanup_slice_chars(&local, "plain english text"),
             LOCAL_CLEANUP_CHARS
@@ -1094,6 +1166,44 @@ mod long_form_tests {
         assert!(local
             .iter()
             .all(|slice| slice.chars().count() <= LOCAL_CLEANUP_CHARS));
+    }
+
+    #[test]
+    fn built_in_model_slices_stay_inside_its_smallest_context() {
+        const { assert!(MANAGED_CLEANUP_CHARS < LOCAL_CLEANUP_CHARS) };
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        // The transcript from the failed run: Chinese, one slice of up to 400
+        // characters came to about 250 tokens; now at most 200 characters.
+        let chinese = "这是一段很长的中文文字，用来测试切分。".repeat(100);
+        assert_eq!(cleanup_slice_chars(&managed, &chinese), 200);
+        assert!(
+            split_for_cleanup(&chinese, cleanup_slice_chars(&managed, &chinese))
+                .iter()
+                .all(|slice| slice.chars().count() <= 200)
+        );
+    }
+
+    #[test]
+    fn writing_speed_is_read_from_the_server_timings() {
+        // Timings as GenieX returned them before and after the slowdown.
+        let fast = serde_json::json!({"timings": {
+            "predicted_ms": 9841.135, "predicted_n": 179, "predicted_per_second": 18.19
+        }});
+        let slow = serde_json::json!({"timings": {
+            "predicted_n": 242, "predicted_per_second": 1.09
+        }});
+        let short = serde_json::json!({"timings": {
+            "predicted_n": 3, "predicted_per_second": 0.5
+        }});
+        assert_eq!(writing_speed(&fast), Some(18.19));
+        assert!(writing_speed(&fast).unwrap() > crate::local_llm::SLOW_WRITING_TOKENS_PER_SECOND);
+        assert!(writing_speed(&slow).unwrap() < crate::local_llm::SLOW_WRITING_TOKENS_PER_SECOND);
+        assert_eq!(writing_speed(&short), None, "too short to judge");
+        assert_eq!(writing_speed(&serde_json::json!({})), None);
+        assert_eq!(
+            writing_speed(&serde_json::json!({"timings": {"predicted_n": 50}})),
+            None
+        );
     }
 
     #[test]

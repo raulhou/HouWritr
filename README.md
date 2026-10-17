@@ -321,9 +321,12 @@ meeting notes on a model that never leaves your computer. Two sources:
   SHA-256, installs for your Windows user only, adds `geniex` to your PATH),
   then **Download model** (several GB, resumable), then **Test model**.
   OpenWritr starts `geniex serve` on a private port (18651) when a cleanup needs
-  it, stops it after 15 idle minutes, and ties it to the app so the NPU is never
-  left occupied. If the server cannot start, cleanup falls back to the raw text
-  exactly like an unreachable hosted provider.
+  it and ties it to the app so the NPU is never left occupied. It is stopped as
+  soon as a file or meeting transcript is finished, after 5 idle minutes
+  following dictation, and whenever it stops answering in time or suddenly
+  writes far slower than it did (the next cleanup starts a fresh one). If the
+  server cannot start, cleanup falls back to the raw text exactly like an
+  unreachable hosted provider.
 - **Another local server** – any OpenAI-compatible server on this PC
   (a GenieX server you run yourself, LM Studio, Ollama, Foundry Local). Presets,
   **Find models**, **Test connection**, and a setup guide are in Settings. Only
