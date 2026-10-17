@@ -40,7 +40,7 @@ eframe = { version = "0.30", default-features = false, features = ["default_font
 egui = "0.30"
 
 # Hotkey + audio + paste
-global-hotkey = "0.7"
+global-hotkey = "0.8"
 cpal = "0.16"
 arboard = "3"
 enigo = "0.6"
