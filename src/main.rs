@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
             mode = "transcript-window",
+            build = build_id(),
             "process starting"
         );
         return transcript_window::run_window();
@@ -63,6 +64,7 @@ fn main() -> Result<()> {
             pid = std::process::id(),
             architecture = std::env::consts::ARCH,
             mode = "settings",
+            build = build_id(),
             "process starting"
         );
         let Some(_settings_instance) = settings_instance else {
@@ -88,6 +90,7 @@ fn main() -> Result<()> {
         pid = std::process::id(),
         architecture = std::env::consts::ARCH,
         mode = "tray",
+        build = build_id(),
         "process starting"
     );
     // Install the global low-level keyboard hook before any subsystem starts
@@ -262,5 +265,14 @@ mod tests {
         assert!(is_about_mode([OsString::from("--about")]));
         assert!(is_about_mode([OsString::from("--ABOUT")]));
         assert!(!is_about_mode([OsString::from("--settings")]));
+    }
+}
+
+/// The commit this binary was built from (CI sets `GITHUB_SHA`), so a log
+/// shows exactly which build ran; every build shares one version number.
+fn build_id() -> &'static str {
+    match option_env!("GITHUB_SHA") {
+        Some(sha) if sha.len() >= 7 => &sha[..7],
+        _ => "local",
     }
 }
