@@ -179,6 +179,23 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// (and may still be loading), so every request timeout is multiplied.
 const LOCAL_TIMEOUT_FACTOR: u32 = 8;
 
+/// How long to wait for a model on this machine: far longer than a hosted
+/// model, and growing with the text it must rewrite (it writes about as much
+/// as it reads, one token at a time).
+fn local_timeout(base: Duration, input_chars: usize) -> Duration {
+    (base * LOCAL_TIMEOUT_FACTOR).max(Duration::from_millis(60_000 + input_chars as u64 * 250))
+}
+
+/// Length of the user message in a chat request body.
+fn request_input_chars(body: &serde_json::Value) -> usize {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .map_or(0, |content| content.chars().count())
+}
+
 /// Whether the target is an OpenAI-compatible server on this machine.
 fn is_local_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(EndpointScope::is_loopback)
@@ -215,17 +232,43 @@ pub fn cleanup_engine_label(settings: &Settings) -> String {
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
 const LOCAL_NOTES_PART_CHARS: usize = 8_000;
 
-fn cleanup_slice_chars(settings: &Settings) -> usize {
+/// Chinese, Japanese and Korean text costs about one token per character,
+/// against roughly a quarter of a token for English, so the same number of
+/// characters is several times more work for a model. Shrink slices to match.
+fn scaled_for_script(base_chars: usize, text: &str) -> usize {
+    let total = text.chars().filter(|c| !c.is_whitespace()).count();
+    if total == 0 {
+        return base_chars;
+    }
+    let cjk = text.chars().filter(|&c| is_cjk(c)).count();
+    match cjk * 100 / total {
+        0..=9 => base_chars,
+        10..=29 => base_chars * 55 / 100,
+        _ => base_chars / 3,
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3040}'..='\u{30FF}'   // Hiragana, Katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul
+        | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+    )
+}
+
+fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
     if uses_local_model(settings) {
-        LOCAL_CLEANUP_CHARS
+        scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
         LONG_FORM_CLEANUP_CHARS
     }
 }
 
-fn notes_part_chars(settings: &Settings) -> usize {
+fn notes_part_chars(settings: &Settings, text: &str) -> usize {
     if uses_local_model(settings) {
-        LOCAL_NOTES_PART_CHARS
+        scaled_for_script(LOCAL_NOTES_PART_CHARS, text)
     } else {
         NOTES_PART_CHARS
     }
@@ -276,7 +319,7 @@ fn request_content(
         }
     }
     let timeout = if local {
-        timeout * LOCAL_TIMEOUT_FACTOR
+        local_timeout(timeout, request_input_chars(&prepared.body))
     } else {
         timeout
     };
@@ -314,10 +357,16 @@ fn request_content(
         return Err(reason);
     }
 
+    let sent = Instant::now();
     let response = match request.send() {
         Ok(response) => response,
         Err(error) => {
-            warn!(error = %error, "cleanup provider request failed");
+            warn!(
+                error = %error,
+                waited = ?sent.elapsed(),
+                limit = ?timeout,
+                "cleanup provider request failed"
+            );
             return Err(FallbackReason::RequestFailed);
         }
     };
@@ -332,6 +381,14 @@ fn request_content(
             return Err(FallbackReason::ResponseUnparseable);
         }
     };
+    if local {
+        info!(
+            took = ?sent.elapsed(),
+            usage = %value.get("usage").unwrap_or(&serde_json::Value::Null),
+            timings = %value.get("timings").unwrap_or(&serde_json::Value::Null),
+            "local model answered"
+        );
+    }
     let content = match adapter::parse_chat_response(&value) {
         Ok(content) => content,
         Err(error) => {
@@ -439,7 +496,7 @@ pub fn enhance_long_form(
     progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
     clean_slices(
-        split_for_cleanup(text, cleanup_slice_chars(settings)),
+        split_for_cleanup(text, cleanup_slice_chars(settings, text)),
         |slice| enhance_outcome(slice, settings, || !interrupted()),
         &interrupted,
         progress,
@@ -450,7 +507,7 @@ pub fn enhance_long_form(
 /// found unreachable moments ago): the text is returned untouched and every
 /// slice is marked for a later retry.
 pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
-    let slices = split_for_cleanup(text, cleanup_slice_chars(settings));
+    let slices = split_for_cleanup(text, cleanup_slice_chars(settings, text));
     LongFormCleanup {
         report: CleanupReport {
             total: slices.len(),
@@ -606,7 +663,7 @@ pub fn generate_meeting_notes(
     if !transcript.chars().any(char::is_alphanumeric) {
         return NotesOutcome::Failed(FallbackReason::EmptyCandidate);
     }
-    let parts = split_for_cleanup(transcript, notes_part_chars(settings));
+    let parts = split_for_cleanup(transcript, notes_part_chars(settings, transcript));
     let mut part_notes = Vec::with_capacity(parts.len());
     for (index, part) in parts.iter().enumerate() {
         if interrupted() {
@@ -848,13 +905,19 @@ mod long_form_tests {
     fn local_profile_applies_only_to_loopback_endpoints() {
         let local = openai_settings("http://127.0.0.1:18651/v1");
         assert!(uses_local_model(&local));
-        assert_eq!(cleanup_slice_chars(&local), LOCAL_CLEANUP_CHARS);
-        assert_eq!(notes_part_chars(&local), LOCAL_NOTES_PART_CHARS);
+        assert_eq!(
+            cleanup_slice_chars(&local, "plain english text"),
+            LOCAL_CLEANUP_CHARS
+        );
+        assert_eq!(
+            notes_part_chars(&local, "plain english text"),
+            LOCAL_NOTES_PART_CHARS
+        );
 
         let hosted = openai_settings("https://api.openai.com/v1");
         assert!(!uses_local_model(&hosted));
-        assert_eq!(cleanup_slice_chars(&hosted), LONG_FORM_CLEANUP_CHARS);
-        assert_eq!(notes_part_chars(&hosted), NOTES_PART_CHARS);
+        assert_eq!(cleanup_slice_chars(&hosted, "x"), LONG_FORM_CLEANUP_CHARS);
+        assert_eq!(notes_part_chars(&hosted, "x"), NOTES_PART_CHARS);
 
         let lan = openai_settings("http://192.168.1.20:1234/v1");
         assert!(!uses_local_model(&lan), "a LAN server is not this machine");
@@ -886,6 +949,29 @@ mod long_form_tests {
         copilot.enhance.provider = "github_copilot".into();
         copilot.enhance.model = "gpt-4.1".into();
         assert_eq!(cleanup_engine_label(&copilot), "GitHub Copilot · gpt-4.1");
+    }
+
+    #[test]
+    fn cjk_text_gets_smaller_slices_and_longer_waits() {
+        let english = "This is plain English. ".repeat(100);
+        let chinese = "这是一段很长的中文文字，用来测试切分。".repeat(100);
+        assert_eq!(scaled_for_script(1_200, &english), 1_200);
+        assert_eq!(scaled_for_script(1_200, &chinese), 400);
+        let mixed = format!("{} {}", &english[..300], &chinese[..240]);
+        let mixed_chars = scaled_for_script(1_200, &mixed);
+        assert!(mixed_chars < 1_200 && mixed_chars > 400, "{mixed_chars}");
+        assert_eq!(scaled_for_script(1_200, "   "), 1_200);
+
+        let short = local_timeout(CLEANUP_TIMEOUT, 100);
+        assert_eq!(short, CLEANUP_TIMEOUT * LOCAL_TIMEOUT_FACTOR);
+        assert!(local_timeout(CLEANUP_TIMEOUT, 1_200) > short);
+        assert_eq!(
+            request_input_chars(&serde_json::json!({
+                "messages": [{"role": "system", "content": "long system prompt"},
+                             {"role": "user", "content": "12345"}]
+            })),
+            5
+        );
     }
 
     #[test]

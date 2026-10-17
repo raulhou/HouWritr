@@ -18,7 +18,7 @@ mod cluster;
 mod fbank;
 mod segment;
 
-use super::ort_helpers::{build_cpu_session, OrtResultExt};
+use super::ort_helpers::{build_plain_cpu_session, OrtResultExt};
 use anyhow::{anyhow, bail, Context, Result};
 use ndarray::Array3;
 use ort::session::Session;
@@ -71,8 +71,8 @@ pub struct Diarizer {
 impl Diarizer {
     pub fn load(dir: &Path) -> Result<Self> {
         let started = Instant::now();
-        let segmentation = build_cpu_session(&dir.join(SEGMENTATION_MODEL))?;
-        let embedding = build_cpu_session(&dir.join(EMBEDDING_MODEL))?;
+        let segmentation = build_plain_cpu_session(&dir.join(SEGMENTATION_MODEL))?;
+        let embedding = build_plain_cpu_session(&dir.join(EMBEDDING_MODEL))?;
         info!(
             ms = started.elapsed().as_millis() as u64,
             "diarization models loaded"

@@ -53,3 +53,28 @@ pub fn build_cpu_session(path: &Path) -> Result<Session> {
         .ortx()
         .with_context(|| format!("load {}", path.display()))
 }
+
+/// A CPU session that does not use automatic device selection.
+///
+/// [`build_cpu_session`] pins automatic device selection to the CPU, but once
+/// the QNN provider is registered (the Whisper NPU engine does that) ONNX
+/// Runtime also looks at the NPU device while selecting and fails with
+/// "Could not determine default backend path for device". Naming the CPU
+/// provider explicitly, and refusing providers registered on the
+/// environment, never looks at other devices.
+pub fn build_plain_cpu_session(path: &Path) -> Result<Session> {
+    use ort::ep::CPU;
+    Session::builder()
+        .ortx()?
+        .with_no_environment_execution_providers()
+        .ortx()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .ortx()?
+        .with_intra_threads(num_threads())
+        .ortx()?
+        .with_execution_providers([CPU::default().build()])
+        .ortx()?
+        .commit_from_file(path)
+        .ortx()
+        .with_context(|| format!("load {}", path.display()))
+}
