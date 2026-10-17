@@ -84,82 +84,138 @@ fn send_cancellable(
 /// and has not switched off by policy.
 const COPILOT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
 
-/// A configured Copilot model this account was refused, and the model used
-/// in its place for the rest of this run.
-static COPILOT_SUBSTITUTE: parking_lot::Mutex<Option<(String, String)>> =
-    parking_lot::Mutex::new(None);
+/// The app identities Copilot knows. Which models a request may use depends
+/// on the identity it names as well as on the account, and a sign-in made by
+/// one app can be refused every model under another's identity.
+const COPILOT_VSCODE: &str = "vscode-chat";
+const COPILOT_CLI: &str = "copilot-developer-cli";
 
-/// The model to send instead of `configured`, if it was refused earlier.
-fn copilot_model_in_use(configured: &str) -> Option<String> {
-    COPILOT_SUBSTITUTE
-        .lock()
-        .as_ref()
-        .filter(|(refused, _)| refused == configured)
-        .map(|(_, substitute)| substitute.clone())
+/// Identities to try for a sign-in, the one matching where it came from first.
+fn copilot_integrations(source: TokenSource) -> [&'static str; 2] {
+    match source {
+        TokenSource::CopilotCli | TokenSource::CopilotCliConfigFile => {
+            [COPILOT_CLI, COPILOT_VSCODE]
+        }
+        TokenSource::Environment(_) | TokenSource::GithubCli => [COPILOT_VSCODE, COPILOT_CLI],
+    }
 }
 
-/// Ask Copilot which models this account may use, pick the closest to
-/// `wanted` and remember it. `None` when the list cannot be read or offers
-/// nothing.
-fn copilot_substitute(wanted: &str, token: &str) -> Option<String> {
+/// How cleanup reaches Copilot once a model and identity worked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CopilotRoute {
+    /// The model in settings.
+    configured: String,
+    /// The model sent in its place (often the same).
+    model: String,
+    integration: &'static str,
+}
+
+/// The route that worked last in this run, so later slices and jobs skip
+/// the refusals.
+static COPILOT_ROUTE: parking_lot::Mutex<Option<CopilotRoute>> = parking_lot::Mutex::new(None);
+
+/// The model and identity to use first for `configured`.
+fn copilot_route_for(configured: &str, source: TokenSource) -> (String, &'static str) {
+    COPILOT_ROUTE
+        .lock()
+        .as_ref()
+        .filter(|route| route.configured == configured)
+        .map(|route| (route.model.clone(), route.integration))
+        .unwrap_or_else(|| (configured.to_string(), copilot_integrations(source)[0]))
+}
+
+/// Add Copilot's headers to a request, naming `integration` as the app.
+fn with_copilot_headers(
+    mut request: reqwest::blocking::RequestBuilder,
+    integration: &str,
+) -> reqwest::blocking::RequestBuilder {
+    for &(name, value) in EnhanceProvider::GithubCopilot.request_headers() {
+        if !name.eq_ignore_ascii_case("Copilot-Integration-Id") {
+            request = request.header(name, value);
+        }
+    }
+    request.header("Copilot-Integration-Id", integration)
+}
+
+/// Ask Copilot which models this account may use under `integration`. Logs
+/// what it says about `wanted`, which explains a refusal. `None` when the
+/// list cannot be read.
+fn copilot_models(wanted: &str, token: &str, integration: &'static str) -> Option<Vec<String>> {
     let token = token.to_string();
     let listing = run_cancellable(move || -> reqwest::Result<serde_json::Value> {
-        let mut request = reqwest::blocking::Client::builder()
+        let request = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()?
             .get(COPILOT_MODELS_URL)
             .bearer_auth(token);
-        for &(name, value) in EnhanceProvider::GithubCopilot.request_headers() {
-            request = request.header(name, value);
-        }
-        request.send()?.error_for_status()?.json()
+        with_copilot_headers(request, integration)
+            .send()?
+            .error_for_status()?
+            .json()
     });
     let listing = match listing {
         Ok(Ok(listing)) => listing,
         Ok(Err(error)) => {
-            warn!(error = %error, "could not list the GitHub Copilot models");
+            warn!(error = %error, integration, "could not list the GitHub Copilot models");
             return None;
         }
         Err(_) => return None,
     };
+    let entry = listing
+        .get("data")
+        .and_then(|data| data.as_array())
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.get("id").and_then(|id| id.as_str()) == Some(wanted))
+        });
     let available = copilot_chat_models(&listing);
-    let substitute = pick_copilot_model(wanted, &available);
-    warn!(
-        refused = wanted,
-        using = substitute.as_deref().unwrap_or("none"),
+    info!(
+        integration,
+        model = wanted,
+        policy = %entry.and_then(|e| e.pointer("/policy/state")).unwrap_or(&serde_json::Value::Null),
+        endpoints = %entry.and_then(|e| e.get("supported_endpoints")).unwrap_or(&serde_json::Value::Null),
+        picker = %entry.and_then(|e| e.get("model_picker_enabled")).unwrap_or(&serde_json::Value::Null),
         available = ?available,
-        "GitHub Copilot does not offer this model to this account"
+        "GitHub Copilot model listing"
     );
-    let substitute = substitute?;
-    *COPILOT_SUBSTITUTE.lock() = Some((wanted.to_string(), substitute.clone()));
-    Some(substitute)
+    Some(available)
 }
 
 /// Chat model IDs in a Copilot `/models` listing, leaving out models whose
-/// policy is not enabled.
+/// policy is not enabled and models that do not answer on the chat
+/// completions endpoint.
 fn copilot_chat_models(listing: &serde_json::Value) -> Vec<String> {
-    let mut ids: Vec<String> = listing
+    let mut ids: Vec<String> = Vec::new();
+    let models = listing
         .get("data")
         .and_then(|data| data.as_array())
         .into_iter()
-        .flatten()
-        .filter(|model| {
-            model
-                .pointer("/capabilities/type")
-                .and_then(|kind| kind.as_str())
-                .map_or(true, |kind| kind == "chat")
-        })
-        .filter(|model| {
-            model
-                .pointer("/policy/state")
-                .and_then(|state| state.as_str())
-                .map_or(true, |state| state == "enabled")
-        })
-        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
-        .map(str::to_string)
-        .collect();
-    ids.dedup();
+        .flatten();
+    for model in models {
+        let chat = model
+            .pointer("/capabilities/type")
+            .and_then(|kind| kind.as_str())
+            .map_or(true, |kind| kind == "chat");
+        let enabled = model
+            .pointer("/policy/state")
+            .and_then(|state| state.as_str())
+            .map_or(true, |state| state == "enabled");
+        let completions = model
+            .get("supported_endpoints")
+            .and_then(|endpoints| endpoints.as_array())
+            .map_or(true, |endpoints| {
+                endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.as_str() == Some("/chat/completions"))
+            });
+        if let Some(id) = model.get("id").and_then(|id| id.as_str()) {
+            if chat && enabled && completions && !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
     ids
 }
 
@@ -173,28 +229,69 @@ const COPILOT_PREFERRED: [&str; 6] = [
     "claude-sonnet-4",
 ];
 
-/// The model to use instead of `wanted`: one of the same Claude tier if
-/// offered (another Haiku for a Haiku), else the first preferred model on
-/// offer, else whatever is offered first.
-fn pick_copilot_model(wanted: &str, available: &[String]) -> Option<String> {
+/// Models to try for `wanted`, best first: `wanted` itself when offered,
+/// then one of the same Claude tier (another Haiku for a Haiku), then the
+/// preferred models on offer, then the rest as listed.
+fn rank_copilot_models(wanted: &str, available: &[String]) -> Vec<String> {
     let wanted_lower = wanted.to_ascii_lowercase();
-    let same_tier = ["haiku", "sonnet", "opus"]
-        .into_iter()
-        .filter(|tier| wanted_lower.contains(tier))
-        .find_map(|tier| {
+    let mut ranked: Vec<String> = Vec::new();
+    let mut add = |id: &String| {
+        if !ranked.contains(id) {
+            ranked.push(id.clone());
+        }
+    };
+    available
+        .iter()
+        .filter(|id| id.as_str() == wanted)
+        .for_each(&mut add);
+    for tier in ["haiku", "sonnet", "opus"] {
+        if wanted_lower.contains(tier) {
             available
                 .iter()
-                .find(|id| id.to_ascii_lowercase().contains(tier))
-        });
-    same_tier
-        .or_else(|| {
-            COPILOT_PREFERRED
-                .iter()
-                .find_map(|preferred| available.iter().find(|id| id.as_str() == *preferred))
-        })
-        .or_else(|| available.first())
-        .filter(|id| id.as_str() != wanted)
-        .cloned()
+                .filter(|id| id.to_ascii_lowercase().contains(tier))
+                .for_each(&mut add);
+        }
+    }
+    for preferred in COPILOT_PREFERRED {
+        available
+            .iter()
+            .filter(|id| id.as_str() == preferred)
+            .for_each(&mut add);
+    }
+    available.iter().for_each(&mut add);
+    ranked
+}
+
+/// Requests tried per identity after a refusal, so a broken sign-in costs a
+/// few quick refusals, not one per listed model.
+const COPILOT_TRIES_PER_IDENTITY: usize = 3;
+
+/// The model and identity pairs to try after `tried` was refused.
+fn copilot_fallbacks(
+    wanted: &str,
+    tried: &(String, &'static str),
+    token: &str,
+    source: TokenSource,
+) -> Vec<(String, &'static str)> {
+    let mut pairs = Vec::new();
+    for integration in copilot_integrations(source) {
+        let Some(available) = copilot_models(wanted, token, integration) else {
+            continue;
+        };
+        pairs.extend(
+            rank_copilot_models(wanted, &available)
+                .into_iter()
+                .map(|model| (model, integration))
+                .filter(|pair| pair.0 != tried.0 || pair.1 != tried.1)
+                .take(COPILOT_TRIES_PER_IDENTITY),
+        );
+    }
+    pairs
+}
+
+fn is_model_refusal(result: &reqwest::Result<(reqwest::StatusCode, String)>) -> bool {
+    matches!(result, Ok((status, text))
+        if status.as_u16() == 400 && text.contains("model_not_supported"))
 }
 
 /// Whether an HTTP error status means the provider refused this request as
@@ -556,9 +653,13 @@ fn request_content(
     // actually reaches provider execution. A server on this machine (Ollama,
     // LM Studio, GenieX, ...) usually needs no key, so for those the key is
     // optional and a failed lookup just means "send none".
+    let mut copilot_source = None;
     let token = match provider {
         EnhanceProvider::GithubCopilot => match crate::copilot_auth::copilot_token() {
-            Ok((token, _)) => Some(token),
+            Ok((token, source)) => {
+                copilot_source = Some(source);
+                Some(token)
+            }
             Err(error) => {
                 warn!(error = %error, "GitHub Copilot credential lookup failed");
                 return Err(FallbackReason::MissingCredential);
@@ -632,31 +733,36 @@ fn request_content(
         return Err(reason);
     }
 
-    let copilot = provider == EnhanceProvider::GithubCopilot;
+    let copilot = copilot_source.filter(|_| provider == EnhanceProvider::GithubCopilot);
     let mut body = prepared.body.clone();
-    if copilot {
-        if let Some(model) = body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .and_then(copilot_model_in_use)
-        {
-            body["model"] = serde_json::json!(model);
-        }
+    let configured = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut route = copilot.map(|source| copilot_route_for(&configured, source));
+    if let Some((model, _)) = &route {
+        body["model"] = serde_json::json!(model);
     }
-    let build = |body: &serde_json::Value| {
+    let build = |body: &serde_json::Value, route: &Option<(String, &'static str)>| {
         let mut request = client.post(&prepared.url).json(body);
         if let Some(token) = &token {
             request = request.bearer_auth(token);
         }
-        for &(name, value) in provider.request_headers() {
-            request = request.header(name, value);
+        match route {
+            Some((_, integration)) => with_copilot_headers(request, integration),
+            None => {
+                for &(name, value) in provider.request_headers() {
+                    request = request.header(name, value);
+                }
+                request
+            }
         }
-        request
     };
 
     let managed = is_managed_target(&prepared.target);
     let sent = Instant::now();
-    let mut result = match send_cancellable(build(&body), !local) {
+    let mut result = match send_cancellable(build(&body, &route), !local) {
         Ok(result) => result,
         Err(why) => {
             info!(waited = ?sent.elapsed(), "cleanup request {why}");
@@ -666,29 +772,49 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
-    // Copilot offers each account only some models. When the chosen one is
-    // refused, ask which are offered, switch to the closest and try again.
-    if copilot {
-        let refused = matches!(&result, Ok((status, text))
-            if status.as_u16() == 400 && text.contains("model_not_supported"));
-        let wanted = body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if refused {
-            if let Some(substitute) = token
-                .as_deref()
-                .and_then(|token| copilot_substitute(&wanted, token))
-            {
-                body["model"] = serde_json::json!(substitute);
-                result = match send_cancellable(build(&body), true) {
+    // Copilot offers each account only some models, and which depends on the
+    // app identity the request names. When the model is refused, ask what is
+    // offered under each identity and try the closest few.
+    if let (Some(source), Some(token), Some(first)) = (copilot, token.as_deref(), route.clone()) {
+        if is_model_refusal(&result) {
+            let mut refused = vec![format!("{} as {}", first.0, first.1)];
+            for next in copilot_fallbacks(&configured, &first, token, source) {
+                body["model"] = serde_json::json!(next.0);
+                route = Some(next.clone());
+                result = match send_cancellable(build(&body, &route), true) {
                     Ok(result) => result,
                     Err(why) => {
                         info!(waited = ?sent.elapsed(), "cleanup request {why}");
                         return Err(FallbackReason::RequestFailed);
                     }
                 };
+                if !is_model_refusal(&result) {
+                    break;
+                }
+                refused.push(format!("{} as {}", next.0, next.1));
+            }
+            if is_model_refusal(&result) {
+                warn!(
+                    refused = ?refused,
+                    "GitHub Copilot refused every model tried for this sign-in"
+                );
+            } else if let Some((model, integration)) = &route {
+                warn!(
+                    configured = %configured,
+                    using = %model,
+                    integration = *integration,
+                    refused = ?refused,
+                    "GitHub Copilot refused the configured model; using another"
+                );
+            }
+        }
+        if matches!(&result, Ok((status, _)) if status.is_success()) {
+            if let Some((model, integration)) = &route {
+                *COPILOT_ROUTE.lock() = Some(CopilotRoute {
+                    configured: configured.clone(),
+                    model: model.clone(),
+                    integration: *integration,
+                });
             }
         }
     }
@@ -1665,31 +1791,46 @@ mod long_form_tests {
     }
 
     #[test]
-    fn a_refused_copilot_model_is_replaced_by_the_closest_on_offer() {
+    fn refused_copilot_models_are_replaced_by_the_closest_on_offer() {
         let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-        // Another model of the same Claude tier first.
+        // The model itself when offered, then the same Claude tier, then the
+        // preferred models, then the rest as listed.
         assert_eq!(
-            pick_copilot_model("claude-haiku-4.5", &ids(&["gpt-4.1", "claude-3.5-haiku"])),
-            Some("claude-3.5-haiku".into())
+            rank_copilot_models(
+                "claude-haiku-4.5",
+                &ids(&["o3", "gpt-4.1", "claude-3.5-haiku", "claude-haiku-4.5"])
+            ),
+            ids(&["claude-haiku-4.5", "claude-3.5-haiku", "gpt-4.1", "o3"])
         );
-        // Otherwise the first preferred model on offer, not just the first listed.
         assert_eq!(
-            pick_copilot_model("claude-haiku-4.5", &ids(&["o3", "gpt-4.1", "gpt-5-mini"])),
-            Some("gpt-5-mini".into())
+            rank_copilot_models("gemini-3.7-flash", &ids(&["o3", "gpt-4.1", "gpt-5-mini"])),
+            ids(&["gpt-5-mini", "gpt-4.1", "o3"])
         );
-        assert_eq!(pick_copilot_model("x", &ids(&["o3"])), Some("o3".into()));
-        // Never the refused model itself, and nothing from an empty list.
-        assert_eq!(pick_copilot_model("gpt-4.1", &ids(&["gpt-4.1"])), None);
-        assert_eq!(pick_copilot_model("gpt-4.1", &[]), None);
+        assert!(rank_copilot_models("gpt-4.1", &[]).is_empty());
+    }
+
+    #[test]
+    fn copilot_cli_sign_ins_try_the_cli_identity_first() {
+        assert_eq!(
+            copilot_integrations(TokenSource::CopilotCli),
+            [COPILOT_CLI, COPILOT_VSCODE]
+        );
+        assert_eq!(
+            copilot_integrations(TokenSource::GithubCli),
+            [COPILOT_VSCODE, COPILOT_CLI]
+        );
     }
 
     #[test]
     fn copilot_listing_keeps_enabled_chat_models() {
         let listing = serde_json::json!({"data": [
-            {"id": "gpt-5-mini", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}},
+            {"id": "gpt-5-mini", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"},
+             "supported_endpoints": ["/chat/completions", "/responses"]},
             {"id": "claude-haiku-4.5", "capabilities": {"type": "chat"}, "policy": {"state": "disabled"}},
+            {"id": "gpt-6-luna", "capabilities": {"type": "chat"}, "supported_endpoints": ["/responses"]},
             {"id": "text-embedding-3-small", "capabilities": {"type": "embeddings"}},
-            {"id": "gpt-4.1", "capabilities": {"type": "chat"}}
+            {"id": "gpt-4.1", "capabilities": {"type": "chat"}},
+            {"id": "gpt-5-mini", "capabilities": {"type": "chat"}}
         ]});
         assert_eq!(copilot_chat_models(&listing), ["gpt-5-mini", "gpt-4.1"]);
         assert!(copilot_chat_models(&serde_json::json!({})).is_empty());
