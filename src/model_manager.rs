@@ -500,6 +500,11 @@ impl ModelManager {
             file_bytes = file_bytes
                 .checked_add(read as u64)
                 .ok_or_else(|| anyhow!("download size overflow"))?;
+            // A server that sends no length up front could otherwise fill the
+            // disk before the size check after the loop.
+            if file_bytes > expected_bytes {
+                bail!("{url} sent more than the expected {expected_bytes} bytes");
+            }
             *downloaded_bytes = downloaded_bytes
                 .checked_add(read as u64)
                 .ok_or_else(|| anyhow!("download progress overflow"))?;
@@ -954,6 +959,14 @@ fn extract_archive(
             written = written
                 .checked_add(read as u64)
                 .ok_or_else(|| anyhow!("extracted size overflow"))?;
+            // The size a ZIP entry declares is not a limit on what it unpacks to.
+            if written > expected.bytes {
+                bail!(
+                    "ZIP entry {} unpacks to more than the expected {} bytes",
+                    expected.archive_path,
+                    expected.bytes
+                );
+            }
         }
         output
             .sync_all()

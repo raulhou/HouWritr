@@ -106,6 +106,7 @@ fn copilot_substitute(wanted: &str, token: &str) -> Option<String> {
     let listing = run_cancellable(move || -> reqwest::Result<serde_json::Value> {
         let mut request = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?
             .get(COPILOT_MODELS_URL)
             .bearer_auth(token);
@@ -414,6 +415,12 @@ fn is_local_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(EndpointScope::is_loopback)
 }
 
+/// Whether an API key may be sent to `endpoint`: over https anywhere, and
+/// over plain http only to a server on this PC (it never crosses a network).
+fn key_may_travel_to(endpoint: &EndpointScope) -> bool {
+    endpoint.scheme() == "https" || endpoint.is_loopback()
+}
+
 /// Whether the target is the server OpenWritr starts itself (GenieX on the NPU).
 fn is_managed_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(crate::local_llm::is_managed)
@@ -584,8 +591,24 @@ fn request_content(
         hosted_timeout(timeout, request_input_chars(&prepared.body))
     };
 
+    // An API key never crosses the network unencrypted: a server on another
+    // machine must use https. A server on this PC is not on the network.
+    if token.is_some() {
+        if let Some(endpoint) = prepared.target.endpoint() {
+            if !key_may_travel_to(endpoint) {
+                warn!(
+                    "refusing to send the API key over unencrypted http to a server that is not on this PC; use an https address"
+                );
+                return Err(FallbackReason::InvalidEndpoint);
+            }
+        }
+    }
+
     let client = match reqwest::blocking::Client::builder()
         .timeout(timeout)
+        // A chat API answers where it was asked. Following a redirect could
+        // resend the transcript to another server.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -695,6 +718,11 @@ fn request_content(
         }
     };
     if !status.is_success() {
+        if provider == EnhanceProvider::GithubCopilot && status.as_u16() == 401 {
+            // The sign-in was revoked or expired: look for it afresh next time
+            // instead of reusing the cached token for up to ten minutes.
+            crate::copilot_auth::forget_token();
+        }
         warn!(
             status = %status,
             detail = %error_excerpt(&body),
@@ -1623,6 +1651,17 @@ mod long_form_tests {
         assert_eq!(result.report.cleaned, 1);
         assert_eq!(result.report.unreachable, 5);
         assert!(result.report.needs_retry());
+    }
+
+    #[test]
+    fn an_api_key_never_crosses_the_network_unencrypted() {
+        let scope = |raw: &str| EndpointScope::parse(raw).unwrap();
+        assert!(key_may_travel_to(&scope("https://api.openai.com/v1")));
+        assert!(key_may_travel_to(&scope("https://192.168.1.20:8443/v1")));
+        assert!(key_may_travel_to(&scope("http://127.0.0.1:11434/v1")));
+        assert!(key_may_travel_to(&scope("http://localhost:1234/v1")));
+        assert!(!key_may_travel_to(&scope("http://192.168.1.20:1234/v1")));
+        assert!(!key_may_travel_to(&scope("http://api.example.com/v1")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # HouWritr Privacy Policy
 
-*Last updated: July 2026*
+*Last updated: October 2026*
 
 HouWritr is a local-first push-to-talk voice-to-text tool. Audio capture and
 speech recognition run **entirely on your device**.
@@ -13,11 +13,15 @@ servers operated by us.
 ## How your voice is processed
 
 - Audio is captured from your microphone **only while you hold the hotkey**.
-- Transcription runs **locally on your device** (NVIDIA Parakeet model on
-  your CPU or NPU). Your audio never leaves your machine.
-- The recognized text is pasted at your cursor or copied to the Windows
-  clipboard, depending on your Settings choice. HouWritr does not keep a
-  transcript history.
+- Transcription runs **locally on your device** (NVIDIA Parakeet on your CPU
+  or NPU, or Whisper on the NPU). Your audio never leaves your machine.
+- Dictated text is pasted at your cursor or copied to the Windows clipboard,
+  depending on your Settings choice. HouWritr keeps no history of dictations.
+  When it pastes, the text is on the clipboard only for a moment and is marked
+  so that Windows Clipboard History and cloud clipboard sync do not keep it.
+- **Files you transcribe and meetings you record are saved as transcript
+  files**: next to the imported file, and meetings under
+  `Documents\OpenWritr\Meetings`. They stay on your PC until you delete them.
 
 ## Network access
 
@@ -36,6 +40,11 @@ HouWritr connects to the internet only for:
    configured OpenAI-compatible API for grammar and punctuation cleanup using
    your own credentials. The provider's privacy policy applies. Set enhancement
    to **Never** to keep all processing local.
+   For GitHub Copilot, HouWritr uses the GitHub sign-in already on your PC: a
+   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` variable, the token
+   GitHub Copilot CLI saved (`copilot login`), or the GitHub CLI's. It is sent
+   only to GitHub. An API key for another service is sent only to the address
+   you entered, and never over unencrypted `http` to another machine.
 4. **Optional local model for cleanup** — choose *Local model (on this PC)*
    in Settings and the text is processed by a model running on your own
    computer (on the Snapdragon NPU, or a server such as LM Studio on
@@ -48,10 +57,14 @@ HouWritr connects to the internet only for:
 ## Data stored on your device
 
 Settings, downloaded models, and a local diagnostic log are stored under
-`%LOCALAPPDATA%\OpenWritr\` on your machine. They never leave it. Deleting
-that folder (or uninstalling) removes them.
+`%LOCALAPPDATA%\OpenWritr\` on your machine (the folder keeps the name of
+the project HouWritr started from, so existing installs keep their models).
+They never leave it unless you choose to share a diagnostics export, which
+removes API keys and prompt text first. API keys you enter are kept in Windows
+Credential Manager, not in the settings file. Deleting that folder (or
+uninstalling) removes the rest.
 
 ## Contact
 
 Questions: open an issue at
-https://github.com/trsdn/openwritr-windows/issues
+https://github.com/raulhou/HouWritr/issues
