@@ -65,10 +65,14 @@ pub(crate) fn prepare_cleanup_request(
     let (provider, target) = resolve_target(settings)?;
     let resolved = settings.resolve_prompt(&target);
     let transcript = Transcript::new(text);
+    let mut body = pipeline::build_request(&target, &resolved.system, &transcript);
+    if is_local_target(&target) {
+        body["max_tokens"] = serde_json::json!(local_max_tokens(text));
+    }
     Ok(PreparedCleanupRequest {
         provider,
         url: pipeline::chat_completions_url(&target),
-        body: pipeline::build_request(&target, &resolved.system, &transcript),
+        body,
         target,
     })
 }
@@ -225,6 +229,15 @@ pub fn cleanup_engine_label(settings: &Settings) -> String {
         },
         Err(_) => name.to_string(),
     }
+}
+
+/// Upper bound on a cleanup reply from a local model. Cleaned text is about as
+/// long as the input (one token per character is a safe ceiling even for
+/// CJK). Without it the server's default is 2,048 tokens, and a model that
+/// does not stop after its answer keeps the NPU busy for minutes while every
+/// later request queues behind it.
+fn local_max_tokens(text: &str) -> usize {
+    text.chars().count() + 128
 }
 
 /// Small local models have short context windows and generate slowly, so
@@ -949,6 +962,20 @@ mod long_form_tests {
         copilot.enhance.provider = "github_copilot".into();
         copilot.enhance.model = "gpt-4.1".into();
         assert_eq!(cleanup_engine_label(&copilot), "GitHub Copilot · gpt-4.1");
+    }
+
+    #[test]
+    fn local_cleanup_requests_cap_the_reply_length() {
+        let text = "hello there, this is a short dictation";
+        let local =
+            prepare_cleanup_request(text, &openai_settings("http://127.0.0.1:18651/v1")).unwrap();
+        assert_eq!(
+            local.body["max_tokens"],
+            serde_json::json!(text.chars().count() + 128)
+        );
+        let hosted =
+            prepare_cleanup_request(text, &openai_settings("https://api.openai.com/v1")).unwrap();
+        assert!(hosted.body.get("max_tokens").is_none());
     }
 
     #[test]

@@ -54,15 +54,54 @@ pub fn build_cpu_session(path: &Path) -> Result<Session> {
         .with_context(|| format!("load {}", path.display()))
 }
 
-/// A CPU session that does not use automatic device selection.
+/// A CPU session that cannot end up on the NPU.
 ///
-/// [`build_cpu_session`] pins automatic device selection to the CPU, but once
-/// the QNN provider is registered (the Whisper NPU engine does that) ONNX
-/// Runtime also looks at the NPU device while selecting and fails with
-/// "Could not determine default backend path for device". Naming the CPU
-/// provider explicitly, and refusing providers registered on the
-/// environment, never looks at other devices.
+/// Once the QNN provider is registered (the Whisper NPU engine does that),
+/// the plain [`build_cpu_session`] fails with "Could not determine default
+/// backend path for device", and a session with no provider named at all was
+/// seen being handed to the NPU provider ("Dynamic shape is not supported
+/// yet"). Naming the CPU device explicitly avoids both. Each way of asking is
+/// tried in turn and, if all fail, every error is reported.
 pub fn build_plain_cpu_session(path: &Path) -> Result<Session> {
+    let mut failures = Vec::new();
+    match build_on_cpu_device(path) {
+        Ok(session) => return Ok(session),
+        Err(error) => failures.push(format!("explicit CPU device: {error:#}")),
+    }
+    match build_without_providers(path) {
+        Ok(session) => return Ok(session),
+        Err(error) => failures.push(format!("default providers: {error:#}")),
+    }
+    Err(anyhow!("load {}: {}", path.display(), failures.join(" | ")))
+}
+
+fn build_on_cpu_device(path: &Path) -> Result<Session> {
+    use ort::memory::DeviceType;
+    let environment = ort::environment::current().ortx()?;
+    let devices: Vec<_> = environment
+        .devices()
+        .filter(|device| {
+            device.ty() == DeviceType::CPU && matches!(device.ep(), Ok("CPUExecutionProvider"))
+        })
+        .collect();
+    if devices.is_empty() {
+        return Err(anyhow!("ONNX Runtime lists no CPU device"));
+    }
+    Session::builder()
+        .ortx()?
+        .with_no_environment_execution_providers()
+        .ortx()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .ortx()?
+        .with_intra_threads(num_threads())
+        .ortx()?
+        .with_devices(devices, None)
+        .ortx()?
+        .commit_from_file(path)
+        .ortx()
+}
+
+fn build_without_providers(path: &Path) -> Result<Session> {
     use ort::ep::CPU;
     Session::builder()
         .ortx()?
@@ -76,5 +115,4 @@ pub fn build_plain_cpu_session(path: &Path) -> Result<Session> {
         .ortx()?
         .commit_from_file(path)
         .ortx()
-        .with_context(|| format!("load {}", path.display()))
 }
