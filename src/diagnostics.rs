@@ -15,8 +15,54 @@ const MAX_DIAGNOSTIC_BUNDLES: usize = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+/// Delete daily logs beyond the newest [`MAX_LOG_FILES`]. Only files named
+/// exactly like the logger names them (`openwritr.YYYY-MM-DD.log`) count and
+/// are ever deleted, newest by the date in the name. Copies such as
+/// `openwritr.2026-10-17 - Copy.log` are left alone and can no longer push
+/// today's log out: that used to delete the log the tray process was still
+/// writing, so everything it logged was lost.
 pub fn prune_logs() -> Result<()> {
-    prune_matching(&paths::log_dir(), MAX_LOG_FILES, is_log_file)
+    prune_daily_logs(&paths::log_dir(), MAX_LOG_FILES)
+}
+
+/// The date in a log file name made by the daily logger, if it is one.
+fn daily_log_date(name: &str) -> Option<&str> {
+    let date = name.strip_prefix("openwritr.")?.strip_suffix(".log")?;
+    let bytes = date.as_bytes();
+    let well_formed = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            _ => byte.is_ascii_digit(),
+        });
+    well_formed.then_some(date)
+}
+
+fn prune_daily_logs(directory: &Path, keep: usize) -> Result<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    let mut logs: Vec<(String, PathBuf)> = fs::read_dir(directory)
+        .with_context(|| format!("read {}", directory.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let date = daily_log_date(path.file_name()?.to_str()?)?.to_string();
+            Some((date, path))
+        })
+        .collect();
+    // Newest date first; ISO dates sort as text.
+    logs.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in logs.into_iter().skip(keep) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn open_logs_dir() -> Result<()> {
@@ -542,6 +588,46 @@ mod tests {
 
         assert!(!text.contains("private words"));
         assert!(text.contains("recent safe line"));
+    }
+
+    #[test]
+    fn only_dated_logs_are_pruned_and_copies_never_push_today_out() {
+        let temp = tempfile::tempdir().unwrap();
+        for day in 1..=10 {
+            fs::write(
+                temp.path().join(format!("openwritr.2026-10-{day:02}.log")),
+                b"log",
+            )
+            .unwrap();
+        }
+        // Copies made later (newer files) must not count.
+        for copy in [
+            "openwritr.2026-10-10 - Copy.log",
+            "openwritr.2026-10-10 (2).log",
+            "openwritr-test.log",
+        ] {
+            fs::write(temp.path().join(copy), b"copy").unwrap();
+        }
+        prune_daily_logs(temp.path(), 7).unwrap();
+        let mut left: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert!(
+            left.contains(&"openwritr.2026-10-10.log".to_string()),
+            "today stays"
+        );
+        assert!(left.contains(&"openwritr.2026-10-04.log".to_string()));
+        assert!(!left.contains(&"openwritr.2026-10-03.log".to_string()));
+        assert!(left.contains(&"openwritr.2026-10-10 - Copy.log".to_string()));
+        assert_eq!(left.len(), 7 + 3);
+        assert_eq!(
+            daily_log_date("openwritr.2026-10-17.log"),
+            Some("2026-10-17")
+        );
+        assert_eq!(daily_log_date("openwritr.2026-10-17 - Copy.log"), None);
+        assert_eq!(daily_log_date("openwritr.log"), None);
     }
 
     #[test]

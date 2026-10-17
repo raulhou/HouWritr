@@ -868,6 +868,34 @@ fn decide_delivery(
     DeliveryPlan::Paste
 }
 
+/// Why AI cleanup gave no output, in words for the transcript window and
+/// the notice. The log has the details.
+fn cleanup_failure_text(reason: &FallbackReason) -> String {
+    match reason {
+        FallbackReason::UnknownProvider => "the cleanup provider setting is not valid".into(),
+        FallbackReason::MissingCredential => "no sign-in or API key was found".into(),
+        FallbackReason::CredentialTargetChanged => {
+            "the provider changed after recording started".into()
+        }
+        FallbackReason::InvalidEndpoint => {
+            "the server address is not accepted (an API key needs https)".into()
+        }
+        FallbackReason::EmptyModelId => "no model is set".into(),
+        FallbackReason::RequestFailed => {
+            "the provider could not be reached or did not answer in time".into()
+        }
+        FallbackReason::ProviderRejected(status) => {
+            format!("the provider rejected the request, HTTP {status}, see the log")
+        }
+        FallbackReason::ResponseUnparseable => "the provider's answer could not be read".into(),
+        FallbackReason::EmptyCandidate => "the provider returned no text".into(),
+        FallbackReason::IntegrityRejected(_) => {
+            "the cleaned text changed facts or numbers, so it was not used".into()
+        }
+        FallbackReason::ValidatorError => "the cleaned text could not be checked".into(),
+    }
+}
+
 fn cleanup_notice_kind(reason: &FallbackReason) -> NoticeKind {
     match reason {
         FallbackReason::UnknownProvider
@@ -2076,9 +2104,10 @@ impl AppHandler {
         let (words, chars, preview) = transcript_window::summarize(text);
         // Warnings for the popup: AI problems and unavailable speaker labels.
         let mut warnings = Vec::new();
-        if cleanup_warning.is_some() {
+        if let Some(reason) = &cleanup_warning {
             warnings.push(format!(
-                "Saved without {missing}: provider or credential problem."
+                "Saved without {missing}: {}.",
+                cleanup_failure_text(reason)
             ));
         } else if let Some(summary) = &summary {
             warnings.push(format!("AI cleanup incomplete: {summary}."));
@@ -2126,7 +2155,8 @@ impl AppHandler {
                 windowed,
                 true,
                 &format!(
-                    "Saved {name} without {missing} (provider or credential problem){retry_note}"
+                    "Saved {name} without {missing} ({}){retry_note}",
+                    cleanup_failure_text(&reason)
                 ),
             );
         } else if let Some(summary) = &summary {
