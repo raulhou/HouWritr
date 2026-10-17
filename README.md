@@ -53,7 +53,10 @@ folder.
 > folder; if you want to look inside, paste `%LOCALAPPDATA%\OpenWritr` into
 > the Explorer address bar.
 
-Logs are under `%LOCALAPPDATA%\OpenWritr\logs`. Tray actions **Open logs**
+Logs are under `%LOCALAPPDATA%\OpenWritr\logs`: `sessions` holds one file
+per run of the app (its windows included), and `recordings` one file per
+recording or transcript, named by its start time in UTC. The newest 30
+sessions and 300 recordings are kept. Tray actions **Open logs**
 and **Export diagnostics** provide bounded logs plus redacted runtime/model
 status; diagnostics never include audio, transcript text, clipboard contents,
 or API keys.

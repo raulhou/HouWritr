@@ -1059,7 +1059,17 @@ impl ApplicationHandler<UserEvent> for AppHandler {
 impl AppHandler {
     fn tick(&mut self, el: &ActiveEventLoop) {
         while let Some(event) = self.state.worker.try_recv() {
+            let finished = match &event {
+                WorkerEvent::JobCompleted { id, .. }
+                | WorkerEvent::JobFailed { id, .. }
+                | WorkerEvent::JobDiscarded { id } => Some(*id),
+                _ => None,
+            };
             self.handle_worker_event(el, event);
+            // The job's own log ends once its result is saved or pasted.
+            if let Some(id) = finished {
+                crate::log_files::end(id);
+            }
         }
         self.sync_overlay();
         self.sync_meeting_indicator();

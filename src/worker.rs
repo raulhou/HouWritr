@@ -762,6 +762,9 @@ fn worker_main(
                 // However the job ends, a finished file or meeting transcript
                 // gives the NPU back instead of keeping the text model loaded.
                 let _release_local_model = ReleaseLocalModel::after(&job.config);
+                // Everything logged for this job also goes to its own log;
+                // the app ends it once it has saved or pasted the result.
+                crate::log_files::begin(job.id, recording_kind(&job.config));
                 {
                     let _transition = transition_gate.lock();
                     if discard_requested.load(Ordering::Acquire) {
@@ -1188,6 +1191,23 @@ impl Drop for ReleaseLocalModel {
         if self.0 {
             crate::local_llm::release("the transcript is finished");
         }
+    }
+}
+
+/// What a job's own log file is named after.
+fn recording_kind(config: &JobConfig) -> crate::log_files::RecordingKind {
+    use crate::log_files::RecordingKind;
+    if config.rerun.is_some() {
+        RecordingKind::Retry
+    } else if let Some(part) = config.session {
+        RecordingKind::Meeting {
+            session: part.id,
+            last: part.last,
+        }
+    } else if config.long_form {
+        RecordingKind::File
+    } else {
+        RecordingKind::Dictation
     }
 }
 

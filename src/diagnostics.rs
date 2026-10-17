@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zip::write::SimpleFileOptions;
 
 const MAX_LOG_FILES: usize = 7;
+/// Newest session logs put in a diagnostics bundle.
+const MAX_SESSION_LOGS_EXPORTED: usize = 5;
+/// Newest recording logs put in a diagnostics bundle.
+const MAX_RECORDING_LOGS_EXPORTED: usize = 20;
 const MAX_LOG_BYTES_PER_FILE: u64 = 5 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BUNDLES: usize = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -22,7 +26,8 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 /// today's log out: that used to delete the log the tray process was still
 /// writing, so everything it logged was lost.
 pub fn prune_logs() -> Result<()> {
-    prune_daily_logs(&paths::log_dir(), MAX_LOG_FILES)
+    prune_daily_logs(&paths::log_dir(), MAX_LOG_FILES)?;
+    crate::log_files::prune().context("prune session and recording logs")
 }
 
 /// The date in a log file name made by the daily logger, if it is one.
@@ -141,8 +146,33 @@ fn export_bundle_from(
             options,
         )?;
 
-        let logs = recent_files(log_dir, is_log_file)?;
-        let included_logs: Vec<_> = logs.iter().take(MAX_LOG_FILES).collect();
+        // Recent session and recording logs, then any older daily logs.
+        let mut included_logs: Vec<(String, PathBuf)> = Vec::new();
+        for (folder, keep) in [
+            ("sessions", MAX_SESSION_LOGS_EXPORTED),
+            ("recordings", MAX_RECORDING_LOGS_EXPORTED),
+        ] {
+            for path in recent_files(&log_dir.join(folder), crate::log_files::is_log)?
+                .into_iter()
+                .take(keep)
+            {
+                let name = path.file_name().and_then(|name| name.to_str());
+                if let Some(name) = name.map(str::to_string) {
+                    included_logs.push((format!("logs/{folder}/{name}"), path));
+                }
+            }
+        }
+        for path in recent_files(log_dir, is_log_file)?
+            .into_iter()
+            .take(MAX_LOG_FILES)
+        {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("openwritr.log")
+                .to_string();
+            included_logs.push((format!("logs/{name}"), path));
+        }
         let metadata = json!({
             "app_version": env!("CARGO_PKG_VERSION"),
             "process_id": std::process::id(),
@@ -175,13 +205,9 @@ fn export_bundle_from(
             write_bytes(&mut zip, "runtime-versions.json", &bytes, options)?;
         }
 
-        for log_path in included_logs {
+        for (name, log_path) in &included_logs {
             let bytes = read_sanitized_log_tail(log_path)?;
-            let name = log_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("openwritr.log");
-            write_bytes(&mut zip, &format!("logs/{name}"), &bytes, options)?;
+            write_bytes(&mut zip, name, &bytes, options)?;
         }
 
         zip.finish().context("finish diagnostics ZIP")?;
@@ -659,6 +685,13 @@ mod tests {
             b"safe\ntranscribed -> \"private transcript\"\n",
         )
         .unwrap();
+        fs::create_dir_all(logs.join("sessions")).unwrap();
+        fs::write(
+            logs.join("sessions")
+                .join("2026-10-17_22-17-08Z_tray_1.log"),
+            b"session\n",
+        )
+        .unwrap();
         fs::write(models.join("parakeet").join("encoder.onnx"), b"model").unwrap();
         fs::write(
             runtime.join("runtime-versions.json"),
@@ -685,6 +718,9 @@ mod tests {
             .read_to_string(&mut log)
             .unwrap();
         assert!(!log.contains("private transcript"));
+        assert!(archive
+            .by_name("logs/sessions/2026-10-17_22-17-08Z_tray_1.log")
+            .is_ok());
         assert!(archive.by_name("metadata.json").is_ok());
         assert!(archive.by_name("model-status.json").is_ok());
         assert!(archive.by_name("runtime-status.json").is_ok());

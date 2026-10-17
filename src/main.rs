@@ -15,6 +15,7 @@ mod enhance;
 mod hotkey;
 mod key_hook;
 mod local_llm;
+mod log_files;
 mod media;
 mod meeting;
 mod model_manager;
@@ -42,7 +43,7 @@ fn main() -> Result<()> {
         return self_check::run();
     }
     if is_transcript_window_mode(arguments.iter()) {
-        let _log_guard = init_tracing(false)?;
+        let _log_guard = init_tracing("transcript-window", false)?;
         info!(
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
@@ -58,7 +59,7 @@ fn main() -> Result<()> {
     // Settings and About share one subprocess and single-instance boundary.
     if settings_mode || about_mode {
         let settings_instance = single_instance::SingleInstance::acquire_settings()?;
-        let _log_guard = init_tracing(false)?;
+        let _log_guard = init_tracing("settings", false)?;
         info!(
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
@@ -77,9 +78,9 @@ fn main() -> Result<()> {
     }
 
     let tray_instance = single_instance::SingleInstance::acquire_tray()?;
-    // Only the one running tray process tidies old logs; the windows it
-    // opens write to the same file and must never delete it.
-    let _log_guard = init_tracing(tray_instance.is_some())?;
+    // Only the one running tray process starts a session log and tidies old
+    // logs; the windows it opens write into its file.
+    let _log_guard = init_tracing("tray", tray_instance.is_some())?;
     let Some(_instance) = tray_instance else {
         info!("tray instance already running; exiting");
         return Ok(());
@@ -133,25 +134,28 @@ fn is_self_check_mode<T: AsRef<OsStr>>(args: impl IntoIterator<Item = T>) -> boo
     })
 }
 
-fn init_tracing(prune: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = paths::log_dir();
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("create log directory {}", log_dir.display()))?;
-    if prune {
+    let sessions = log_files::sessions_dir();
+    std::fs::create_dir_all(&sessions)
+        .with_context(|| format!("create log directory {}", sessions.display()))?;
+    if owner {
         diagnostics::prune_logs()?;
     }
     record_crashes(log_dir.clone());
 
+    // One file per session; the tray's windows append to the tray's file.
+    let session_log = log_files::session_log(mode, owner);
+    let stem = session_log
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("session log has no file name")?;
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openwritr")
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_prefix(stem)
         .filename_suffix("log")
-        // No `max_log_files`: the library's own pruning counts every
-        // `openwritr*.log` file, copies included, by creation time, and ran
-        // in every process; it deleted the log the tray was still writing.
-        // `diagnostics::prune_logs` does it safely instead.
-        .build(&log_dir)
-        .with_context(|| format!("initialize log appender in {}", log_dir.display()))?;
+        .build(&sessions)
+        .with_context(|| format!("open {}", session_log.display()))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -162,12 +166,22 @@ fn init_tracing(prune: bool) -> Result<tracing_appender::non_blocking::WorkerGua
         .with_ansi(false)
         .with_thread_ids(true)
         .with_thread_names(true);
+    // The same lines, while a recording or transcript is worked on, also go
+    // to that recording's own log (tray only: the windows run no jobs).
+    let recording_layer = owner.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(log_files::RecordingWriter)
+            .with_ansi(false)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+    });
     let console_layer =
         cfg!(debug_assertions).then(|| tracing_subscriber::fmt::layer().with_ansi(false));
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "openwritr=info".into()))
         .with(file_layer)
+        .with(recording_layer)
         .with(console_layer)
         .try_init()
         .context("initialize tracing subscriber")?;
@@ -185,7 +199,7 @@ fn record_crashes(log_dir: std::path::PathBuf) {
         let thread = std::thread::current();
         let report = format!(
             "{} UTC pid {} thread {}: {}\n{}\n\n",
-            utc_now(),
+            log_files::utc_now(),
             std::process::id(),
             thread.name().unwrap_or("unnamed"),
             info,
@@ -205,34 +219,6 @@ fn record_crashes(log_dir: std::path::PathBuf) {
 }
 
 /// The current UTC time as `YYYY-MM-DD hh:mm:ss`, without a date library.
-fn utc_now() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    // Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
-        rest / 3_600,
-        rest % 3_600 / 60,
-        rest % 60
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{is_about_mode, is_self_check_mode, is_settings_mode, is_transcript_window_mode};
