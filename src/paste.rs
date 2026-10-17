@@ -304,7 +304,7 @@ fn paste(
                     anyhow!("{error}; additionally failed to schedule clipboard restoration: {restore_error}")
                 })?;
                 Err(anyhow!(
-                    "{error}; OpenWritr will restore the previous clipboard only if the injected payload is still current"
+                    "{error}; HouWritr will restore the previous clipboard only if the injected payload is still current"
                 ))
             }
             InjectionFailureAction::PreserveTranscript => {
@@ -482,7 +482,7 @@ impl ClipboardSnapshot {
 
         if initial_identity.sequence != final_identity.sequence {
             return Err(anyhow!(
-                "automatic paste aborted because the clipboard changed while OpenWritr was snapshotting it"
+                "automatic paste aborted because the clipboard changed while HouWritr was snapshotting it"
             ));
         }
 
@@ -700,7 +700,7 @@ fn write_injected_payload(
         let current_identity = current_clipboard_identity()?;
         if current_identity.sequence != captured_identity.sequence {
             return Err(anyhow!(
-                "automatic paste aborted because the clipboard changed while OpenWritr was preparing the transcript payload"
+                "automatic paste aborted because the clipboard changed while HouWritr was preparing the transcript payload"
             ));
         }
 
@@ -910,7 +910,7 @@ fn write_clipboard_text(text: &str) -> Result<()> {
 fn write_clipboard_marker(marker_format: u32, marker: &str) -> Result<()> {
     let mut bytes = marker.as_bytes().to_vec();
     bytes.push(0);
-    set_clipboard_memory(marker_format, &bytes).context("write the OpenWritr clipboard marker")
+    set_clipboard_memory(marker_format, &bytes).context("write the HouWritr clipboard marker")
 }
 
 fn set_clipboard_memory(format: u32, bytes: &[u8]) -> Result<()> {
@@ -971,7 +971,7 @@ fn read_clipboard_marker(marker_format: u32) -> Result<Option<String>> {
     }
 
     Ok(Some(
-        read_global_utf8_string(handle).context("read the OpenWritr clipboard marker")?,
+        read_global_utf8_string(handle).context("read the HouWritr clipboard marker")?,
     ))
 }
 
@@ -1015,7 +1015,7 @@ fn read_global_utf8_string(handle: *mut core::ffi::c_void) -> Result<String> {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8(bytes[..text_len].to_vec())
-        .context("decode the OpenWritr clipboard marker payload")
+        .context("decode the HouWritr clipboard marker payload")
 }
 
 fn read_global_bytes(handle: *mut core::ffi::c_void) -> Result<Vec<u8>> {
@@ -1078,7 +1078,7 @@ fn openwritr_marker_format() -> Result<u32> {
             let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
             if format == 0 {
                 Err(std::io::Error::last_os_error())
-                    .context("register the OpenWritr clipboard marker format")
+                    .context("register the HouWritr clipboard marker format")
             } else {
                 Ok(format)
             }

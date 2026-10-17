@@ -366,8 +366,8 @@ mod tests {
     #[test]
     fn markdown_groups_runon_sentences_into_paragraphs() {
         let body = "One. Two. Three. Four. Five. Six.";
-        let md = to_markdown("Talk", "Transcribed by OpenWritr", body);
-        assert!(md.starts_with("# Talk\n\n*Transcribed by OpenWritr*\n\n"));
+        let md = to_markdown("Talk", "Transcribed by HouWritr", body);
+        assert!(md.starts_with("# Talk\n\n*Transcribed by HouWritr*\n\n"));
         assert!(md.contains("One. Two. Three. Four.\n\nFive. Six.\n"));
     }
 

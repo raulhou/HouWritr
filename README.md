@@ -1,11 +1,11 @@
-# OpenWritr for Windows
+# HouWritr for Windows
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Windows 11](https://img.shields.io/badge/Windows-11_24H2-0078D4?logo=windows)](https://github.com/trsdn/openwritr-windows)
+[![Windows 11](https://img.shields.io/badge/Windows-11_24H2-0078D4?logo=windows)](https://github.com/raulhou/HouWritr)
 [![Rust](https://img.shields.io/badge/Rust-1.85-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Snapdragon X Elite](https://img.shields.io/badge/Snapdragon-X_Elite-3253DC?logo=qualcomm&logoColor=white)](https://www.qualcomm.com/products/mobile/snapdragon/pcs-and-tablets/snapdragon-x-elite)
 [![Hexagon NPU](https://img.shields.io/badge/Hexagon-NPU-FF2A00?logo=qualcomm&logoColor=white)](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)
-[![Release](https://img.shields.io/github/v/release/trsdn/openwritr-windows)](https://github.com/trsdn/openwritr-windows/releases/latest)
+[![Release](https://img.shields.io/github/v/release/raulhou/HouWritr)](https://github.com/raulhou/HouWritr/releases/latest)
 
 Push-to-talk voice-to-text for Windows. Local transcription uses **NVIDIA
 Parakeet TDT 0.6B v3** on CPU or Qualcomm Hexagon NPU, plus native
@@ -14,15 +14,14 @@ Optional LLM cleanup via **GitHub Copilot** (Claude Haiku 4.5, GPT-5 Mini,
 GPT-4.1), any OpenAI-compatible endpoint, or a **model that runs on your PC**
 (on the Snapdragon NPU via Qualcomm GenieX, or a local server such as LM Studio).
 
-**[Microsoft Store](https://apps.microsoft.com/detail/9MSQWR701P2Q)** · **[Website](https://trsdn.github.io/openwritr-windows/)** · **[Releases](https://github.com/trsdn/openwritr-windows/releases)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)** · **[macOS sibling](https://github.com/trsdn/OpenWritr)**
+**[Releases](https://github.com/raulhou/HouWritr/releases)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)**
+
+HouWritr started as a fork of [OpenWritr for Windows](https://github.com/trsdn/openwritr-windows) by trsdn (MIT licence), and is now developed separately. It adds file and meeting transcription, speaker labels, Whisper on the NPU, a local text model on the NPU through GenieX, and GitHub Copilot CLI sign-in.
 
 ## Quick start
 
-**Easiest: [get it from the Microsoft Store](https://apps.microsoft.com/detail/9MSQWR701P2Q).**
-One click, it installs the right build for your CPU automatically, keeps
-itself updated, and there's no SmartScreen warning.
-
-Prefer a direct download? Pick the build for your CPU, both per-user (no
+HouWritr is not in the Microsoft Store (the OpenWritr listing there is the
+original project's). Pick the build for your CPU, both per-user (no
 admin / UAC required):
 
 | Your machine | Build | Engine |
@@ -35,7 +34,7 @@ System → About. Everything else is x64.
 
 **Installer.** Download
 `openwritr-windows-<arch>-vX.Y.Z-setup.exe` from
-[Releases](https://github.com/trsdn/openwritr-windows/releases/latest)
+[Releases](https://github.com/raulhou/HouWritr/releases/latest)
 and run it. Sets up the Start Menu shortcut, an optional autostart-at-logon
 entry, and a proper uninstaller you'll find under Settings → Apps. You can
 turn autostart on or off any time later under Settings → Startup.
@@ -45,7 +44,7 @@ it into **any folder you like** (e.g. `C:\Tools\OpenWritr\`), then run
 `openwritr.exe`. The app finds its DLLs next to the exe — the install
 location doesn't matter. Same binaries as the installer, just no shortcuts.
 Autostart is available here too: enable "Run at startup" under Settings →
-Startup, and OpenWritr repairs the entry automatically if you later move the
+Startup, and HouWritr repairs the entry automatically if you later move the
 folder.
 
 > **Note:** user data (settings, downloaded models, logs) always lives under
@@ -109,7 +108,7 @@ Both live in the tray menu and run fully offline on the selected engine.
   loopback) into one timeline, up to 12 hours. **Pause meeting recording**
   stops capturing and releases the microphone (Windows' mic-in-use indicator
   turns off); **Resume** continues the same recording with no gap, and paused
-  time is not recorded or counted. When you stop, OpenWritr asks whether to
+  time is not recorded or counted. When you stop, HouWritr asks whether to
   **also create meeting notes** (see below). The transcript is saved to
   `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` (named after when
   the meeting *started*) and copied to the clipboard. Quitting while a
@@ -190,7 +189,7 @@ while the provider answers). Whatever is still unfinished is retried
 20 and 30 minutes later, and the saved transcript (and meeting notes, if they
 could not be generated) are updated in place when it works. The saved-file
 notice tells you what happened, for example *cleaned 21 of 25 sections;
-retrying automatically*. OpenWritr leaves a file alone if you have edited,
+retrying automatically*. HouWritr leaves a file alone if you have edited,
 moved or deleted it, and the retries stop when you quit the app (the
 transcript stays as recognised; the in-progress and saved files are never
 lost).
@@ -219,7 +218,7 @@ echo reduce accuracy, and speakers are not separated.
 The `[m:ss]` marker is the time into the recording where that person starts
 talking (paused time in a meeting is not counted).
 
-OpenWritr finds the speaker turns with two small on-device models (pyannote
+HouWritr finds the speaker turns with two small on-device models (pyannote
 segmentation 3.0 and a WeSpeaker voice-print model, about 32 MB, downloaded the
 first time you use it), then transcribes each turn separately. It runs on the
 CPU, takes roughly a minute or two per hour of audio on a recent PC, and works
@@ -249,7 +248,7 @@ rejected.
 **Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
 (Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`
 title, an italic details line (source file or meeting length), and paragraphs.
-The formatting is added by OpenWritr itself, not requested from the AI
+The formatting is added by HouWritr itself, not requested from the AI
 provider, so the cleanup integrity checks are unaffected and the same words
 are kept in both formats.
 
@@ -272,7 +271,7 @@ Tray icon → right-click → **Settings**. All fields:
 - **Output and feedback**: either paste into the active app or keep the
   transcript on the clipboard. Auto-paste is tied to the foreground top-level
   window captured when recording starts. If focus or the target process
-  changes, or another recording is active when the job completes, OpenWritr
+  changes, or another recording is active when the job completes, HouWritr
   does not inject keystrokes: it copies the final text to the clipboard and
   shows a warning. Copy-only mode always remains explicit. The overlay option
   covers both the recording waveform and typed job/status messages.
@@ -299,7 +298,7 @@ Tray icon → right-click → **Settings**. All fields:
   visible.
 - **About, credits & support** (also available directly from the tray menu):
   view the installed version and architecture,
-  official website, Microsoft Store, source, releases, issue reporting,
+  source, releases, issue reporting,
   privacy and license links, model/runtime credits, local third-party notices,
   and guidance for exporting privacy-safe diagnostics.
 
@@ -314,13 +313,13 @@ confirmation before the Settings window closes.
 Settings → Text enhancement → **Local model (on this PC)** runs cleanup and
 meeting notes on a model that never leaves your computer. Two sources:
 
-- **Built-in model (NPU)** – on a Snapdragon (Windows on ARM) PC, OpenWritr
+- **Built-in model (NPU)** – on a Snapdragon (Windows on ARM) PC, HouWritr
   uses Qualcomm's [GenieX](https://github.com/qualcomm/GenieX) to run
   `ai-hub-models/Qwen3-4B-Instruct-2507` on the Hexagon NPU. In Settings press
   **Install GenieX…** (downloads the pinned official v0.8.0 installer, checks its
   SHA-256, installs for your Windows user only, adds `geniex` to your PATH),
   then **Download model** (several GB, resumable), then **Test model**.
-  OpenWritr starts `geniex serve` on a private port (18651) when a cleanup needs
+  HouWritr starts `geniex serve` on a private port (18651) when a cleanup needs
   it, stops it after 15 idle minutes, and ties it to the app so the NPU is never
   left occupied. If the server cannot start, cleanup falls back to the raw text
   exactly like an unreachable hosted provider.
@@ -330,7 +329,7 @@ meeting notes on a model that never leaves your computer. Two sources:
   `localhost` / `127.0.0.1` / `::1` addresses are accepted here; no API key is
   needed unless the server asks for one.
 
-Local models are slower and weaker than hosted ones, so OpenWritr sends them
+Local models are slower and weaker than hosted ones, so HouWritr sends them
 smaller slices (about 1,200 characters for cleanup, 8,000 for meeting notes),
 waits 8× longer for each answer, and removes `<think>…</think>` reasoning
 blocks from replies. The same integrity checks as for hosted models apply.
@@ -484,7 +483,7 @@ recompilation via AI Hub.
 
 ## Licenses
 
-- **OpenWritr code**: MIT — see [`LICENSE`](LICENSE).
+- **HouWritr code**: MIT — see [`LICENSE`](LICENSE).
 - **Parakeet model**: CC-BY-4.0 (NVIDIA). Attribution preserved when the
   model is downloaded.
 - **Qualcomm QNN runtime DLLs** (`QnnHtp.dll`, QNN provider, V73 stub, etc.,
@@ -493,7 +492,7 @@ recompilation via AI Hub.
   `third-party-licenses/Qualcomm_LICENSE.pdf`, alongside Microsoft's
   `ThirdPartyNotices.txt` for the `onnxruntime-qnn` PyPI package the DLLs
   come from. These DLLs are redistributable as part of applications targeting
-  Qualcomm Snapdragon hardware, which is what OpenWritr does.
+  Qualcomm Snapdragon hardware, which is what HouWritr does.
 - **ONNX Runtime DLLs** (`onnxruntime.dll`, `onnxruntime_providers_qnn.dll`):
   MIT (Microsoft), bundled under their respective LICENSE files in the release
   zip.
@@ -515,7 +514,7 @@ The shipped `openwritr.exe` does not call Python at runtime.
 ## Development
 
 ```powershell
-git clone https://github.com/trsdn/openwritr-windows.git
+git clone https://github.com/raulhou/HouWritr.git
 cd openwritr-windows
 .\scripts\envup.ps1
 cargo build --release --bins
@@ -574,7 +573,7 @@ Run `cargo run --bin cleanup_eval -- --help` for the full flag list.
 ## Releases
 
 Tagged releases live at
-[github.com/trsdn/openwritr-windows/releases](https://github.com/trsdn/openwritr-windows/releases).
+[github.com/raulhou/HouWritr/releases](https://github.com/raulhou/HouWritr/releases).
 Each architecture ships a ZIP and installer generated from the same validated
 release stage. CI also builds an unsigned Store `.msixbundle` as a workflow
 artifact for Partner Center ingestion, but does not attach it to the public

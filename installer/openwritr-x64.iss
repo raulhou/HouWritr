@@ -6,17 +6,17 @@
 ; Build:
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" /Qp installer\openwritr-x64.iss
 
-#define AppName       "OpenWritr"
+#define AppName       "HouWritr"
 #ifndef AppVersion
 #define AppVersion    "0.6.1"
 #endif
-#define AppPublisher  "Torsten Mahr"
-#define AppURL        "https://github.com/trsdn/openwritr-windows"
+#define AppPublisher  "Wenxuan Hou"
+#define AppURL        "https://github.com/raulhou/HouWritr"
 #define AppExeName    "openwritr.exe"
 #define SrcDir        "..\target\stage\x64"
 
 [Setup]
-AppId={{7F3C1A92-5E84-4D17-B6A9-1C2E4F77A083}
+AppId={{C105EA40-33DF-4139-9139-02B5C5650D19}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -25,7 +25,7 @@ AppSupportURL={#AppURL}/issues
 AppUpdatesURL={#AppURL}/releases
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-DefaultDirName={localappdata}\OpenWritr\app
+DefaultDirName={localappdata}\HouWritr\app
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=auto
 ; x64 installer: runs on Intel/AMD Windows. (Also runs under x64 emulation on
