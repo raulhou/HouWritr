@@ -434,6 +434,8 @@ struct Server {
     model_loaded: bool,
     /// The model has written at normal speed since the server started.
     was_fast: bool,
+    /// Slow answers in a row from this server.
+    slow_answers: u32,
 }
 
 static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
@@ -444,6 +446,7 @@ static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
         reaper_running: false,
         model_loaded: false,
         was_fast: false,
+        slow_answers: 0,
     })
 });
 
@@ -464,6 +467,7 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
             server.child = None;
             server.model_loaded = false;
             server.was_fast = false;
+            server.slow_answers = 0;
             false
         }
         None => false,
@@ -482,6 +486,7 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
                     server.child = Some(child);
                     server.model_loaded = false;
                     server.was_fast = false;
+                    server.slow_answers = 0;
                     if !server.reaper_running {
                         server.reaper_running = true;
                         std::thread::spawn(reap_when_idle);
@@ -677,6 +682,7 @@ fn stop_locked(server: &mut Server) {
     }
     server.model_loaded = false;
     server.was_fast = false;
+    server.slow_answers = 0;
 }
 
 /// Stop the server OpenWritr started, now, so the NPU and its memory go back
@@ -725,7 +731,11 @@ pub fn note_writing_speed(tokens_per_second: f64) {
     }
     if tokens_per_second >= SLOW_WRITING_TOKENS_PER_SECOND {
         server.was_fast = true;
-    } else if restart_for_speed(tokens_per_second, server.was_fast) {
+        server.slow_answers = 0;
+        return;
+    }
+    server.slow_answers += 1;
+    if restart_for_speed(tokens_per_second, server.was_fast) {
         warn!(
             tokens_per_second,
             "the local model has become slow; restarting it"
@@ -737,6 +747,19 @@ pub fn note_writing_speed(tokens_per_second: f64) {
             "the local model writes slowly on this PC"
         );
     }
+}
+
+/// Slow answers in a row after which a long cleanup stops: at under 1 token a
+/// second a 48 minute transcript would take hours, holding the NPU and
+/// memory all that time. What is left is retried later.
+const SLOW_ANSWERS_TO_GIVE_UP: u32 = 2;
+
+/// Whether the built-in model has kept writing slowly (a long cleanup then
+/// stops instead of grinding on).
+pub fn keeps_writing_slowly() -> bool {
+    SERVER
+        .try_lock_for(Duration::from_secs(2))
+        .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
 }
 
 /// Stop the server (called when OpenWritr exits or the model is removed).

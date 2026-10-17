@@ -12,8 +12,64 @@ use crate::cleanup::{
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
 use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+/// Set when OpenWritr quits without finishing its work: requests still
+/// waiting for an answer are abandoned at once instead of holding up the exit
+/// for as long as their timeout.
+static CANCEL_REQUESTS: AtomicBool = AtomicBool::new(false);
+
+/// Abandon every cleanup or notes request in flight (OpenWritr is quitting).
+pub fn cancel_requests() {
+    CANCEL_REQUESTS.store(true, Ordering::Release);
+}
+
+/// Run `work` (a blocking HTTP exchange) on its own thread and wait for it,
+/// giving up early when [`cancel_requests`] is called. An abandoned thread
+/// ends by itself when its request does, or with the process.
+fn run_cancellable<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, &'static str> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cleanup-request".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|_| "could not start the request thread")?;
+    loop {
+        if CANCEL_REQUESTS.load(Ordering::Acquire) {
+            return Err("abandoned because OpenWritr is quitting");
+        }
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(value) => return Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the request thread stopped unexpectedly")
+            }
+        }
+    }
+}
+
+/// Whether an HTTP error status means the provider refused this request as
+/// such, so sending it again cannot help. Timeouts (408) and rate limits
+/// (429) are worth another try later.
+fn is_rejection(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 408 | 429)
+}
+
+/// The start of a provider's error message, on one line, for the log. Error
+/// bodies describe the request (model, parameters), not the transcript.
+fn error_excerpt(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut excerpt: String = flat.chars().take(300).collect();
+    if flat.chars().count() > 300 {
+        excerpt.push('…');
+    }
+    excerpt
+}
 
 pub use crate::copilot_auth::{CopilotAuthError, TokenSource};
 
@@ -423,16 +479,31 @@ fn request_content(
     // Only a hosted provider is worth a second try: a server on this machine
     // that cannot be reached will not be there two seconds later either.
     let retry = if local { None } else { request.try_clone() };
-    let mut result = request.send();
-    if let Some(again) = retry {
-        if result.as_ref().is_err_and(|error| error.is_connect()) {
-            warn!("could not connect to the cleanup provider; trying once more");
-            std::thread::sleep(CONNECT_RETRY_PAUSE);
-            result = again.send();
+    let exchange = move || -> reqwest::Result<(reqwest::StatusCode, String)> {
+        let mut result = request.send();
+        if let Some(again) = retry {
+            if result.as_ref().is_err_and(|error| error.is_connect()) {
+                warn!("could not connect to the cleanup provider; trying once more");
+                std::thread::sleep(CONNECT_RETRY_PAUSE);
+                result = again.send();
+            }
         }
-    }
-    let response = match result {
-        Ok(response) => response,
+        let response = result?;
+        let status = response.status();
+        Ok((status, response.text()?))
+    };
+    let result = match run_cancellable(exchange) {
+        Ok(result) => result,
+        Err(why) => {
+            info!(waited = ?sent.elapsed(), "cleanup request {why}");
+            if managed {
+                crate::local_llm::release("the cleanup request was abandoned");
+            }
+            return Err(FallbackReason::RequestFailed);
+        }
+    };
+    let (status, body) = match result {
+        Ok(answer) => answer,
         Err(error) if error.is_timeout() => {
             warn!(
                 waited = ?sent.elapsed(),
@@ -441,8 +512,7 @@ fn request_content(
             );
             if managed {
                 // The server keeps writing the reply nobody waits for, and
-                // every later request queues behind it. A fresh server also
-                // leaves the slow state the timeout most likely came from.
+                // every later request would queue behind it.
                 crate::local_llm::release("the local model did not answer in time");
             }
             return Err(FallbackReason::RequestFailed);
@@ -457,11 +527,19 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
-    if !response.status().is_success() {
-        warn!(status = %response.status(), "cleanup provider returned an error");
-        return Err(FallbackReason::RequestFailed);
+    if !status.is_success() {
+        warn!(
+            status = %status,
+            detail = %error_excerpt(&body),
+            "cleanup provider returned an error"
+        );
+        return Err(if is_rejection(status) {
+            FallbackReason::ProviderRejected(status.as_u16())
+        } else {
+            FallbackReason::RequestFailed
+        });
     }
-    let value: serde_json::Value = match response.json() {
+    let value: serde_json::Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "cleanup provider response was not valid JSON");
@@ -589,12 +667,22 @@ pub fn enhance_long_form(
     interrupted: impl Fn() -> bool,
     progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
-    let slices = split_for_cleanup(text, cleanup_slice_chars(settings, text));
+    let slice_chars = cleanup_slice_chars(settings, text);
+    let slices = split_for_cleanup(text, slice_chars);
     let joins = joins_between(text, &slices);
+    info!(
+        provider = %settings.enhance.provider,
+        model = %settings.enhance.model,
+        slices = slices.len(),
+        slice_chars,
+        "long-form cleanup started"
+    );
+    let managed = uses_managed_model(settings);
     clean_slices(
         slices,
         &joins,
         |slice| enhance_outcome(slice, settings, || !interrupted()),
+        &|| managed && crate::local_llm::keeps_writing_slowly(),
         &interrupted,
         progress,
     )
@@ -665,6 +753,7 @@ fn clean_slices(
     slices: Vec<&str>,
     joins: &[&str],
     mut clean: impl FnMut(&str) -> Option<EnhanceOutcome>,
+    give_up: &dyn Fn() -> bool,
     interrupted: &dyn Fn() -> bool,
     mut progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
@@ -678,6 +767,9 @@ fn clean_slices(
     let mut first_failure: Option<FallbackReason> = None;
     let mut in_a_row = 0usize;
     let mut tripped = false;
+    // The provider refused the request: the rest would be refused too, and a
+    // later retry as well, so they are not marked for one.
+    let mut rejected = false;
 
     for (index, slice) in slices.into_iter().enumerate() {
         if interrupted() {
@@ -688,7 +780,9 @@ fn clean_slices(
         }
         if tripped {
             joined.push_str(slice);
-            report.unreachable += 1;
+            if !rejected {
+                report.unreachable += 1;
+            }
             progress(index + 1, total);
             continue;
         }
@@ -710,6 +804,10 @@ fn clean_slices(
                             "cleanup provider unreachable or too slow; skipping the remaining slices"
                         );
                     }
+                } else if matches!(reason, FallbackReason::ProviderRejected(_)) {
+                    tripped = true;
+                    rejected = true;
+                    warn!("cleanup provider rejected the request; the remaining slices keep their raw text");
                 } else {
                     in_a_row = 0;
                 }
@@ -719,6 +817,10 @@ fn clean_slices(
         }
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
+        if !tripped && index + 1 < total && give_up() {
+            tripped = true;
+            warn!("cleanup is too slow to finish; the remaining slices are left for later");
+        }
     }
 
     let failed = report.total - report.cleaned;
@@ -877,6 +979,7 @@ fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
         FallbackReason::InvalidEndpoint => "invalid OpenAI-compatible endpoint",
         FallbackReason::EmptyModelId => "enhancement model ID is empty",
         FallbackReason::RequestFailed => "enhancement provider request failed",
+        FallbackReason::ProviderRejected(_) => "enhancement provider rejected the request",
         FallbackReason::ResponseUnparseable => "enhancement provider response was invalid",
         FallbackReason::EmptyCandidate => "enhancement returned an empty candidate",
         FallbackReason::IntegrityRejected(_) => "enhancement failed integrity validation",
@@ -1259,8 +1362,15 @@ mod long_form_tests {
 
     #[test]
     fn a_clean_run_reports_everything_cleaned() {
-        let result =
-            clean_slices(slices(3), &[], |_| enhanced("Clean."), &|| false, |_, _| {}).unwrap();
+        let result = clean_slices(
+            slices(3),
+            &[],
+            |_| enhanced("Clean."),
+            &|| false,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(
             result.report,
             CleanupReport {
@@ -1288,6 +1398,7 @@ mod long_form_tests {
                 }
             },
             &|| false,
+            &|| false,
             |_, _| {},
         )
         .unwrap();
@@ -1296,6 +1407,71 @@ mod long_form_tests {
         assert_eq!(result.report.unreachable, 3);
         assert!(result.report.needs_retry());
         assert!(result.outcome.is_enhanced());
+    }
+
+    #[test]
+    fn a_rejected_request_stops_without_scheduling_a_retry() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(5),
+            &[],
+            |_| {
+                calls += 1;
+                failed(FallbackReason::ProviderRejected(400))
+            },
+            &|| false,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1, "the same request would be refused again");
+        assert_eq!(result.report.cleaned, 0);
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
+        assert!(matches!(
+            result.outcome,
+            EnhanceOutcome::RawFallback {
+                reason: FallbackReason::ProviderRejected(400),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_model_that_keeps_writing_slowly_leaves_the_rest_for_later() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(6),
+            &[],
+            |_| {
+                calls += 1;
+                enhanced("Clean.")
+            },
+            &|| true,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.report.cleaned, 1);
+        assert_eq!(result.report.unreachable, 5);
+        assert!(result.report.needs_retry());
+    }
+
+    #[test]
+    fn client_errors_are_rejections_but_timeouts_and_rate_limits_are_not() {
+        use reqwest::StatusCode;
+        assert!(is_rejection(StatusCode::BAD_REQUEST));
+        assert!(is_rejection(StatusCode::UNAUTHORIZED));
+        assert!(is_rejection(StatusCode::NOT_FOUND));
+        assert!(!is_rejection(StatusCode::REQUEST_TIMEOUT));
+        assert!(!is_rejection(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_rejection(StatusCode::BAD_GATEWAY));
+        assert_eq!(
+            error_excerpt("{\n  \"error\": \"model not supported\"\n}"),
+            "{ \"error\": \"model not supported\" }"
+        );
+        assert!(error_excerpt(&"x".repeat(400)).ends_with('…'));
     }
 
     #[test]
@@ -1308,6 +1484,7 @@ mod long_form_tests {
                 calls += 1;
                 failed(FallbackReason::RequestFailed)
             },
+            &|| false,
             &|| false,
             |_, _| {},
         )
@@ -1342,6 +1519,7 @@ mod long_form_tests {
                 failed(FallbackReason::IntegrityRejected(Vec::new()))
             },
             &|| false,
+            &|| false,
             |_, _| {},
         )
         .unwrap();
@@ -1352,7 +1530,15 @@ mod long_form_tests {
 
     #[test]
     fn interruption_returns_nothing() {
-        assert!(clean_slices(slices(3), &[], |_| enhanced("x"), &|| true, |_, _| {}).is_none());
+        assert!(clean_slices(
+            slices(3),
+            &[],
+            |_| enhanced("x"),
+            &|| false,
+            &|| true,
+            |_, _| {}
+        )
+        .is_none());
     }
 
     #[test]
