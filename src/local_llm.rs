@@ -253,9 +253,32 @@ pub fn model_installed(cli: &Path, model: &str) -> Result<bool> {
     Ok(lists_model(&String::from_utf8_lossy(&output.stdout), model))
 }
 
+/// Whether `listing` (`geniex list --format json`) contains `model`.
+///
+/// GenieX stores `ai-hub-models/<name>` under its canonical `qualcomm/<name>`,
+/// so names are compared by their last path segment, ignoring case and any
+/// `:precision` suffix.
 fn lists_model(listing: &str, model: &str) -> bool {
-    let wanted = model.trim().to_ascii_lowercase();
-    !wanted.is_empty() && listing.to_ascii_lowercase().contains(&wanted)
+    fn repo(name: &str) -> String {
+        let name = name.split(':').next().unwrap_or(name);
+        name.rsplit('/')
+            .next()
+            .unwrap_or(name)
+            .trim()
+            .to_ascii_lowercase()
+    }
+    let wanted = repo(model);
+    if wanted.is_empty() {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(listing) {
+        Ok(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|name| name.as_str()))
+            .any(|name| repo(name) == wanted),
+        // Unexpected output: fall back to a plain search for the bare name.
+        _ => listing.to_ascii_lowercase().contains(&wanted),
+    }
 }
 
 /// Download `model` with `geniex pull`. `progress` gets a percentage when the
@@ -725,13 +748,21 @@ mod tests {
     }
 
     #[test]
-    fn model_listing_match_is_case_insensitive_and_non_empty() {
-        let listing = r#"[{"name":"ai-hub-models/Qwen3-4B-Instruct-2507","size":123}]"#;
+    fn model_listing_matches_the_canonical_name_geniex_stores() {
+        let listing =
+            r#"[{"name":"qualcomm/Qwen3-4B-Instruct-2507","size":123,"precisions":["N/A"]}]"#;
         assert!(lists_model(listing, DEFAULT_MODEL));
         assert!(lists_model(listing, "AI-HUB-MODELS/qwen3-4b-instruct-2507"));
+        assert!(lists_model(listing, "qualcomm/Qwen3-4B-Instruct-2507:int4"));
         assert!(!lists_model(listing, "ai-hub-models/Other"));
+        assert!(!lists_model(listing, "ai-hub-models/Qwen3-4B"));
         assert!(!lists_model(listing, "  "));
         assert!(!lists_model("[]", DEFAULT_MODEL));
+        // Not JSON: plain search for the bare name.
+        assert!(lists_model(
+            "qualcomm/Qwen3-4B-Instruct-2507  2.3 GiB",
+            DEFAULT_MODEL
+        ));
     }
 
     #[test]
