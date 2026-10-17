@@ -157,6 +157,9 @@ struct Repair {
 const REPAIR_BACKOFF_SECONDS: [u64; 5] = [120, 300, 600, 1_200, 1_800];
 /// Pause between steps of one productive round.
 const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
+/// How often the main loop looks for a changed settings file (the hotkey
+/// thread uses the same interval).
+const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long to wait before the next round after `failed_rounds` fruitless
 /// ones, or `None` to give up.
@@ -193,9 +196,11 @@ fn render_notes(title: &str, details: &str, transcript_name: &str, notes: &str) 
     )
 }
 
+/// Overwrite a transcript or notes file the user already has. Atomic, so a
+/// crash in the middle never leaves it empty or half written.
 fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-    std::fs::write(path, content)
+    crate::settings::atomic_write_bytes(path, content.as_bytes())
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// "cleaned 21 of 25 sections" when some of the text is still as recognised.
@@ -446,6 +451,9 @@ struct State {
     hk_stop: Arc<AtomicBool>,
     delivery_interlock: Arc<paste::DeliveryInterlock>,
     settings_revision: Option<SettingsRevision>,
+    /// When the settings file was last checked for changes (see
+    /// [`SETTINGS_CHECK_INTERVAL`]).
+    settings_checked_at: Instant,
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
     meeting: Option<MeetingRecorder>,
@@ -568,6 +576,7 @@ pub fn run() -> Result<()> {
         hk_stop,
         delivery_interlock,
         settings_revision,
+        settings_checked_at: Instant::now(),
         proxy,
         diagnostics_exporting: false,
         meeting: None,
@@ -1238,7 +1247,11 @@ impl AppHandler {
 
         // Settings hot-reload compares content revisions so deletion is a
         // first-class change and both loops return to the same defaults.
-        {
+        // Reading and hashing the file on every pass of the loop (at least 10
+        // times a second, and on every event) cost disk reads and virus scans
+        // all day; twice a second is as prompt as anyone notices.
+        if self.state.settings_checked_at.elapsed() >= SETTINGS_CHECK_INTERVAL {
+            self.state.settings_checked_at = Instant::now();
             match Settings::revision() {
                 Ok(revision) if self.state.settings_revision.as_ref() != Some(&revision) => {
                     match Settings::load_runtime() {
@@ -2323,6 +2336,33 @@ impl AppHandler {
         }
     }
 
+    /// The provider refused a background retry outright (an unsupported
+    /// model, a rejected key...): trying again later would only be refused
+    /// again, and the transcript must not be reported as cleaned.
+    fn stop_rejected_repair(&mut self, job_id: u64, status: u16) {
+        let Some((repair_id, _)) = self.state.repair_jobs.remove(&job_id) else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .repairs
+            .iter()
+            .position(|repair| repair.id == repair_id)
+        else {
+            return;
+        };
+        let repair = self.state.repairs.remove(index);
+        warn!(
+            file = %repair.output.display(),
+            status,
+            "background cleanup stopped: the provider rejected the request"
+        );
+        self.show_job_warning(&format!(
+            "Stopped cleaning up {}: the provider rejected the request (HTTP {status}, see the log)",
+            repair.name
+        ));
+    }
+
     /// A background retry did not run to completion.
     fn abort_repair_step(&mut self, job_id: u64) {
         let Some((repair_id, _)) = self.state.repair_jobs.remove(&job_id) else {
@@ -2389,9 +2429,14 @@ impl AppHandler {
                 text,
                 cleanup,
                 notes,
+                enhancement_warning,
                 ..
             } if self.state.repair_jobs.contains_key(&id) => {
-                self.finish_repair_step(id, text, notes, cleanup);
+                if let Some(FallbackReason::ProviderRejected(status)) = enhancement_warning {
+                    self.stop_rejected_repair(id, status);
+                } else {
+                    self.finish_repair_step(id, text, notes, cleanup);
+                }
             }
             WorkerEvent::JobFailed { id, .. } | WorkerEvent::JobDiscarded { id }
                 if self.state.repair_jobs.contains_key(&id) =>

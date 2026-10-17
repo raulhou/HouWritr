@@ -864,6 +864,12 @@ fn atomic_write_json(path: &Path, document: &Value) -> Result<(), SettingsError>
     atomic_write_bytes_with(path, &bytes, replace_file)
 }
 
+/// Write `bytes` to `path` through a temporary file, so a crash or power cut
+/// leaves either the old file or the new one, never a half written one.
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), SettingsError> {
+    atomic_write_bytes_with(path, bytes, replace_file)
+}
+
 fn atomic_write_bytes_with<F>(path: &Path, bytes: &[u8], replace: F) -> Result<(), SettingsError>
 where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
