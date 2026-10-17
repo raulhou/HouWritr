@@ -53,6 +53,149 @@ fn run_cancellable<T: Send + 'static>(
     }
 }
 
+/// Send a request on its own thread (see [`run_cancellable`]) and read the
+/// whole answer. With `retry_connect`, a connection that could not be opened
+/// is tried once more after [`CONNECT_RETRY_PAUSE`].
+fn send_cancellable(
+    request: reqwest::blocking::RequestBuilder,
+    retry_connect: bool,
+) -> std::result::Result<reqwest::Result<(reqwest::StatusCode, String)>, &'static str> {
+    let retry = if retry_connect {
+        request.try_clone()
+    } else {
+        None
+    };
+    run_cancellable(move || {
+        let mut result = request.send();
+        if let Some(again) = retry {
+            if result.as_ref().is_err_and(|error| error.is_connect()) {
+                warn!("could not connect to the cleanup provider; trying once more");
+                std::thread::sleep(CONNECT_RETRY_PAUSE);
+                result = again.send();
+            }
+        }
+        let response = result?;
+        let status = response.status();
+        Ok((status, response.text()?))
+    })
+}
+
+/// Models GitHub Copilot lists for this account: the chat models it offers
+/// and has not switched off by policy.
+const COPILOT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
+
+/// A configured Copilot model this account was refused, and the model used
+/// in its place for the rest of this run.
+static COPILOT_SUBSTITUTE: parking_lot::Mutex<Option<(String, String)>> =
+    parking_lot::Mutex::new(None);
+
+/// The model to send instead of `configured`, if it was refused earlier.
+fn copilot_model_in_use(configured: &str) -> Option<String> {
+    COPILOT_SUBSTITUTE
+        .lock()
+        .as_ref()
+        .filter(|(refused, _)| refused == configured)
+        .map(|(_, substitute)| substitute.clone())
+}
+
+/// Ask Copilot which models this account may use, pick the closest to
+/// `wanted` and remember it. `None` when the list cannot be read or offers
+/// nothing.
+fn copilot_substitute(wanted: &str, token: &str) -> Option<String> {
+    let token = token.to_string();
+    let listing = run_cancellable(move || -> reqwest::Result<serde_json::Value> {
+        let mut request = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?
+            .get(COPILOT_MODELS_URL)
+            .bearer_auth(token);
+        for &(name, value) in EnhanceProvider::GithubCopilot.request_headers() {
+            request = request.header(name, value);
+        }
+        request.send()?.error_for_status()?.json()
+    });
+    let listing = match listing {
+        Ok(Ok(listing)) => listing,
+        Ok(Err(error)) => {
+            warn!(error = %error, "could not list the GitHub Copilot models");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    let available = copilot_chat_models(&listing);
+    let substitute = pick_copilot_model(wanted, &available);
+    warn!(
+        refused = wanted,
+        using = substitute.as_deref().unwrap_or("none"),
+        available = ?available,
+        "GitHub Copilot does not offer this model to this account"
+    );
+    let substitute = substitute?;
+    *COPILOT_SUBSTITUTE.lock() = Some((wanted.to_string(), substitute.clone()));
+    Some(substitute)
+}
+
+/// Chat model IDs in a Copilot `/models` listing, leaving out models whose
+/// policy is not enabled.
+fn copilot_chat_models(listing: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = listing
+        .get("data")
+        .and_then(|data| data.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|model| {
+            model
+                .pointer("/capabilities/type")
+                .and_then(|kind| kind.as_str())
+                .map_or(true, |kind| kind == "chat")
+        })
+        .filter(|model| {
+            model
+                .pointer("/policy/state")
+                .and_then(|state| state.as_str())
+                .map_or(true, |state| state == "enabled")
+        })
+        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+        .map(str::to_string)
+        .collect();
+    ids.dedup();
+    ids
+}
+
+/// Fast, inexpensive models that do cleanup well, best first.
+const COPILOT_PREFERRED: [&str; 6] = [
+    "gpt-5-mini",
+    "gpt-4.1",
+    "gpt-4o-mini",
+    "gpt-4o",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+];
+
+/// The model to use instead of `wanted`: one of the same Claude tier if
+/// offered (another Haiku for a Haiku), else the first preferred model on
+/// offer, else whatever is offered first.
+fn pick_copilot_model(wanted: &str, available: &[String]) -> Option<String> {
+    let wanted_lower = wanted.to_ascii_lowercase();
+    let same_tier = ["haiku", "sonnet", "opus"]
+        .into_iter()
+        .filter(|tier| wanted_lower.contains(tier))
+        .find_map(|tier| {
+            available
+                .iter()
+                .find(|id| id.to_ascii_lowercase().contains(tier))
+        });
+    same_tier
+        .or_else(|| {
+            COPILOT_PREFERRED
+                .iter()
+                .find_map(|preferred| available.iter().find(|id| id.as_str() == *preferred))
+        })
+        .or_else(|| available.first())
+        .filter(|id| id.as_str() != wanted)
+        .cloned()
+}
+
 /// Whether an HTTP error status means the provider refused this request as
 /// such, so sending it again cannot help. Timeouts (408) and rate limits
 /// (429) are worth another try later.
@@ -451,14 +594,6 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
-    let mut request = client.post(&prepared.url).json(&prepared.body);
-    if let Some(token) = &token {
-        request = request.bearer_auth(token);
-    }
-    for &(name, value) in provider.request_headers() {
-        request = request.header(name, value);
-    }
-
     // Race hardening: as late as possible — after the just-in-time credential
     // read and immediately before send — confirm the current runtime provider
     // and canonical endpoint still match this job's frozen target. Otherwise a
@@ -474,25 +609,31 @@ fn request_content(
         return Err(reason);
     }
 
+    let copilot = provider == EnhanceProvider::GithubCopilot;
+    let mut body = prepared.body.clone();
+    if copilot {
+        if let Some(model) = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .and_then(copilot_model_in_use)
+        {
+            body["model"] = serde_json::json!(model);
+        }
+    }
+    let build = |body: &serde_json::Value| {
+        let mut request = client.post(&prepared.url).json(body);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        for &(name, value) in provider.request_headers() {
+            request = request.header(name, value);
+        }
+        request
+    };
+
     let managed = is_managed_target(&prepared.target);
     let sent = Instant::now();
-    // Only a hosted provider is worth a second try: a server on this machine
-    // that cannot be reached will not be there two seconds later either.
-    let retry = if local { None } else { request.try_clone() };
-    let exchange = move || -> reqwest::Result<(reqwest::StatusCode, String)> {
-        let mut result = request.send();
-        if let Some(again) = retry {
-            if result.as_ref().is_err_and(|error| error.is_connect()) {
-                warn!("could not connect to the cleanup provider; trying once more");
-                std::thread::sleep(CONNECT_RETRY_PAUSE);
-                result = again.send();
-            }
-        }
-        let response = result?;
-        let status = response.status();
-        Ok((status, response.text()?))
-    };
-    let result = match run_cancellable(exchange) {
+    let mut result = match send_cancellable(build(&body), !local) {
         Ok(result) => result,
         Err(why) => {
             info!(waited = ?sent.elapsed(), "cleanup request {why}");
@@ -502,6 +643,32 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
+    // Copilot offers each account only some models. When the chosen one is
+    // refused, ask which are offered, switch to the closest and try again.
+    if copilot {
+        let refused = matches!(&result, Ok((status, text))
+            if status.as_u16() == 400 && text.contains("model_not_supported"));
+        let wanted = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if refused {
+            if let Some(substitute) = token
+                .as_deref()
+                .and_then(|token| copilot_substitute(&wanted, token))
+            {
+                body["model"] = serde_json::json!(substitute);
+                result = match send_cancellable(build(&body), true) {
+                    Ok(result) => result,
+                    Err(why) => {
+                        info!(waited = ?sent.elapsed(), "cleanup request {why}");
+                        return Err(FallbackReason::RequestFailed);
+                    }
+                };
+            }
+        }
+    }
     let (status, body) = match result {
         Ok(answer) => answer,
         Err(error) if error.is_timeout() => {
@@ -1456,6 +1623,37 @@ mod long_form_tests {
         assert_eq!(result.report.cleaned, 1);
         assert_eq!(result.report.unreachable, 5);
         assert!(result.report.needs_retry());
+    }
+
+    #[test]
+    fn a_refused_copilot_model_is_replaced_by_the_closest_on_offer() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        // Another model of the same Claude tier first.
+        assert_eq!(
+            pick_copilot_model("claude-haiku-4.5", &ids(&["gpt-4.1", "claude-3.5-haiku"])),
+            Some("claude-3.5-haiku".into())
+        );
+        // Otherwise the first preferred model on offer, not just the first listed.
+        assert_eq!(
+            pick_copilot_model("claude-haiku-4.5", &ids(&["o3", "gpt-4.1", "gpt-5-mini"])),
+            Some("gpt-5-mini".into())
+        );
+        assert_eq!(pick_copilot_model("x", &ids(&["o3"])), Some("o3".into()));
+        // Never the refused model itself, and nothing from an empty list.
+        assert_eq!(pick_copilot_model("gpt-4.1", &ids(&["gpt-4.1"])), None);
+        assert_eq!(pick_copilot_model("gpt-4.1", &[]), None);
+    }
+
+    #[test]
+    fn copilot_listing_keeps_enabled_chat_models() {
+        let listing = serde_json::json!({"data": [
+            {"id": "gpt-5-mini", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}},
+            {"id": "claude-haiku-4.5", "capabilities": {"type": "chat"}, "policy": {"state": "disabled"}},
+            {"id": "text-embedding-3-small", "capabilities": {"type": "embeddings"}},
+            {"id": "gpt-4.1", "capabilities": {"type": "chat"}}
+        ]});
+        assert_eq!(copilot_chat_models(&listing), ["gpt-5-mini", "gpt-4.1"]);
+        assert!(copilot_chat_models(&serde_json::json!({})).is_empty());
     }
 
     #[test]
