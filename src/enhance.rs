@@ -558,12 +558,55 @@ pub fn enhance_long_form(
     interrupted: impl Fn() -> bool,
     progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
+    let slices = split_for_cleanup(text, cleanup_slice_chars(settings, text));
+    let joins = joins_between(text, &slices);
     clean_slices(
-        split_for_cleanup(text, cleanup_slice_chars(settings, text)),
+        slices,
+        &joins,
         |slice| enhance_outcome(slice, settings, || !interrupted()),
         &interrupted,
         progress,
     )
+}
+
+/// What to put back between each slice and the one before it: the kind of
+/// gap the text had there. A cut between speaker blocks gets the blank line
+/// back; a cut inside a block gets a space, a line break or nothing (Chinese
+/// has no spaces), so the number of blocks stays the same. The `[m:ss]`
+/// markers are put back block by block, and a single extra blank line used
+/// to make every marker in the transcript disappear.
+///
+/// `slices` must be parts of `text`, as [`split_for_cleanup`] returns them.
+fn joins_between(text: &str, slices: &[&str]) -> Vec<&'static str> {
+    // Byte offset of a slice inside `text` (None if it is not part of it).
+    let offset = |slice: &str| (slice.as_ptr() as usize).checked_sub(text.as_ptr() as usize);
+    slices
+        .windows(2)
+        .map(|pair| {
+            let gap = offset(pair[0])
+                .zip(offset(pair[1]))
+                .and_then(|(first, second)| text.get(first + pair[0].len()..second));
+            match gap {
+                None => "\n\n",
+                Some(gap) if gap.contains("\n\n") => "\n\n",
+                Some(gap) if gap.contains('\n') => "\n",
+                Some("") => "",
+                Some(_) => " ",
+            }
+        })
+        .collect()
+}
+
+/// `slices` joined with the gaps from [`joins_between`].
+fn join_slices<'a>(slices: impl IntoIterator<Item = &'a str>, joins: &[&str]) -> String {
+    let mut joined = String::new();
+    for (index, slice) in slices.into_iter().enumerate() {
+        if index > 0 {
+            joined.push_str(joins.get(index - 1).copied().unwrap_or("\n\n"));
+        }
+        joined.push_str(slice);
+    }
+    joined
 }
 
 /// What cleanup would report if it were skipped outright (the provider was
@@ -571,18 +614,25 @@ pub fn enhance_long_form(
 /// slice is marked for a later retry.
 pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
     let slices = split_for_cleanup(text, cleanup_slice_chars(settings, text));
+    let joins = joins_between(text, &slices);
     LongFormCleanup {
         report: CleanupReport {
             total: slices.len(),
             cleaned: 0,
             unreachable: slices.len(),
         },
-        outcome: EnhanceOutcome::raw_fallback(slices.join("\n\n"), FallbackReason::RequestFailed),
+        outcome: EnhanceOutcome::raw_fallback(
+            join_slices(slices.iter().copied(), &joins),
+            FallbackReason::RequestFailed,
+        ),
     }
 }
 
+/// `joins[i]` goes between slice `i` and slice `i + 1` (a blank line when
+/// missing).
 fn clean_slices(
     slices: Vec<&str>,
+    joins: &[&str],
     mut clean: impl FnMut(&str) -> Option<EnhanceOutcome>,
     interrupted: &dyn Fn() -> bool,
     mut progress: impl FnMut(usize, usize),
@@ -602,8 +652,8 @@ fn clean_slices(
         if interrupted() {
             return None;
         }
-        if !joined.is_empty() {
-            joined.push_str("\n\n");
+        if index > 0 {
+            joined.push_str(joins.get(index - 1).copied().unwrap_or("\n\n"));
         }
         if tripped {
             joined.push_str(slice);
@@ -1028,6 +1078,57 @@ mod long_form_tests {
     }
 
     #[test]
+    fn rejoined_slices_keep_every_block_and_gap_of_the_text() {
+        // A speaker block far longer than one slice, as in a long Chinese
+        // turn: cutting it used to add blank lines, so the block count no
+        // longer matched the `[m:ss]` markers and every marker was dropped.
+        let chinese = "第一句话说得很长很长。".repeat(60);
+        let english = "Another sentence here. ".repeat(40);
+        let text = format!(
+            "Speaker 1: {chinese}\n\nSpeaker 2: 好的。\n\nSpeaker 1: {}",
+            english.trim_end()
+        );
+        for max_chars in [50, 200, 600, 3_000] {
+            let slices = split_for_cleanup(&text, max_chars);
+            let joins = joins_between(&text, &slices);
+            assert_eq!(joins.len(), slices.len().saturating_sub(1));
+            assert_eq!(
+                join_slices(slices.iter().copied(), &joins),
+                text,
+                "slices of {max_chars} characters"
+            );
+        }
+    }
+
+    #[test]
+    fn joins_follow_the_gap_in_the_text() {
+        let text = "One. Two.\nThree.\n\nFour.五。六。";
+        let part = |wanted: &str| -> &'static str {
+            let at = text.find(wanted).unwrap();
+            &text[at..at + wanted.len()]
+        };
+        let slices: Vec<&str> = ["One.", "Two.", "Three.", "Four.", "五。", "六。"]
+            .into_iter()
+            .map(part)
+            .collect();
+        assert_eq!(joins_between(text, &slices), [" ", "\n", "\n\n", "", ""]);
+        // A missing join falls back to a blank line.
+        assert_eq!(join_slices(["a", "b"], &[]), "a\n\nb");
+    }
+
+    #[test]
+    fn a_skipped_cleanup_returns_the_text_unchanged() {
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        let text = format!(
+            "Speaker 1: {}\n\nSpeaker 2: 好。",
+            "很长的一句话。".repeat(80)
+        );
+        let skipped = skipped_cleanup(&text, &managed);
+        assert!(skipped.report.total > 1, "the long block is cut");
+        assert_eq!(skipped.outcome.text(), text);
+    }
+
+    #[test]
     fn writing_speed_is_read_from_the_server_timings() {
         // Timings as GenieX returned them before and after the slowdown.
         let fast = serde_json::json!({"timings": {
@@ -1117,7 +1218,8 @@ mod long_form_tests {
 
     #[test]
     fn a_clean_run_reports_everything_cleaned() {
-        let result = clean_slices(slices(3), |_| enhanced("Clean."), &|| false, |_, _| {}).unwrap();
+        let result =
+            clean_slices(slices(3), &[], |_| enhanced("Clean."), &|| false, |_, _| {}).unwrap();
         assert_eq!(
             result.report,
             CleanupReport {
@@ -1135,6 +1237,7 @@ mod long_form_tests {
         let mut call = 0;
         let result = clean_slices(
             slices(6),
+            &[],
             |_| {
                 call += 1;
                 if call % 2 == 0 {
@@ -1159,6 +1262,7 @@ mod long_form_tests {
         let mut calls = 0;
         let result = clean_slices(
             slices(10),
+            &[],
             |_| {
                 calls += 1;
                 failed(FallbackReason::RequestFailed)
@@ -1191,6 +1295,7 @@ mod long_form_tests {
         let mut calls = 0;
         let result = clean_slices(
             slices(5),
+            &[],
             |_| {
                 calls += 1;
                 failed(FallbackReason::IntegrityRejected(Vec::new()))
@@ -1206,7 +1311,7 @@ mod long_form_tests {
 
     #[test]
     fn interruption_returns_nothing() {
-        assert!(clean_slices(slices(3), |_| enhanced("x"), &|| true, |_, _| {}).is_none());
+        assert!(clean_slices(slices(3), &[], |_| enhanced("x"), &|| true, |_, _| {}).is_none());
     }
 
     #[test]
