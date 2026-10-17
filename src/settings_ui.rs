@@ -582,7 +582,7 @@ impl SettingsApp {
                 "github_copilot" => match self.copilot_readiness.as_ref() {
                     Some(CopilotReadiness::Ready) => {}
                     Some(CopilotReadiness::CliMissing) => {
-                        return Some("GitHub CLI is not installed or is not on PATH.".into())
+                        return Some("GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.".into())
                     }
                     Some(CopilotReadiness::NotAuthenticated) => {
                         return Some(
@@ -1366,7 +1366,7 @@ impl SettingsApp {
                 }
                 Some(CopilotReadiness::CliMissing) => status_label(
                     ui,
-                    "GitHub CLI is not installed or is not on PATH.",
+                    "GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.",
                     error_color(),
                 ),
                 Some(CopilotReadiness::NotAuthenticated) => status_label(

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CopilotAuthError {
-    #[error("GitHub CLI is not installed or is not available on PATH")]
+    #[error("GitHub CLI (gh) was not found. Install it with `winget install GitHub.cli`, then run `gh auth login`")]
     CliMissing,
     #[error("GitHub CLI is not authenticated; run `gh auth login`")]
     NotAuthenticated,
@@ -750,6 +750,57 @@ fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
     }
 }
 
+/// Places `gh.exe` can be, in the order to look: the PATH this process
+/// started with, then the usual install folders. A program started before
+/// `gh` was installed (or by Windows at sign-in) does not see the new PATH
+/// entry, so the installer's own folders are checked too.
+fn gh_candidates(
+    path_var: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::path::Path>,
+    program_files: &[std::path::PathBuf],
+    user_profile: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = path_var {
+        out.extend(std::env::split_paths(path).map(|dir| dir.join("gh.exe")));
+    }
+    for dir in program_files {
+        out.push(dir.join("GitHub CLI").join("gh.exe"));
+    }
+    if let Some(dir) = local_app_data {
+        out.push(dir.join("Programs").join("GitHub CLI").join("gh.exe"));
+        out.push(
+            dir.join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("gh.exe"),
+        );
+    }
+    if let Some(dir) = user_profile {
+        out.push(dir.join("scoop").join("shims").join("gh.exe"));
+    }
+    out
+}
+
+/// The GitHub CLI to run: the first existing candidate, else plain `gh`.
+fn locate_gh() -> std::path::PathBuf {
+    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+    let program_files: Vec<_> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|name| var(name))
+        .collect();
+    let path = std::env::var_os("PATH");
+    gh_candidates(
+        path.as_deref(),
+        var("LOCALAPPDATA").as_deref(),
+        &program_files,
+        var("USERPROFILE").as_deref(),
+    )
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+    .unwrap_or_else(|| "gh".into())
+}
+
 fn gh_token() -> std::result::Result<String, CopilotAuthError> {
     // Cache the token for 10 minutes so we don't spawn `gh` on every call.
     static CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
@@ -763,7 +814,7 @@ fn gh_token() -> std::result::Result<String, CopilotAuthError> {
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("gh")
+    let out = std::process::Command::new(locate_gh())
         .args(["auth", "token"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -912,6 +963,37 @@ mod long_form_tests {
         settings.enhance.base_url = base_url.into();
         settings.enhance.model = "some-model".into();
         settings
+    }
+
+    #[test]
+    fn gh_is_searched_on_path_then_in_the_usual_install_folders() {
+        use std::path::{Path, PathBuf};
+        let path = std::env::join_paths(["tools", "bin"]).unwrap();
+        let found = gh_candidates(
+            Some(&path),
+            Some(Path::new("local")),
+            &[PathBuf::from("programs")],
+            Some(Path::new("home")),
+        );
+        assert_eq!(
+            found,
+            [
+                Path::new("tools").join("gh.exe"),
+                Path::new("bin").join("gh.exe"),
+                Path::new("programs").join("GitHub CLI").join("gh.exe"),
+                Path::new("local")
+                    .join("Programs")
+                    .join("GitHub CLI")
+                    .join("gh.exe"),
+                Path::new("local")
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("gh.exe"),
+                Path::new("home").join("scoop").join("shims").join("gh.exe"),
+            ]
+        );
+        assert!(gh_candidates(None, None, &[], None).is_empty());
     }
 
     #[test]
