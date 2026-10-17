@@ -47,6 +47,19 @@ enum JobKind {
     Discover,
 }
 
+impl JobKind {
+    fn name(self) -> &'static str {
+        match self {
+            JobKind::Check => "check",
+            JobKind::Install => "install GenieX",
+            JobKind::Pull => "download model",
+            JobKind::Remove => "remove model",
+            JobKind::Test => "test model",
+            JobKind::Discover => "find models",
+        }
+    }
+}
+
 enum JobEvent {
     Progress(Option<f32>, String),
     Status(LocalStatus),
@@ -470,6 +483,14 @@ impl SettingsApp {
             .name("local-model".into())
             .spawn(move || {
                 let result = run_local_job(kind, &base_url, &model, &sender, &token);
+                match &result {
+                    Ok(message) => {
+                        tracing::info!(job = kind.name(), result = %message, "local model action finished")
+                    }
+                    Err(message) => {
+                        tracing::warn!(job = kind.name(), error = %message, "local model action failed")
+                    }
+                }
                 let _ = sender.send(JobEvent::Done(result));
             });
         match spawned {

@@ -334,6 +334,7 @@ pub fn pull_model(
                 if !clean.is_empty() {
                     progress(parse_percent(clean), clean);
                     if parse_percent(clean).is_none() {
+                        info!("geniex pull: {clean}");
                         recent.push_back(clean.to_string());
                         if recent.len() > 4 {
                             recent.pop_front();
@@ -551,14 +552,22 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     let mut child = hidden(
         Command::new(&cli)
             .args(["serve", "--host", &format!("127.0.0.1:{MANAGED_PORT}")])
-            .env("GENIEX_LOG", "none")
+            .env("GENIEX_LOG", "info")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
     )
     .spawn()
     .map_err(|error| LocalLlmError::StartFailed(error.to_string()))?;
     kill_with_parent(&child);
+    // Everything the server prints goes into OpenWritr's log, so a model
+    // that fails or stalls can be diagnosed from one file.
+    if let Some(stream) = child.stdout.take() {
+        forward_output(stream, "stdout");
+    }
+    if let Some(stream) = child.stderr.take() {
+        forward_output(stream, "stderr");
+    }
 
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
@@ -574,6 +583,34 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     let _ = child.kill();
     let _ = child.wait();
     Err(LocalLlmError::StartFailed("timed out".into()))
+}
+
+/// Copy a child's output into the log, one line at a time. Also keeps the
+/// pipe drained so the server can never block on a full buffer.
+fn forward_output(stream: impl Read + Send + 'static, name: &'static str) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("geniex-{name}"))
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let text = strip_ansi(&String::from_utf8_lossy(&line));
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            let text: String = text.chars().take(600).collect();
+                            info!(stream = name, "geniex: {text}");
+                        }
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(error = %error, "could not capture the local model server's output");
+    }
 }
 
 fn server_answers(timeout: Duration) -> bool {
