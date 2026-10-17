@@ -4,7 +4,7 @@ version = "0.6.1"
 edition = "2021"
 description = "Native push-to-talk voice-to-text for Windows"
 license = "MIT"
-repository = "https://github.com/trsdn/openwritr-windows"
+repository = "https://github.com/raulhou/HouWritr"
 rust-version = "1.85"
 build = "build.rs"
 

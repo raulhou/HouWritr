@@ -931,7 +931,7 @@ impl AppHandler {
                 self.state.model_state = None;
                 self.state.tray.set_status(
                     tray::IconColor::Transcribing,
-                    &format!("OpenWritr — loading {engine_name}"),
+                    &format!("HouWritr — loading {engine_name}"),
                 );
             }
             Err(error) => {
@@ -940,7 +940,7 @@ impl AppHandler {
                 };
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    "OpenWritr — could not start engine loader (see log)",
+                    "HouWritr — could not start engine loader (see log)",
                 );
                 warn!(error = %error, "failed to start engine load");
             }
@@ -973,14 +973,14 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                 self.state.diagnostics_exporting = false;
                 self.state
                     .tray
-                    .set_tooltip("OpenWritr — diagnostics exported");
+                    .set_tooltip("HouWritr — diagnostics exported");
             }
             UserEvent::DiagnosticsExportFailed(error) => {
                 self.state.diagnostics_exporting = false;
                 warn!(error = %error, "diagnostics export failed");
                 self.state
                     .tray
-                    .set_tooltip("OpenWritr — diagnostics export failed (see log)");
+                    .set_tooltip("HouWritr — diagnostics export failed (see log)");
             }
             UserEvent::FileDecoded {
                 path,
@@ -1002,7 +1002,7 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                     warn!(error = %error, "file import failed");
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        &format!("OpenWritr — could not read file: {}", short_error(&error)),
+                        &format!("HouWritr — could not read file: {}", short_error(&error)),
                     );
                 } else {
                     self.update_job_status();
@@ -1122,7 +1122,7 @@ impl AppHandler {
                     self.state.model_state = Some(ModelState::Cancelled);
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        "OpenWritr — model download cancelled; choose Retry",
+                        "HouWritr — model download cancelled; choose Retry",
                     );
                     info!("model acquisition cancelled by user");
                 }
@@ -1137,7 +1137,7 @@ impl AppHandler {
                     warn!(error = %e, "failed to open logs directory");
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        "OpenWritr — could not open logs (see log)",
+                        "HouWritr — could not open logs (see log)",
                     );
                 }
                 continue;
@@ -1147,7 +1147,7 @@ impl AppHandler {
                     self.state.diagnostics_exporting = true;
                     self.state
                         .tray
-                        .set_tooltip("OpenWritr — exporting diagnostics…");
+                        .set_tooltip("HouWritr — exporting diagnostics…");
                     let settings = self.state.settings.clone();
                     let proxy = self.state.proxy.clone();
                     let spawn = thread::Builder::new()
@@ -1170,12 +1170,12 @@ impl AppHandler {
                         warn!(error = %e, "failed to start diagnostics export");
                         self.state
                             .tray
-                            .set_tooltip("OpenWritr — diagnostics export failed (see log)");
+                            .set_tooltip("HouWritr — diagnostics export failed (see log)");
                     }
                 } else {
                     self.state
                         .tray
-                        .set_tooltip("OpenWritr — diagnostics export already running");
+                        .set_tooltip("HouWritr — diagnostics export already running");
                 }
                 continue;
             }
@@ -1313,7 +1313,7 @@ impl AppHandler {
             self.show_overlay_notice(
                 NoticeKind::Error,
                 status
-                    .strip_prefix("OpenWritr — ")
+                    .strip_prefix("HouWritr — ")
                     .unwrap_or(&status)
                     .to_string(),
             );
@@ -1337,7 +1337,7 @@ impl AppHandler {
                 Ok(capture) => {
                     self.state.tray.set_status(
                         tray::IconColor::Recording,
-                        &format!("OpenWritr — recording from {}", capture.device_name),
+                        &format!("HouWritr — recording from {}", capture.device_name),
                     );
                     let active_recording = ActiveRecording::new(settings, intent, delivery_target);
                     if active_recording.settings.sounds {
@@ -1358,7 +1358,7 @@ impl AppHandler {
                 Err(e) => {
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        "OpenWritr — microphone unavailable (see log)",
+                        "HouWritr — microphone unavailable (see log)",
                     );
                     self.show_overlay_notice(NoticeKind::Error, "Microphone unavailable");
                     warn!(error = %e, "failed to start recording");
@@ -1407,7 +1407,7 @@ impl AppHandler {
             Err(e) => {
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    "OpenWritr — microphone error (see log)",
+                    "HouWritr — microphone error (see log)",
                 );
                 self.show_overlay_notice(NoticeKind::Error, "Microphone error");
                 warn!(error = %e, "failed to stop recording");
@@ -1420,7 +1420,7 @@ impl AppHandler {
         if let Some(error) = recording.stream_error {
             self.state.tray.set_status(
                 tray::IconColor::Error,
-                "OpenWritr — microphone stream failed (see log)",
+                "HouWritr — microphone stream failed (see log)",
             );
             self.show_overlay_notice(NoticeKind::Error, "Microphone stream failed");
             warn!(error = %error, "recording aborted after stream failure");
@@ -1429,7 +1429,7 @@ impl AppHandler {
 
         self.state
             .tray
-            .set_status(tray::IconColor::Idle, "OpenWritr");
+            .set_status(tray::IconColor::Idle, "HouWritr");
         let reached_limit = timer_limit_reached || recording.reached_limit;
         if reached_limit {
             info!(
@@ -1508,7 +1508,7 @@ impl AppHandler {
                 warn!(error = %error, "failed to queue transcription");
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    "OpenWritr — could not queue transcription (see log)",
+                    "HouWritr — could not queue transcription (see log)",
                 );
                 self.show_overlay_notice(NoticeKind::Error, "Could not queue transcription");
             }
@@ -1587,7 +1587,7 @@ impl AppHandler {
             notes_output: None,
             title,
             details: format!(
-                "Transcript of {name} ({}) · OpenWritr",
+                "Transcript of {name} ({}) · HouWritr",
                 format_duration(seconds)
             ),
             window: Some(window),
@@ -1601,7 +1601,7 @@ impl AppHandler {
     fn dispatch_long_form(&mut self, samples: Vec<f32>, job: FileJob, kind: &str) {
         if self.state.shutting_down {
             job.tell_window(WindowMsg::Failed {
-                error: "OpenWritr is shutting down".into(),
+                error: "HouWritr is shutting down".into(),
             });
             return;
         }
@@ -1639,7 +1639,7 @@ impl AppHandler {
                 if reported {
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        "OpenWritr — could not queue transcription (see log)",
+                        "HouWritr — could not queue transcription (see log)",
                     );
                 } else {
                     self.show_job_warning("Could not queue transcription (see log)");
@@ -1732,7 +1732,7 @@ impl AppHandler {
                     .set_meeting_state(tray::MeetingMenuState::Recording);
                 self.state.tray.set_status(
                     tray::IconColor::Recording,
-                    &format!("OpenWritr — recording meeting ({sources})"),
+                    &format!("HouWritr — recording meeting ({sources})"),
                 );
                 let hidden_note = if self.meeting_indicator_visible() {
                     ""
@@ -1902,7 +1902,7 @@ impl AppHandler {
         self.state.pending_meeting = Some(pending);
         self.state.tray.set_status(
             tray::IconColor::Transcribing,
-            "OpenWritr — meeting recorded; waiting for your answer about notes",
+            "HouWritr — meeting recorded; waiting for your answer about notes",
         );
         let proxy = self.state.proxy.clone();
         let asked = thread::Builder::new()
@@ -1950,7 +1950,7 @@ impl AppHandler {
                 started.year, started.month, started.day, started.hour, started.minute
             ),
             details: format!(
-                "Recorded with OpenWritr · {}",
+                "Recorded with HouWritr · {}",
                 format_duration(pending.recorded.as_secs() as usize)
             ),
         };
@@ -1968,7 +1968,7 @@ impl AppHandler {
             };
             self.state
                 .tray
-                .set_status(color, &format!("OpenWritr — {message}"));
+                .set_status(color, &format!("HouWritr — {message}"));
         } else if warning {
             self.show_job_warning(message);
         } else {
@@ -2071,7 +2071,7 @@ impl AppHandler {
             warnings.push(format!("AI cleanup incomplete: {summary}."));
         }
         if retrying {
-            warnings.push("OpenWritr will retry automatically and update the file.".into());
+            warnings.push("HouWritr will retry automatically and update the file.".into());
         }
         if let DiarizationOutcome::Failed(reason) = &diarization {
             warnings.push(format!("Speaker labels unavailable: {reason}"));
@@ -2418,7 +2418,7 @@ impl AppHandler {
                 self.state.model_state = Some(state);
                 self.state
                     .tray
-                    .set_status(color, &format!("OpenWritr — {status}"));
+                    .set_status(color, &format!("HouWritr — {status}"));
             }
             WorkerEvent::EngineLoading { generation, engine } => {
                 if generation != self.state.load_generation || engine != self.state.settings.engine
@@ -2428,7 +2428,7 @@ impl AppHandler {
                 self.state.engine_state = EngineState::Loading;
                 self.state.tray.set_status(
                     tray::IconColor::Transcribing,
-                    &format!("OpenWritr — loading {engine}"),
+                    &format!("HouWritr — loading {engine}"),
                 );
             }
             WorkerEvent::EngineReady {
@@ -2463,7 +2463,7 @@ impl AppHandler {
                 self.state.engine_state = EngineState::Failed { error };
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    &format!("OpenWritr — {engine} failed: {short_error}; choose Retry"),
+                    &format!("HouWritr — {engine} failed: {short_error}; choose Retry"),
                 );
             }
             WorkerEvent::JobStarted { id } if self.is_windowed_job(id) => {
@@ -2489,7 +2489,7 @@ impl AppHandler {
                 );
                 self.state.tray.set_status(
                     tray::IconColor::Transcribing,
-                    "OpenWritr — cleaning up transcript",
+                    "HouWritr — cleaning up transcript",
                 );
             }
             WorkerEvent::JobProgress {
@@ -2522,7 +2522,7 @@ impl AppHandler {
                 self.state.tray.set_status(
                     tray::IconColor::Transcribing,
                     &format!(
-                        "OpenWritr — enhancing; {} job(s) remaining",
+                        "HouWritr — enhancing; {} job(s) remaining",
                         self.state.pending_jobs
                     ),
                 );
@@ -2643,7 +2643,7 @@ impl AppHandler {
                         } else {
                             self.state.tray.set_status(
                                 tray::IconColor::Idle,
-                                "OpenWritr — copied transcript to clipboard",
+                                "HouWritr — copied transcript to clipboard",
                             );
                             self.show_overlay_notice(
                                 NoticeKind::Success,
@@ -2694,7 +2694,7 @@ impl AppHandler {
                 if self.state.pending_jobs == 0 {
                     self.state.tray.set_status(
                         tray::IconColor::Error,
-                        &format!("OpenWritr — transcription failed: {}", short_error(&error)),
+                        &format!("HouWritr — transcription failed: {}", short_error(&error)),
                     );
                 } else {
                     self.update_job_status();
@@ -2723,7 +2723,7 @@ impl AppHandler {
                 }
                 if let Some(job) = file_job {
                     job.tell_window(WindowMsg::Failed {
-                        error: "Cancelled because OpenWritr is quitting".into(),
+                        error: "Cancelled because HouWritr is quitting".into(),
                     });
                 }
                 info!(id, "transcription job discarded");
@@ -2794,7 +2794,7 @@ impl AppHandler {
             };
             self.state.tray.set_status(
                 color,
-                &format!("OpenWritr — {state} ({}){queued}", recorder.sources()),
+                &format!("HouWritr — {state} ({}){queued}", recorder.sources()),
             );
             return;
         }
@@ -2807,7 +2807,7 @@ impl AppHandler {
             self.state.tray.set_status(
                 tray::IconColor::Transcribing,
                 &format!(
-                    "OpenWritr — transcribing; {} {noun} remaining",
+                    "HouWritr — transcribing; {} {noun} remaining",
                     self.state.pending_jobs
                 ),
             );
@@ -2815,27 +2815,27 @@ impl AppHandler {
             if let EngineState::Failed { error } = &self.state.engine_state {
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    &format!("OpenWritr — engine failed: {}", short_error(error)),
+                    &format!("HouWritr — engine failed: {}", short_error(error)),
                 );
             } else if let Some(issue) = self.configuration_issue() {
                 self.state.tray.set_status(
                     tray::IconColor::Error,
-                    &format!("OpenWritr — {}", short_error(issue)),
+                    &format!("HouWritr — {}", short_error(issue)),
                 );
             } else {
                 match &self.state.engine_state {
-                    EngineState::Ready { label } => self.state.tray.set_status(
-                        tray::IconColor::Idle,
-                        &format!("OpenWritr — ready: {label}"),
-                    ),
+                    EngineState::Ready { label } => self
+                        .state
+                        .tray
+                        .set_status(tray::IconColor::Idle, &format!("HouWritr — ready: {label}")),
                     EngineState::Loading => self
                         .state
                         .tray
-                        .set_status(tray::IconColor::Transcribing, "OpenWritr — loading engine"),
+                        .set_status(tray::IconColor::Transcribing, "HouWritr — loading engine"),
                     EngineState::NotStarted => self
                         .state
                         .tray
-                        .set_status(tray::IconColor::Error, "OpenWritr — engine not ready"),
+                        .set_status(tray::IconColor::Error, "HouWritr — engine not ready"),
                     EngineState::Failed { .. } => unreachable!(),
                 }
             }
@@ -2845,7 +2845,7 @@ impl AppHandler {
     fn show_job_success(&mut self, message: &str) {
         self.state
             .tray
-            .set_status(tray::IconColor::Idle, &format!("OpenWritr — {message}"));
+            .set_status(tray::IconColor::Idle, &format!("HouWritr — {message}"));
         self.show_overlay_notice(NoticeKind::Success, message);
     }
 
@@ -2856,7 +2856,7 @@ impl AppHandler {
     fn show_job_warning_kind(&mut self, kind: NoticeKind, message: &str) {
         self.state
             .tray
-            .set_status(tray::IconColor::Error, &format!("OpenWritr — {message}"));
+            .set_status(tray::IconColor::Error, &format!("HouWritr — {message}"));
         self.show_overlay_notice(kind, message);
     }
 
@@ -2934,7 +2934,7 @@ impl AppHandler {
             return (
                 color,
                 format!(
-                    "OpenWritr — recording blocked: {}",
+                    "HouWritr — recording blocked: {}",
                     state.status_text(&self.state.settings.engine)
                 ),
             );
@@ -2942,20 +2942,20 @@ impl AppHandler {
         match &self.state.engine_state {
             EngineState::Loading => (
                 tray::IconColor::Transcribing,
-                "OpenWritr — recording blocked: engine is loading".into(),
+                "HouWritr — recording blocked: engine is loading".into(),
             ),
             EngineState::Failed { error } => (
                 tray::IconColor::Error,
                 format!(
-                    "OpenWritr — recording blocked: engine failed: {}",
+                    "HouWritr — recording blocked: engine failed: {}",
                     short_error(error)
                 ),
             ),
             EngineState::NotStarted => (
                 tray::IconColor::Error,
-                "OpenWritr — recording blocked: engine is not ready".into(),
+                "HouWritr — recording blocked: engine is not ready".into(),
             ),
-            EngineState::Ready { .. } => (tray::IconColor::Idle, "OpenWritr — engine ready".into()),
+            EngineState::Ready { .. } => (tray::IconColor::Idle, "HouWritr — engine ready".into()),
         }
     }
 
@@ -2993,10 +2993,10 @@ impl AppHandler {
         }
         let status = match mode {
             ShutdownMode::Wait => format!(
-                "OpenWritr — finishing {} queued job(s) before exit",
+                "HouWritr — finishing {} queued job(s) before exit",
                 self.state.pending_jobs
             ),
-            ShutdownMode::Discard => "OpenWritr — discarding queued work and exiting".into(),
+            ShutdownMode::Discard => "HouWritr — discarding queued work and exiting".into(),
         };
         self.state
             .tray
@@ -3103,11 +3103,11 @@ fn prompt_shutdown_mode(pending_jobs: usize) -> ShutdownMode {
     };
 
     let message = HSTRING::from(format!(
-        "OpenWritr is still processing {pending_jobs} transcription job(s).\n\n\
+        "HouWritr is still processing {pending_jobs} transcription job(s).\n\n\
          Choose Yes to wait for them to finish before exiting.\n\
          Choose No to discard queued results and exit after the current native call reaches a safe boundary."
     ));
-    let title = HSTRING::from("OpenWritr");
+    let title = HSTRING::from("HouWritr");
     let response = unsafe {
         MessageBoxW(
             None,

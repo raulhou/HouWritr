@@ -338,7 +338,7 @@ impl SettingsApp {
         status_label(
             ui,
             "A 4B-parameter model is smaller than hosted models: cleanup of long recordings takes longer, \
-             and changes it makes that fail OpenWritr's safety checks fall back to the original text.",
+             and changes it makes that fail HouWritr's safety checks fall back to the original text.",
             secondary_text(),
         );
     }

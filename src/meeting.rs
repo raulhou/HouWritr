@@ -638,7 +638,7 @@ pub fn ask_create_notes(recorded: Duration) -> bool {
     let wide =
         |value: &str| -> Vec<u16> { value.encode_utf16().chain(std::iter::once(0)).collect() };
     let text = wide(&text);
-    let caption = wide("OpenWritr — Meeting recording");
+    let caption = wide("HouWritr — Meeting recording");
     // SAFETY: both buffers are NUL-terminated and outlive the call.
     let answer = unsafe {
         MessageBoxW(

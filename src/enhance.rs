@@ -41,7 +41,7 @@ fn run_cancellable<T: Send + 'static>(
         .map_err(|_| "could not start the request thread")?;
     loop {
         if CANCEL_REQUESTS.load(Ordering::Acquire) {
-            return Err("abandoned because OpenWritr is quitting");
+            return Err("abandoned because HouWritr is quitting");
         }
         match receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(value) => return Ok(value),
