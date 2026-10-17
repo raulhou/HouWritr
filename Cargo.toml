@@ -60,6 +60,8 @@ tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy
 
 # Audio preprocessing
 rubato = "0.16"
+# Pure-Rust decoding for "Transcribe file…" (no codec DLLs, x64 + arm64).
+symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 realfft = "3"
 
 # HTTP for enhance (Copilot / OpenAI)
@@ -90,12 +92,15 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
+    "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_Storage_Packaging_Appx",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell",
     "Win32_Media_Audio",
 ] }
@@ -105,6 +110,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Threading",
 ] }

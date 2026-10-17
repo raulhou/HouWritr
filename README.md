@@ -11,7 +11,8 @@ Push-to-talk voice-to-text for Windows. Local transcription uses **NVIDIA
 Parakeet TDT 0.6B v3** on CPU or Qualcomm Hexagon NPU, plus native
 **Whisper Large v3 Turbo** on the Snapdragon X Elite NPU.
 Optional LLM cleanup via **GitHub Copilot** (Claude Haiku 4.5, GPT-5 Mini,
-GPT-4.1) or any OpenAI-compatible endpoint.
+GPT-4.1), any OpenAI-compatible endpoint, or a **model that runs on your PC**
+(on the Snapdragon NPU via Qualcomm GenieX, or a local server such as LM Studio).
 
 **[Microsoft Store](https://apps.microsoft.com/detail/9MSQWR701P2Q)** · **[Website](https://trsdn.github.io/openwritr-windows/)** · **[Releases](https://github.com/trsdn/openwritr-windows/releases)** · **[NPU model on HF](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)** · **[macOS sibling](https://github.com/trsdn/OpenWritr)**
 
@@ -90,6 +91,170 @@ fallbacks, provider/credential warnings, and errors. Active recording always
 takes priority over background job status. Settings changes take effect after
 saving — no restart required.
 
+### Transcribe files and meetings
+
+Both live in the tray menu and run fully offline on the selected engine.
+
+- **Transcribe audio or video file…** opens a file picker (WAV, MP3, M4A/AAC,
+  FLAC, OGG, MP4/MOV/MKV with a supported audio track) and then a small
+  progress window instead of the bottom-center indicator. The window shows the
+  stage (reading audio, transcribing n/m, AI cleanup), elapsed time and an
+  estimate, the source, length, engine, whether AI cleanup is on, the output
+  format and file, and, when finished, the word count, a preview, and **Open
+  file / Show in folder / Copy text** buttons. Minimize it like any window;
+  closing it does not cancel the job. The transcript is saved next to the
+  source as `<name>.txt` (or `.md`) and copied to the clipboard.
+- **Start meeting recording / Stop meeting recording** captures your
+  microphone and everything playing on the default output device (WASAPI
+  loopback) into one timeline, up to 12 hours. **Pause meeting recording**
+  stops capturing and releases the microphone (Windows' mic-in-use indicator
+  turns off); **Resume** continues the same recording with no gap, and paused
+  time is not recorded or counted. When you stop, OpenWritr asks whether to
+  **also create meeting notes** (see below). The transcript is saved to
+  `Documents\OpenWritr\Meetings\Meeting <date> <time>.txt` (named after when
+  the meeting *started*) and copied to the clipboard. Quitting while a
+  meeting is recording, or while the question is open, saves the transcript
+  without notes.
+
+  **Rolling transcription.** Meetings are transcribed while they are being
+  recorded: every five minutes of audio, and whenever you pause, the finished
+  part is cut off (at a quiet moment, so words are not split) and transcribed
+  in the background while recording continues. As each part is ready its text
+  is appended to `Meeting <date> <time> (in progress).txt` next to the final
+  transcript, so you can read the meeting so far, and nothing is lost if the
+  app or the PC dies mid-meeting. When you stop, only the last few minutes are
+  left to transcribe; the parts are stuck together into one transcript, saved
+  as the normal transcript file, and the in-progress file is deleted. Memory
+  use stays around five minutes of audio however long the meeting runs, and
+  the tray icon and recording indicator keep showing that you are recording
+  (the tray tooltip mentions that earlier parts are being transcribed).
+  Dictating with the hotkey still works during a meeting: it waits at most for
+  the part being transcribed. Speaker labels stay consistent across parts
+  (Speaker 1 in the first part is Speaker 1 in the last), and `[m:ss]` markers
+  count from the start of the meeting. If a part cannot be transcribed, the
+  transcript says so at that point and the rest is still delivered. If the
+  engine is much slower than real time the backlog of untranscribed audio
+  grows in memory (about 230 MB per hour of audio).
+
+Long audio is split into windows of at most 30 s at the quietest nearby point
+and transcribed in order. These jobs never paste. Transcription itself never
+leaves the machine.
+
+**Turning a meeting into a full report.** [`docs/meeting-report-prompt.md`](docs/meeting-report-prompt.md)
+is a ready-made prompt for Claude: give it the saved transcript (with
+`[m:ss] Speaker N:` markers) plus the agenda, slides and other material from
+the meeting and it builds a single self-contained HTML file with an executive
+summary, decisions, action items, a topic-by-topic digest, a materials
+cross-reference, and the full verbatim transcript with a searchable index.
+
+**Recording indicator.** While a meeting is being recorded, a pill in the
+same style as the dictation indicator stays on screen, in exactly the same
+place: red `Recording 12:34` with live level bars, or amber `Paused 12:34`.
+When the dictation pill needs the spot (you dictate, a job is queued, or a
+notice appears) the meeting pill steps aside and comes straight back when it
+clears. Turn it off under *Settings → Output and feedback → Show a recording
+indicator during meeting recordings*, or flip it for the current session with
+**Hide / Show recording indicator** in the tray menu (the tray menu does not
+change the saved setting). The tray icon still turns red (recording) or amber
+(paused) either way, and hiding the indicator mid-meeting shows a short notice
+so it is never silent.
+
+**AI cleanup.** If text enhancement is set to anything other than **Never**
+(Settings → Text enhancement), file and meeting transcripts are also cleaned up
+by your configured provider (GitHub Copilot or an OpenAI-compatible API). The
+transcript is sent in slices of up to ~3,000 characters, split at sentence ends
+and returned as paragraphs. Each slice is checked by the same integrity
+validator as dictation; a slice that fails keeps its raw text, and if no slice
+can be cleaned the raw transcript is saved with a warning. Set enhancement to
+**Never** to keep these transcripts fully offline. Note that cleanup sends the
+transcript text to the provider you chose, so avoid it for confidential
+meetings unless that provider is acceptable.
+
+**Meeting notes.** Under *Settings → Output and feedback* choose what happens
+when a meeting recording stops: **Ask every time** (the default), **Always**
+create notes, or **Never**. With an AI provider configured (Settings → Text
+enhancement), *Ask every time* shows *Also create meeting notes with AI?* **Yes** saves, next to the transcript, a separate
+`Meeting notes <date> <time>.md` with a *Summary*, *Key points*, *Decisions*,
+*Action items* (a `- [ ]` checklist) and *Open questions*. **No** saves the
+transcript only. **Always** creates the notes without asking, also when you quit mid-meeting; **Never** never asks. Without a provider the question is skipped and a hint is shown. The prompt forbids
+inventing names, owners, dates or decisions, but speakers are not labelled and
+recognition errors can slip through, so review notes before acting on them.
+**When the connection is unreliable.** Cleanup never holds up your transcript.
+A request that cannot reach the provider keeps that section as recognised;
+after three failures in a row the rest is skipped instead of waiting out each
+timeout, and for the next minute no further requests are attempted (so
+dictation is not held up either). Sections that could not be cleaned during a
+meeting get a second try when you press Stop (for up to 90 seconds, and only
+while the provider answers). Whatever is still unfinished is retried
+**automatically in the background** after the transcript is saved, 2, 5, 10,
+20 and 30 minutes later, and the saved transcript (and meeting notes, if they
+could not be generated) are updated in place when it works. The saved-file
+notice tells you what happened, for example *cleaned 21 of 25 sections;
+retrying automatically*. OpenWritr leaves a file alone if you have edited,
+moved or deleted it, and the retries stop when you quit the app (the
+transcript stays as recognised; the in-progress and saved files are never
+lost).
+
+Notes work even when cleanup is set to **Never**; if cleanup is on it runs
+first and the notes are built from the cleaned text. If the provider fails, the
+transcript is still saved and the notice says the notes are missing. Very long
+meetings are noted in parts and merged. The whole transcript is sent to the
+provider, so answer *No* where that is not acceptable.
+
+**In-person meetings.** Recording works without a call: with nothing playing,
+only the microphone contributes. Use the best input device Windows offers (a
+conference or USB mic beats a laptop mic), keep it near the speakers, and
+expect quieter or distant voices to be missed. Overlapping speech and room
+echo reduce accuracy, and speakers are not separated.
+
+**Speaker labels.** Turn on *Label speakers in file and meeting transcripts*
+(Settings → Output and feedback) and transcripts are split by who is talking:
+
+```
+[0:00] Speaker 1: Thanks everyone for joining…
+
+[0:12] Speaker 2: Happy to be here. Can we start with the roadmap?
+```
+
+The `[m:ss]` marker is the time into the recording where that person starts
+talking (paused time in a meeting is not counted).
+
+OpenWritr finds the speaker turns with two small on-device models (pyannote
+segmentation 3.0 and a WeSpeaker voice-print model, about 32 MB, downloaded the
+first time you use it), then transcribes each turn separately. It runs on the
+CPU, takes roughly a minute or two per hour of audio on a recent PC, and works
+for files and meeting recordings alike. Labels never remove speech: audio the models can't
+attribute (a short "yes", a first word at a segment edge) is transcribed with
+the neighbouring speaker, so a labelled transcript has every word an unlabelled
+one would. Labels are numbered in order of first
+appearance and are **not** names. Accuracy drops with overlapping speech, very
+short interjections, similar voices and poor audio, and a voice is sometimes
+split into two labels. If only one speaker is found the transcript is left
+unlabelled; if the models cannot be downloaded or run, you still get the normal
+transcript and a note saying labels were unavailable. AI cleanup keeps the
+labels and markers (the markers are held back from the AI request and put back
+afterwards), and meeting notes may attribute action items to "Speaker N".
+
+**Managing the speaker-label models.** *Settings → Speaker labels* holds the
+on/off switch and the local model status: *Installed*, *Not downloaded* or
+*Incomplete*, the size, and the folder they live in. **Download and install**
+fetches them now (with a progress bar and **Cancel**) instead of waiting for
+the first labelled transcript, **Verify files** re-checks sizes and SHA-256
+hashes, and **Open model folder** opens the install location. For machines
+without direct access, expand *Install manually*: it lists each file with its
+exact name, size, hash and download link; save the files into the model folder
+and click **Verify files**. Files that do not match the pinned hashes are
+rejected.
+
+**Markdown output.** Turn on *Save file and meeting transcripts as Markdown*
+(Settings → Output and feedback) to get `.md` files instead of `.txt`: a `#`
+title, an italic details line (source file or meeting length), and paragraphs.
+The formatting is added by OpenWritr itself, not requested from the AI
+provider, so the cleanup integrity checks are unaffected and the same words
+are kept in both formats.
+
+Record meetings only where everyone present has agreed to it.
+
 ## Settings
 
 Tray icon → right-click → **Settings**. All fields:
@@ -113,7 +278,8 @@ Tray icon → right-click → **Settings**. All fields:
   covers both the recording waveform and typed job/status messages.
   Start/stop sounds are optional.
 - **Text enhancement**: choose **Never**, **When Shift is additionally held**,
-  or **Always**, then select GitHub Copilot or an OpenAI-compatible API.
+  or **Always**, then select GitHub Copilot, an OpenAI-compatible API, or a
+  **Local model (on this PC)** (see below).
   Shift is monitored throughout the recording, so the mode and purple overlay
   indicator update immediately instead of being fixed at the initial key
   press. In **Always** mode, additional Shift bypasses cleanup while held. The
@@ -143,6 +309,34 @@ replacement, and legacy plaintext API keys are migrated only after the secure
 credential can be written and read back successfully. Unsaved changes require
 confirmation before the Settings window closes.
 
+### Local model for AI cleanup (NPU)
+
+Settings → Text enhancement → **Local model (on this PC)** runs cleanup and
+meeting notes on a model that never leaves your computer. Two sources:
+
+- **Built-in model (NPU)** – on a Snapdragon (Windows on ARM) PC, OpenWritr
+  uses Qualcomm's [GenieX](https://github.com/qualcomm/GenieX) to run
+  `ai-hub-models/Qwen3-4B-Instruct-2507` on the Hexagon NPU. In Settings press
+  **Install GenieX…** (downloads the pinned official v0.8.0 installer, checks its
+  SHA-256, installs for your Windows user only, adds `geniex` to your PATH),
+  then **Download model** (several GB, resumable), then **Test model**.
+  OpenWritr starts `geniex serve` on a private port (18651) when a cleanup needs
+  it, stops it after 15 idle minutes, and ties it to the app so the NPU is never
+  left occupied. If the server cannot start, cleanup falls back to the raw text
+  exactly like an unreachable hosted provider.
+- **Another local server** – any OpenAI-compatible server on this PC
+  (a GenieX server you run yourself, LM Studio, Ollama, Foundry Local). Presets,
+  **Find models**, **Test connection**, and a setup guide are in Settings. Only
+  `localhost` / `127.0.0.1` / `::1` addresses are accepted here; no API key is
+  needed unless the server asks for one.
+
+Local models are slower and weaker than hosted ones, so OpenWritr sends them
+smaller slices (about 1,200 characters for cleanup, 8,000 for meeting notes),
+waits 8× longer for each answer, and removes `<think>…</think>` reasoning
+blocks from replies. The same integrity checks as for hosted models apply.
+Developer-preview note: GenieX is a Qualcomm developer preview; the pinned
+version is isolated in `src/local_llm.rs`.
+
 ## Architecture
 
 ### Native Rust app (what ships in the release zip)
@@ -165,7 +359,8 @@ openwritr-windows/
 │   │   ├── whisper_mel.rs   128-bin Whisper log-mel frontend
 │   │   ├── whisper_decoder.rs  QNN encoder/decoder and KV-cache loop
 │   │   └── qnn_ffi.rs       reusable typed QNN C-API sessions
-│   ├── enhance.rs           Copilot / OpenAI cleanup pass
+│   ├── enhance.rs           Copilot / OpenAI / local-model cleanup pass
+│   ├── local_llm.rs         GenieX install, model download, private `geniex serve`
 │   ├── sounds.rs            G3/E3 tone synth (start/stop pings)
 │   └── bin/
 │       ├── package.rs       distributable-zip builder

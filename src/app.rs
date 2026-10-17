@@ -10,20 +10,28 @@
 use crate::{
     audio::Recorder,
     cleanup::FallbackReason,
-    diagnostics, hotkey, key_hook,
+    diagnostics, enhance, hotkey, key_hook, media,
+    meeting::{self, MeetingRecorder},
     model_manager::ModelState,
     overlay::{self, ListeningIntent, NoticeKind, OverlayViewState, ProcessingPhase},
     paste,
-    settings::{CredentialHealth, EnhanceMode, Settings, SettingsRevision},
-    sounds, tray,
-    worker::{DeliveryTarget, JobConfig, RecordingIntent, ShutdownMode, Worker, WorkerEvent},
+    settings::{CredentialHealth, EnhanceMode, MeetingNotesMode, Settings, SettingsRevision},
+    sounds,
+    transcript_window::{self, WindowMsg},
+    tray,
+    worker::{
+        DeliveryTarget, DiarizationOutcome, JobConfig, JobStage, RecordingIntent, RepairPlan,
+        Rerun, SessionPart, ShutdownMode, Worker, WorkerEvent,
+    },
 };
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::thread;
@@ -48,6 +56,19 @@ pub enum UserEvent {
     HotkeyRelease,
     DiagnosticsExported,
     DiagnosticsExportFailed(String),
+    /// A file picked from the tray menu was decoded to 16 kHz mono. `window`
+    /// feeds the popup that was opened for it when the file was chosen.
+    FileDecoded {
+        path: PathBuf,
+        samples: Vec<f32>,
+        output: PathBuf,
+        markdown: bool,
+        window: mpsc::Sender<WindowMsg>,
+    },
+    /// The file dialog was dismissed, or decoding failed (`Some(reason)`).
+    FileImportEnded(Option<String>),
+    /// Answer to "also create meeting notes?" after a recording stopped.
+    MeetingNotesChoice(bool),
     Tick,
 }
 
@@ -61,6 +82,176 @@ enum EngineState {
     Ready { label: String },
     Failed { error: String },
 }
+
+/// Where a long-form (file or meeting) transcript goes, and how to label it.
+struct FileJob {
+    output: PathBuf,
+    markdown: bool,
+    /// Structured AI notes were requested; they go to `notes_output`.
+    notes: bool,
+    notes_output: Option<PathBuf>,
+    title: String,
+    details: String,
+    /// Popup window for this job. `None` (meetings) keeps the overlay pill.
+    window: Option<mpsc::Sender<WindowMsg>>,
+    /// A non-final part of a rolling meeting transcription: it only feeds the
+    /// worker's session and is never shown or delivered on its own.
+    background: bool,
+    /// Meeting membership, with the settings snapshotted when the meeting
+    /// began so every part is processed the same way.
+    session: Option<(SessionPart, Settings)>,
+    /// The in-progress transcript of a meeting. Background parts append to it
+    /// (it is their `output`); the final job deletes it once the finished
+    /// transcript is saved.
+    partial: Option<PathBuf>,
+}
+
+impl FileJob {
+    /// Jobs that must stay out of the dictation overlay's job queue: the
+    /// popup shows file jobs, and background meeting parts show nothing.
+    fn overlay_free(&self) -> bool {
+        self.window.is_some() || self.background
+    }
+
+    /// Tell the popup something; a failed send just means it was closed.
+    fn tell_window(&self, message: WindowMsg) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.send(message).is_ok())
+    }
+}
+
+/// What one background retry does for a delivered transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairStep {
+    /// Clean piece `n` of the transcript again.
+    Piece(usize),
+    /// Generate the meeting notes that could not be generated before.
+    Notes,
+}
+
+/// A delivered transcript whose AI cleanup (or notes) could not finish, e.g.
+/// because the connection was down. The app keeps what is needed to try again
+/// in the background and rewrites the saved files when it succeeds.
+struct Repair {
+    id: u64,
+    name: String,
+    plan: RepairPlan,
+    output: PathBuf,
+    notes_output: Option<PathBuf>,
+    markdown: bool,
+    title: String,
+    details: String,
+    /// Exactly what the transcript file held when we last wrote it: if the
+    /// file has changed since (the user edited it), it is left alone.
+    last_written: String,
+    /// Most slices ever cleaned for each piece, to tell progress from repeats.
+    best_cleaned: Vec<usize>,
+    failed_rounds: u32,
+    next_attempt: Instant,
+    in_flight: Option<u64>,
+}
+
+/// First retry after two minutes, then slower; after five fruitless rounds
+/// the text is left as it is.
+const REPAIR_BACKOFF_SECONDS: [u64; 5] = [120, 300, 600, 1_200, 1_800];
+/// Pause between steps of one productive round.
+const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
+
+/// How long to wait before the next round after `failed_rounds` fruitless
+/// ones, or `None` to give up.
+fn repair_delay(failed_rounds: u32) -> Option<Duration> {
+    REPAIR_BACKOFF_SECONDS
+        .get(failed_rounds.saturating_sub(1) as usize)
+        .map(|seconds| Duration::from_secs(*seconds))
+}
+
+/// The next thing to retry: unfinished pieces in order, then the notes.
+fn next_repair_step(plan: &RepairPlan) -> Option<RepairStep> {
+    plan.pieces
+        .iter()
+        .position(|piece| piece.raw.is_some())
+        .map(RepairStep::Piece)
+        .or_else(|| plan.notes_failed.then_some(RepairStep::Notes))
+}
+
+/// File content for a transcript: Markdown with a title, or the plain text.
+fn render_transcript(markdown: bool, title: &str, details: &str, text: &str) -> String {
+    if markdown {
+        media::to_markdown(title, details, text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// File content for meeting notes, which sit next to the transcript.
+fn render_notes(title: &str, details: &str, transcript_name: &str, notes: &str) -> String {
+    media::to_markdown(
+        &title.replacen("Meeting", "Meeting notes", 1),
+        &format!("{details} · transcript: {transcript_name}"),
+        notes,
+    )
+}
+
+fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+    std::fs::write(path, content)
+}
+
+/// "cleaned 21 of 25 sections" when some of the text is still as recognised.
+fn cleanup_summary(report: &crate::enhance::CleanupReport) -> Option<String> {
+    (report.total > 0 && report.cleaned < report.total)
+        .then(|| format!("cleaned {} of {} sections", report.cleaned, report.total))
+}
+
+/// A meeting being recorded: its parts are transcribed as they are cut.
+struct MeetingSession {
+    id: u64,
+    started: meeting::LocalTime,
+    /// The transcript so far, kept on disk while recording continues.
+    partial: PathBuf,
+    /// Settings as they were when the meeting began.
+    settings: Settings,
+}
+
+/// A finished meeting recording waiting for the "create notes?" answer. The
+/// final part is the audio recorded since the last rolling cut.
+struct PendingMeeting {
+    tail: meeting::Segment,
+    session: MeetingSession,
+    recorded: Duration,
+}
+
+/// What to do about meeting notes when a recording stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotesDecision {
+    /// Show the "create notes?" question.
+    Ask,
+    /// Create notes without asking.
+    Create,
+    /// Transcript only.
+    Skip,
+    /// The user wants notes (or would be asked) but no AI provider is set
+    /// up: transcript only, with a hint.
+    SkipNoProvider,
+}
+
+/// `may_ask` is false when no question can be shown (quitting the app).
+fn notes_decision(mode: MeetingNotesMode, provider_ready: bool, may_ask: bool) -> NotesDecision {
+    match mode {
+        MeetingNotesMode::Never => NotesDecision::Skip,
+        MeetingNotesMode::Always if provider_ready => NotesDecision::Create,
+        MeetingNotesMode::Always => NotesDecision::SkipNoProvider,
+        MeetingNotesMode::Ask if !may_ask => NotesDecision::Skip,
+        MeetingNotesMode::Ask if provider_ready => NotesDecision::Ask,
+        MeetingNotesMode::Ask => NotesDecision::SkipNoProvider,
+    }
+}
+
+/// Rolling parts are queued as pieces of at most this long so that a
+/// dictation job never waits behind more than one short transcription.
+const MEETING_PIECE_SECONDS: usize = 300;
+const MEETING_PIECE_SEARCH_SECONDS: usize = 10;
 
 struct ActiveRecording {
     started: Instant,
@@ -257,6 +448,29 @@ struct State {
     settings_revision: Option<SettingsRevision>,
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
+    meeting: Option<MeetingRecorder>,
+    /// Live meeting input level feeding the recording indicator.
+    meeting_level: Arc<AtomicU32>,
+    /// The meeting pill: same position as the dictation pill, shown for the
+    /// whole recording except while the dictation pill is on screen.
+    meeting_overlay: overlay::OverlayController,
+    meeting_overlay_view: OverlayViewState,
+    meeting_overlay_enabled: bool,
+    /// Tray toggle for this session only. `None` follows the saved setting;
+    /// the tray process never rewrites settings.json itself.
+    meeting_indicator_override: Option<bool>,
+    /// Recording finished; the notes question is open.
+    pending_meeting: Option<PendingMeeting>,
+    /// The meeting being recorded, if any.
+    meeting_session: Option<MeetingSession>,
+    next_meeting_session: u64,
+    /// Delivered transcripts waiting for an automatic retry of AI cleanup.
+    repairs: Vec<Repair>,
+    repair_jobs: HashMap<u64, (u64, RepairStep)>,
+    next_repair_id: u64,
+    /// Long-form jobs (imported files, meetings) mapped to their output file.
+    file_jobs: HashMap<u64, FileJob>,
+    file_import_running: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -296,6 +510,7 @@ pub fn run() -> Result<()> {
     );
     let recorder = Recorder::new()?;
     let tray = tray::Tray::new(&settings)?;
+    tray.set_meeting_indicator_visible(settings.show_meeting_indicator);
     let worker = Worker::spawn()?;
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -323,6 +538,16 @@ pub fn run() -> Result<()> {
         settings.overlay,
     )?;
 
+    let meeting_level = Arc::new(AtomicU32::new(0));
+    let meeting_overlay = overlay::spawn(
+        overlay::OverlayHandles {
+            level_x10000: meeting_level.clone(),
+            stop: hk_stop.clone(),
+        },
+        settings.show_meeting_indicator,
+    )?;
+    let meeting_overlay_enabled = settings.show_meeting_indicator;
+
     let state = State {
         settings,
         credential_health,
@@ -345,6 +570,20 @@ pub fn run() -> Result<()> {
         settings_revision,
         proxy,
         diagnostics_exporting: false,
+        meeting: None,
+        meeting_level,
+        meeting_overlay,
+        meeting_overlay_view: OverlayViewState::Hidden,
+        meeting_overlay_enabled,
+        meeting_indicator_override: None,
+        pending_meeting: None,
+        meeting_session: None,
+        next_meeting_session: 1,
+        repairs: Vec::new(),
+        repair_jobs: HashMap::new(),
+        next_repair_id: 1,
+        file_jobs: HashMap::new(),
+        file_import_running: false,
     };
 
     // Wait mode: loop sleeps until a message arrives (tray click, user event,
@@ -742,6 +981,32 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                     .tray
                     .set_tooltip("OpenWritr — diagnostics export failed (see log)");
             }
+            UserEvent::FileDecoded {
+                path,
+                samples,
+                output,
+                markdown,
+                window,
+            } => {
+                self.state.file_import_running = false;
+                self.dispatch_file(path, samples, output, markdown, window);
+            }
+            UserEvent::MeetingNotesChoice(create_notes) => {
+                self.finish_pending_meeting(create_notes);
+            }
+            UserEvent::FileImportEnded(error) => {
+                self.state.file_import_running = false;
+                if let Some(error) = error {
+                    // The popup already shows the reason; no pill for files.
+                    warn!(error = %error, "file import failed");
+                    self.state.tray.set_status(
+                        tray::IconColor::Error,
+                        &format!("OpenWritr — could not read file: {}", short_error(&error)),
+                    );
+                } else {
+                    self.update_job_status();
+                }
+            }
             UserEvent::Tick => self.tick(el),
         }
     }
@@ -759,6 +1024,7 @@ impl AppHandler {
             self.handle_worker_event(el, event);
         }
         self.sync_overlay();
+        self.sync_meeting_indicator();
 
         if self.state.active_recording.is_some() {
             let stream_failed = self.state.recorder.stream_failed();
@@ -810,6 +1076,36 @@ impl AppHandler {
                     self.finish_recording(true);
                 }
             }
+        }
+
+        let meeting_status = self
+            .state
+            .meeting
+            .as_ref()
+            .map(|meeting| (meeting.limit_reached(), meeting.failure()));
+        if let Some((limit_reached, failure)) = meeting_status {
+            if limit_reached || failure.is_some() {
+                if let Some(failure) = failure {
+                    warn!(
+                        failure,
+                        "meeting capture failed; transcribing what was captured"
+                    );
+                }
+                self.stop_meeting(true);
+            }
+        }
+
+        self.run_due_repairs();
+
+        // Rolling transcription: five minutes of finished audio go to the
+        // transcriber while the recording carries on.
+        if self
+            .state
+            .meeting
+            .as_ref()
+            .is_some_and(|recorder| !recorder.is_paused() && recorder.roll_due())
+        {
+            self.roll_meeting_part();
         }
 
         // Drain tray menu events.
@@ -882,6 +1178,26 @@ impl AppHandler {
                 }
                 continue;
             }
+            if ev.id == self.state.tray.menu_transcribe_file_id {
+                self.start_file_import();
+                continue;
+            }
+            if ev.id == self.state.tray.menu_meeting_id {
+                if self.state.meeting.is_some() {
+                    self.stop_meeting(true);
+                } else {
+                    self.start_meeting();
+                }
+                continue;
+            }
+            if ev.id == self.state.tray.menu_meeting_pause_id {
+                self.toggle_meeting_pause();
+                continue;
+            }
+            if ev.id == self.state.tray.menu_meeting_indicator_id {
+                self.toggle_meeting_indicator();
+                continue;
+            }
             if ev.id == self.state.tray.menu_settings_id {
                 info!("opening settings UI subprocess");
                 // CRITICAL: spawn from a background thread. CreateProcessW on
@@ -938,8 +1254,14 @@ impl AppHandler {
                             } else {
                                 let old_engine = self.state.settings.engine.clone();
                                 let old_overlay = self.state.settings.overlay;
+                                let old_indicator = self.state.settings.show_meeting_indicator;
                                 self.state.settings = loaded.settings;
                                 self.state.settings_error = None;
+                                if self.state.settings.show_meeting_indicator != old_indicator {
+                                    // A saved change replaces any tray toggle.
+                                    self.state.meeting_indicator_override = None;
+                                    self.sync_meeting_indicator();
+                                }
                                 if self.state.settings.overlay != old_overlay {
                                     if let Err(error) =
                                         self.state.overlay.set_enabled(self.state.settings.overlay)
@@ -1005,6 +1327,11 @@ impl AppHandler {
                 .iter()
                 .any(|modifier| modifier == "shift");
             let intent = recording_intent(settings.enhance.mode, shift_is_modifier, shift_down);
+            if settings.enhance.mode != crate::settings::EnhanceMode::Never
+                && settings.enhance.provider == "openai_compatible"
+            {
+                crate::local_llm::prewarm(&settings.enhance.base_url, &settings.enhance.model);
+            }
             match self.state.recorder.start(settings.max_record_seconds) {
                 Ok(capture) => {
                     self.state.tray.set_status(
@@ -1187,8 +1514,889 @@ impl AppHandler {
         }
     }
 
+    /// Gate shared by file import and meetings: they need a loaded engine.
+    fn require_ready_engine(&mut self) -> bool {
+        if self.state.shutting_down {
+            return false;
+        }
+        if matches!(self.state.engine_state, EngineState::Ready { .. }) {
+            return true;
+        }
+        let (color, status) = self.blocked_recording_status();
+        self.state.tray.set_status(color, &status);
+        self.show_overlay_notice(NoticeKind::Warning, "Engine is not ready yet");
+        false
+    }
+
+    fn start_file_import(&mut self) {
+        if self.state.file_import_running {
+            return;
+        }
+        if !self.require_ready_engine() {
+            return;
+        }
+        self.state.file_import_running = true;
+        let proxy = self.state.proxy.clone();
+        let markdown = self.state.settings.markdown_transcripts;
+        let cleanup = self.state.settings.enhance.mode.is_enabled();
+        let cleanup_engine = crate::enhance::cleanup_engine_label(&self.state.settings);
+        let engine = match &self.state.engine_state {
+            EngineState::Ready { label } => label.clone(),
+            _ => self.state.settings.engine.clone(),
+        };
+        // The Open dialog blocks and decoding is CPU-heavy: neither may run
+        // on the tray event loop.
+        let spawned = thread::Builder::new()
+            .name("file-import".into())
+            .spawn(move || {
+                let Some(path) = media::pick_audio_file() else {
+                    let _ = proxy.send_event(UserEvent::FileImportEnded(None));
+                    return;
+                };
+                let event = import_file(path, markdown, cleanup, cleanup_engine, engine);
+                let _ = proxy.send_event(event);
+            });
+        if let Err(error) = spawned {
+            self.state.file_import_running = false;
+            warn!(error = %error, "failed to start file import");
+        }
+    }
+
+    fn dispatch_file(
+        &mut self,
+        source: PathBuf,
+        samples: Vec<f32>,
+        output: PathBuf,
+        markdown: bool,
+        window: mpsc::Sender<WindowMsg>,
+    ) {
+        let name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "audio file".into());
+        let title = source
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Transcript".into());
+        let seconds = samples.len() / media::TARGET_RATE as usize;
+        let job = FileJob {
+            output,
+            markdown,
+            notes: false,
+            notes_output: None,
+            title,
+            details: format!(
+                "Transcript of {name} ({}) · OpenWritr",
+                format_duration(seconds)
+            ),
+            window: Some(window),
+            background: false,
+            session: None,
+            partial: None,
+        };
+        self.dispatch_long_form(samples, job, "file");
+    }
+
+    fn dispatch_long_form(&mut self, samples: Vec<f32>, job: FileJob, kind: &str) {
+        if self.state.shutting_down {
+            job.tell_window(WindowMsg::Failed {
+                error: "OpenWritr is shutting down".into(),
+            });
+            return;
+        }
+        let config = match &job.session {
+            Some((part, settings)) => JobConfig::meeting_part(settings.clone(), *part, job.notes),
+            None if job.notes => JobConfig::meeting_notes(self.state.settings.clone()),
+            None => JobConfig::long_form(self.state.settings.clone()),
+        };
+        match self
+            .state
+            .worker
+            .enqueue(samples, media::TARGET_RATE, config)
+        {
+            Ok(id) => {
+                let windowed = job.overlay_free();
+                job.tell_window(WindowMsg::Stage {
+                    stage: transcript_window::Stage::Queued,
+                    done: 0,
+                    total: 0,
+                });
+                self.state.file_jobs.insert(id, job);
+                self.state.pending_jobs = self.state.pending_jobs.saturating_add(1);
+                if !windowed {
+                    self.state.overlay_state.job_queued(id);
+                }
+                info!(id, kind, "long-form transcription job queued");
+                self.update_job_status();
+                self.sync_overlay();
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to queue long-form transcription");
+                let reported = job.tell_window(WindowMsg::Failed {
+                    error: format!("could not queue transcription: {error}"),
+                });
+                if reported {
+                    self.state.tray.set_status(
+                        tray::IconColor::Error,
+                        "OpenWritr — could not queue transcription (see log)",
+                    );
+                } else {
+                    self.show_job_warning("Could not queue transcription (see log)");
+                }
+            }
+        }
+    }
+
+    /// Whether the meeting recording indicator should be on screen: the saved
+    /// setting, unless the tray menu overrode it for this session.
+    fn meeting_indicator_visible(&self) -> bool {
+        self.state
+            .meeting_indicator_override
+            .unwrap_or(self.state.settings.show_meeting_indicator)
+    }
+
+    /// Push the indicator's visibility and current view to its pill. Cheap:
+    /// only sends a command when something changed (about once a second
+    /// while recording, for the clock).
+    fn sync_meeting_indicator(&mut self) {
+        let visible = self.meeting_indicator_visible();
+        if visible != self.state.meeting_overlay_enabled {
+            match self.state.meeting_overlay.set_enabled(visible) {
+                Ok(()) => self.state.meeting_overlay_enabled = visible,
+                Err(error) => warn!(error, "failed to update meeting indicator"),
+            }
+            self.state.tray.set_meeting_indicator_visible(visible);
+        }
+        // The meeting pill occupies the same spot as the dictation pill, so
+        // it steps aside while that one is on screen (listening, writing, or
+        // a notice) and returns as soon as it clears.
+        let dictation_pill_showing =
+            self.state.settings.overlay && !self.state.overlay_state.last_view.is_hidden();
+        let desired = match &self.state.meeting {
+            Some(recorder) if !dictation_pill_showing => {
+                OverlayViewState::meeting(recorder.elapsed().as_secs(), recorder.is_paused())
+            }
+            _ => OverlayViewState::Hidden,
+        };
+        if desired != self.state.meeting_overlay_view {
+            match self.state.meeting_overlay.set_state(desired.clone()) {
+                Ok(()) => self.state.meeting_overlay_view = desired,
+                Err(error) => warn!(error, "failed to update meeting indicator"),
+            }
+        }
+    }
+
+    fn toggle_meeting_indicator(&mut self) {
+        let show = !self.meeting_indicator_visible();
+        self.state.meeting_indicator_override = Some(show);
+        self.state.tray.set_meeting_indicator_visible(show);
+        self.sync_meeting_indicator();
+        if self.state.meeting.is_some() {
+            // Hiding must never be silent while a recording is running.
+            let message = if show {
+                "Recording indicator shown"
+            } else {
+                "Indicator hidden · still recording (tray icon is red)"
+            };
+            self.show_overlay_notice(NoticeKind::Info, message);
+        }
+    }
+
+    fn start_meeting(&mut self) {
+        if self.state.pending_meeting.is_some() {
+            self.show_overlay_notice(
+                NoticeKind::Warning,
+                "Answer the meeting notes question first",
+            );
+            return;
+        }
+        if !self.require_ready_engine() {
+            return;
+        }
+        match MeetingRecorder::start(self.state.meeting_level.clone()) {
+            Ok(recorder) => {
+                let sources = recorder.sources();
+                let id = self.state.next_meeting_session;
+                self.state.next_meeting_session += 1;
+                let started = meeting::LocalTime::now();
+                self.state.meeting_session = Some(MeetingSession {
+                    id,
+                    started,
+                    partial: media::unique_path(meeting::partial_output_path(started)),
+                    settings: self.state.settings.clone(),
+                });
+                self.state.meeting = Some(recorder);
+                self.state
+                    .tray
+                    .set_meeting_state(tray::MeetingMenuState::Recording);
+                self.state.tray.set_status(
+                    tray::IconColor::Recording,
+                    &format!("OpenWritr — recording meeting ({sources})"),
+                );
+                let hidden_note = if self.meeting_indicator_visible() {
+                    ""
+                } else {
+                    " (indicator hidden)"
+                };
+                self.show_overlay_notice(
+                    NoticeKind::Success,
+                    format!("Recording meeting: {sources}{hidden_note}"),
+                );
+            }
+            Err(error) => {
+                warn!(error = %error, "could not start meeting capture");
+                self.show_job_warning(&format!(
+                    "Could not start meeting recording: {}",
+                    short_error(&error.to_string())
+                ));
+            }
+        }
+    }
+
+    fn toggle_meeting_pause(&mut self) {
+        let Some(recorder) = self.state.meeting.as_mut() else {
+            return;
+        };
+        if recorder.is_paused() {
+            let resumed = recorder.resume().map(|()| recorder.sources());
+            match resumed {
+                Ok(_) => {
+                    self.state
+                        .tray
+                        .set_meeting_state(tray::MeetingMenuState::Recording);
+                    self.update_job_status();
+                    self.show_overlay_notice(NoticeKind::Success, "Meeting recording resumed");
+                }
+                Err(error) => {
+                    // Still paused: the user can retry or stop and keep what
+                    // was recorded so far.
+                    warn!(error = %error, "could not resume meeting capture");
+                    self.show_job_warning(&format!(
+                        "Could not resume the meeting: {}",
+                        short_error(&error.to_string())
+                    ));
+                }
+            }
+        } else {
+            recorder.pause();
+            // Nothing more is recorded while paused, so use the time: hand
+            // everything recorded so far to the transcriber now.
+            let segment = recorder.take_segment(false, meeting::MIN_PAUSE_SEGMENT_SAMPLES);
+            self.state
+                .tray
+                .set_meeting_state(tray::MeetingMenuState::Paused);
+            self.update_job_status();
+            self.show_overlay_notice(NoticeKind::Info, "Meeting recording paused");
+            if let Some(segment) = segment {
+                self.queue_meeting_part(segment);
+            }
+        }
+    }
+
+    /// Cut the finished stretch of the recording off for transcription.
+    /// Called once an hour of audio is waiting (see `MeetingRecorder::roll_due`).
+    fn roll_meeting_part(&mut self) {
+        let segment = self
+            .state
+            .meeting
+            .as_mut()
+            .and_then(|recorder| recorder.take_segment(true, 1));
+        if let Some(segment) = segment {
+            info!(
+                seconds = segment.samples.len() / media::TARGET_RATE as usize,
+                "rolling meeting part cut"
+            );
+            self.queue_meeting_part(segment);
+        }
+    }
+
+    /// Queue a finished part of the running meeting as background jobs.
+    fn queue_meeting_part(&mut self, segment: meeting::Segment) {
+        let Some(session) = &self.state.meeting_session else {
+            return;
+        };
+        let (id, settings, partial) = (
+            session.id,
+            session.settings.clone(),
+            session.partial.clone(),
+        );
+        let pieces = media::plan_windows(
+            &segment.samples,
+            media::TARGET_RATE,
+            MEETING_PIECE_SECONDS,
+            MEETING_PIECE_SEARCH_SECONDS,
+        );
+        for range in pieces {
+            let part = SessionPart {
+                id,
+                offset_samples: segment.start + range.start,
+                last: false,
+            };
+            let job = FileJob {
+                // Where this part's text is appended as soon as it is ready.
+                output: partial.clone(),
+                markdown: false,
+                notes: false,
+                notes_output: None,
+                title: String::new(),
+                details: String::new(),
+                window: None,
+                background: true,
+                session: Some((part, settings.clone())),
+                partial: None,
+            };
+            self.dispatch_long_form(segment.samples[range].to_vec(), job, "meeting part");
+        }
+    }
+
+    /// End the recording. With `ask_for_notes`, offer to also create AI notes
+    /// (only when a provider is configured); otherwise queue the transcript.
+    fn stop_meeting(&mut self, ask_for_notes: bool) {
+        let Some(recorder) = self.state.meeting.take() else {
+            return;
+        };
+        self.state
+            .tray
+            .set_meeting_state(tray::MeetingMenuState::Idle);
+        let recorded = recorder.elapsed();
+        let tail = recorder.finish();
+        let session = self.state.meeting_session.take();
+        let total_samples = tail.start + tail.samples.len();
+        let Some(session) = session else {
+            return;
+        };
+        if total_samples < media::TARGET_RATE as usize {
+            self.show_job_warning("Meeting recording was too short to transcribe");
+            self.update_job_status();
+            return;
+        }
+        info!(seconds = recorded.as_secs(), "meeting capture stopped");
+        let pending = PendingMeeting {
+            tail,
+            session,
+            recorded,
+        };
+
+        let provider_ready = enhance::notes_configuration(&self.state.settings).is_ok();
+        let decision = notes_decision(
+            self.state.settings.meeting_notes,
+            provider_ready,
+            ask_for_notes,
+        );
+        match decision {
+            NotesDecision::Create | NotesDecision::Skip | NotesDecision::SkipNoProvider => {
+                if decision == NotesDecision::SkipNoProvider {
+                    self.show_overlay_notice(
+                        NoticeKind::Info,
+                        "Set up an AI provider in Settings to get meeting notes",
+                    );
+                }
+                self.state.pending_meeting = Some(pending);
+                self.finish_pending_meeting(decision == NotesDecision::Create);
+                return;
+            }
+            NotesDecision::Ask => {}
+        }
+
+        self.state.pending_meeting = Some(pending);
+        self.state.tray.set_status(
+            tray::IconColor::Transcribing,
+            "OpenWritr — meeting recorded; waiting for your answer about notes",
+        );
+        let proxy = self.state.proxy.clone();
+        let asked = thread::Builder::new()
+            .name("meeting-notes-prompt".into())
+            .spawn(move || {
+                let choice = meeting::ask_create_notes(recorded);
+                let _ = proxy.send_event(UserEvent::MeetingNotesChoice(choice));
+            });
+        if let Err(error) = asked {
+            warn!(error = %error, "could not show the notes question; saving the transcript only");
+            self.finish_pending_meeting(false);
+        }
+    }
+
+    /// Queue the final part of the recording (and with it the stitched
+    /// transcript, and notes if wanted) after the "create notes?" answer.
+    fn finish_pending_meeting(&mut self, create_notes: bool) {
+        let Some(pending) = self.state.pending_meeting.take() else {
+            return;
+        };
+        let started = pending.session.started;
+        let markdown = self.state.settings.markdown_transcripts;
+        let mut output = meeting::default_output_path(started);
+        if markdown {
+            output.set_extension("md");
+        }
+        let notes_output =
+            create_notes.then(|| media::unique_path(meeting::default_notes_path(started)));
+        let part = SessionPart {
+            id: pending.session.id,
+            offset_samples: pending.tail.start,
+            last: true,
+        };
+        let job = FileJob {
+            output: media::unique_path(output),
+            markdown,
+            notes: create_notes,
+            notes_output,
+            window: None,
+            background: false,
+            partial: Some(pending.session.partial),
+            session: Some((part, pending.session.settings)),
+            title: format!(
+                "Meeting {:04}-{:02}-{:02} {:02}:{:02}",
+                started.year, started.month, started.day, started.hour, started.minute
+            ),
+            details: format!(
+                "Recorded with OpenWritr · {}",
+                format_duration(pending.recorded.as_secs() as usize)
+            ),
+        };
+        self.dispatch_long_form(pending.tail.samples, job, "meeting");
+    }
+
+    /// Report a file/meeting outcome. Windowed jobs only touch the tray; the
+    /// popup carries the details, so the overlay pill stays out of it.
+    fn report_long_form(&mut self, windowed: bool, warning: bool, message: &str) {
+        if windowed {
+            let color = if warning {
+                tray::IconColor::Error
+            } else {
+                tray::IconColor::Idle
+            };
+            self.state
+                .tray
+                .set_status(color, &format!("OpenWritr — {message}"));
+        } else if warning {
+            self.show_job_warning(message);
+        } else {
+            self.show_job_success(message);
+        }
+    }
+
+    fn deliver_file_transcript(
+        &mut self,
+        job: FileJob,
+        text: &str,
+        notes: Option<String>,
+        diarization: DiarizationOutcome,
+        cleanup: Option<crate::enhance::CleanupReport>,
+        repair: Option<RepairPlan>,
+        cleanup_warning: Option<FallbackReason>,
+    ) {
+        let windowed = job.window.is_some();
+        if text.trim().is_empty() {
+            job.tell_window(WindowMsg::Failed {
+                error: "No speech detected in the audio".into(),
+            });
+            self.report_long_form(windowed, true, "No speech detected in the audio");
+            return;
+        }
+        let document = render_transcript(job.markdown, &job.title, &job.details, text);
+        let output = job.output.clone();
+        let text = document.as_str();
+        let written = output
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&output, text));
+        if let Err(error) = written {
+            warn!(error = %error, file = %output.display(), "failed to write transcript");
+            // Never lose a long transcription to a bad path.
+            let _ = paste::deliver(text, paste::DeliveryMode::Clipboard);
+            job.tell_window(WindowMsg::Failed {
+                error: format!(
+                    "could not save {}: {error}. The transcript was copied to the clipboard.",
+                    output.display()
+                ),
+            });
+            self.report_long_form(
+                windowed,
+                true,
+                &format!(
+                    "Could not save transcript ({}); copied to clipboard",
+                    short_error(&error.to_string())
+                ),
+            );
+            return;
+        }
+        info!(file = %output.display(), chars = text.chars().count(), "transcript saved");
+        // The finished transcript supersedes the in-progress one. (If saving
+        // failed above we returned earlier and the partial file is kept.)
+        if let Some(partial) = &job.partial {
+            let _ = std::fs::remove_file(partial);
+        }
+        if let Err(error) = paste::deliver(text, paste::DeliveryMode::Clipboard) {
+            warn!(error = %error, "failed to copy transcript to clipboard");
+        }
+
+        // Meeting notes go next to the transcript as their own file.
+        let mut notes_saved = false;
+        if let (Some(notes_text), Some(notes_path)) = (notes.as_deref(), job.notes_output.as_ref())
+        {
+            let transcript_name = output
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let document = render_notes(&job.title, &job.details, &transcript_name, notes_text);
+            let saved = write_file(notes_path, &document);
+            match saved {
+                Ok(()) => notes_saved = true,
+                Err(error) => {
+                    warn!(error = %error, file = %notes_path.display(), "failed to write notes");
+                }
+            }
+        }
+
+        let missing = if job.notes && !notes_saved {
+            "AI notes"
+        } else {
+            "AI cleanup"
+        };
+        // What is still missing is retried in the background; say so.
+        let retrying = repair.is_some();
+        let summary = cleanup.as_ref().and_then(cleanup_summary);
+        if let Some(plan) = repair {
+            self.register_repair(&job, plan, text.to_string());
+        }
+        let (words, chars, preview) = transcript_window::summarize(text);
+        // Warnings for the popup: AI problems and unavailable speaker labels.
+        let mut warnings = Vec::new();
+        if cleanup_warning.is_some() {
+            warnings.push(format!(
+                "Saved without {missing}: provider or credential problem."
+            ));
+        } else if let Some(summary) = &summary {
+            warnings.push(format!("AI cleanup incomplete: {summary}."));
+        }
+        if retrying {
+            warnings.push("OpenWritr will retry automatically and update the file.".into());
+        }
+        if let DiarizationOutcome::Failed(reason) = &diarization {
+            warnings.push(format!("Speaker labels unavailable: {reason}"));
+        }
+        if let Some(note) = self.unlabelled_note(&diarization, text) {
+            warnings.push(note);
+        }
+        let speakers = match &diarization {
+            DiarizationOutcome::Labelled { speakers } => Some(*speakers),
+            _ => None,
+        };
+        let shown = job.tell_window(WindowMsg::Done {
+            output_path: output.display().to_string(),
+            words,
+            chars,
+            preview,
+            warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+            speakers,
+        });
+        // The popup has "Show in folder"; only pop Explorer open ourselves
+        // when nothing is showing the result (meetings, or popup closed).
+        if !shown {
+            if let Err(error) = diagnostics::reveal(&output) {
+                warn!(error = %error, "failed to reveal transcript");
+            }
+        }
+        let name = output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "transcript".into());
+        let retry_note = if retrying {
+            "; retrying automatically"
+        } else {
+            ""
+        };
+        if let Some(reason) = cleanup_warning {
+            warn!(?reason, "transcript saved without AI output");
+            self.report_long_form(
+                windowed,
+                true,
+                &format!(
+                    "Saved {name} without {missing} (provider or credential problem){retry_note}"
+                ),
+            );
+        } else if let Some(summary) = &summary {
+            self.report_long_form(
+                windowed,
+                true,
+                &format!("Saved {name} · {summary}{retry_note}"),
+            );
+        } else if let DiarizationOutcome::Failed(reason) = &diarization {
+            self.report_long_form(
+                windowed,
+                true,
+                &format!(
+                    "Saved {name} without speaker labels ({})",
+                    short_error(reason)
+                ),
+            );
+        } else {
+            let mut message = if notes_saved {
+                format!("Saved {name} and meeting notes")
+            } else {
+                format!("Saved {name} and copied to clipboard")
+            };
+            if let DiarizationOutcome::Labelled { speakers } = &diarization {
+                message.push_str(&format!(" · {speakers} speakers"));
+            } else if let Some(note) = self.unlabelled_note(&diarization, text) {
+                message.push_str(&format!(" · {}", note.trim_end_matches('.')));
+            }
+            self.report_long_form(windowed, false, &message);
+        }
+    }
+
+    /// Why a finished file or meeting transcript has no speaker labels, when
+    /// that is not an error (switched off, or only one voice heard).
+    fn unlabelled_note(&self, diarization: &DiarizationOutcome, text: &str) -> Option<String> {
+        match diarization {
+            // A retried cleanup reports `NotRequested` for text that already
+            // carries labels from the first pass.
+            DiarizationOutcome::NotRequested
+                if !self.state.settings.diarize_speakers && !text.contains("Speaker 1:") =>
+            {
+                Some("Speaker labels are off. Turn them on in Settings → Speaker labels.".into())
+            }
+            DiarizationOutcome::SingleSpeaker => {
+                Some("Only one speaker was detected, so no labels were added.".into())
+            }
+            _ => None,
+        }
+    }
+
+    /// Remember a delivered transcript whose AI steps can still be retried.
+    fn register_repair(&mut self, job: &FileJob, plan: RepairPlan, written: String) {
+        let id = self.state.next_repair_id;
+        self.state.next_repair_id += 1;
+        let name = job
+            .output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "transcript".into());
+        info!(id, file = %job.output.display(), "AI cleanup will be retried in the background");
+        self.state.repairs.push(Repair {
+            id,
+            name,
+            best_cleaned: vec![0; plan.pieces.len()],
+            plan,
+            output: job.output.clone(),
+            notes_output: job.notes_output.clone(),
+            markdown: job.markdown,
+            title: job.title.clone(),
+            details: job.details.clone(),
+            last_written: written,
+            failed_rounds: 0,
+            next_attempt: Instant::now() + Duration::from_secs(REPAIR_BACKOFF_SECONDS[0]),
+            in_flight: None,
+        });
+    }
+
+    /// Start the next retry of every delivered transcript that is due.
+    fn run_due_repairs(&mut self) {
+        if self.state.shutting_down || self.state.repairs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for index in 0..self.state.repairs.len() {
+            let repair = &self.state.repairs[index];
+            if repair.in_flight.is_some() || now < repair.next_attempt {
+                continue;
+            }
+            let Some(step) = next_repair_step(&repair.plan) else {
+                continue;
+            };
+            let kind = match step {
+                RepairStep::Piece(piece) => Rerun::Clean {
+                    raw: repair.plan.pieces[piece].raw.clone().unwrap_or_default(),
+                },
+                RepairStep::Notes => Rerun::Notes {
+                    text: repair.plan.assemble(),
+                },
+            };
+            let repair_id = repair.id;
+            let config = JobConfig::rerun(self.state.settings.clone(), kind);
+            match self
+                .state
+                .worker
+                .enqueue(Vec::new(), media::TARGET_RATE, config)
+            {
+                Ok(job_id) => {
+                    self.state.repairs[index].in_flight = Some(job_id);
+                    self.state.repair_jobs.insert(job_id, (repair_id, step));
+                }
+                Err(error) => {
+                    warn!(error = %error, "could not queue a cleanup retry");
+                    self.state.repairs[index].next_attempt = now + Duration::from_secs(60);
+                }
+            }
+        }
+    }
+
+    /// A background retry finished.
+    fn finish_repair_step(
+        &mut self,
+        job_id: u64,
+        text: String,
+        notes: Option<String>,
+        cleanup: Option<crate::enhance::CleanupReport>,
+    ) {
+        let Some((repair_id, step)) = self.state.repair_jobs.remove(&job_id) else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .repairs
+            .iter()
+            .position(|repair| repair.id == repair_id)
+        else {
+            return;
+        };
+        let mut transcript_changed = false;
+        let progressed;
+        {
+            let repair = &mut self.state.repairs[index];
+            repair.in_flight = None;
+            match step {
+                RepairStep::Piece(piece) => {
+                    let report = cleanup.unwrap_or_default();
+                    let improved = report.cleaned > repair.best_cleaned[piece];
+                    let complete = !report.needs_retry();
+                    if improved || complete {
+                        repair.plan.pieces[piece].text = text;
+                        transcript_changed = true;
+                    }
+                    if improved {
+                        repair.best_cleaned[piece] = report.cleaned;
+                    }
+                    if complete {
+                        repair.plan.pieces[piece].raw = None;
+                    }
+                    progressed = improved || complete;
+                }
+                RepairStep::Notes => match (notes, repair.notes_output.clone()) {
+                    (Some(notes), Some(path)) => {
+                        let transcript_name = repair
+                            .output
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let document =
+                            render_notes(&repair.title, &repair.details, &transcript_name, &notes);
+                        match write_file(&path, &document) {
+                            Ok(()) => {
+                                repair.plan.notes_failed = false;
+                                progressed = true;
+                            }
+                            Err(error) => {
+                                warn!(error = %error, file = %path.display(), "could not write the retried notes");
+                                progressed = false;
+                            }
+                        }
+                    }
+                    _ => progressed = false,
+                },
+            }
+        }
+
+        if transcript_changed {
+            if let Err(reason) = self.rewrite_repaired_transcript(index) {
+                // Most likely the file was edited or moved: leave it alone.
+                let repair = self.state.repairs.remove(index);
+                warn!(file = %repair.output.display(), reason, "stopping cleanup retries");
+                self.show_job_warning(&format!(
+                    "Left {} as it is ({reason}); automatic cleanup stopped",
+                    repair.name
+                ));
+                return;
+            }
+        }
+
+        let repair = &mut self.state.repairs[index];
+        if repair.plan.is_complete() {
+            let repair = self.state.repairs.remove(index);
+            info!(file = %repair.output.display(), "transcript cleanup finished in the background");
+            self.show_job_success(&format!("Finished cleaning up {}", repair.name));
+        } else if progressed {
+            repair.next_attempt = Instant::now() + REPAIR_STEP_PAUSE;
+        } else {
+            self.schedule_repair_retry(index);
+        }
+    }
+
+    /// A background retry did not run to completion.
+    fn abort_repair_step(&mut self, job_id: u64) {
+        let Some((repair_id, _)) = self.state.repair_jobs.remove(&job_id) else {
+            return;
+        };
+        if let Some(index) = self
+            .state
+            .repairs
+            .iter()
+            .position(|repair| repair.id == repair_id)
+        {
+            self.state.repairs[index].in_flight = None;
+            self.schedule_repair_retry(index);
+        }
+    }
+
+    /// Count a fruitless round and wait longer, or give up.
+    fn schedule_repair_retry(&mut self, index: usize) {
+        let repair = &mut self.state.repairs[index];
+        repair.failed_rounds += 1;
+        match repair_delay(repair.failed_rounds) {
+            Some(delay) => repair.next_attempt = Instant::now() + delay,
+            None => {
+                let repair = self.state.repairs.remove(index);
+                warn!(file = %repair.output.display(), "giving up on background cleanup");
+                self.show_job_warning(&format!(
+                    "Could not finish cleaning up {}; it stays as recognised",
+                    repair.name
+                ));
+            }
+        }
+    }
+
+    /// Rewrite the saved transcript from the repaired pieces, unless the file
+    /// was changed by someone else since we wrote it.
+    fn rewrite_repaired_transcript(&mut self, index: usize) -> Result<(), String> {
+        let repair = &mut self.state.repairs[index];
+        let current = std::fs::read_to_string(&repair.output)
+            .map_err(|_| "the file was moved or deleted".to_string())?;
+        if current != repair.last_written {
+            return Err("you have edited it".into());
+        }
+        let document = render_transcript(
+            repair.markdown,
+            &repair.title,
+            &repair.details,
+            &repair.plan.assemble(),
+        );
+        write_file(&repair.output, &document).map_err(|error| error.to_string())?;
+        repair.last_written = document;
+        Ok(())
+    }
+
     fn handle_worker_event(&mut self, el: &ActiveEventLoop, event: WorkerEvent) {
         match event {
+            // Background retries of AI cleanup / notes never touch the
+            // overlay, the job counters or the tray.
+            WorkerEvent::JobStarted { id }
+            | WorkerEvent::EnhancementStarted { id }
+            | WorkerEvent::JobProgress { id, .. }
+                if self.state.repair_jobs.contains_key(&id) => {}
+            WorkerEvent::JobCompleted {
+                id,
+                text,
+                cleanup,
+                notes,
+                ..
+            } if self.state.repair_jobs.contains_key(&id) => {
+                self.finish_repair_step(id, text, notes, cleanup);
+            }
+            WorkerEvent::JobFailed { id, .. } | WorkerEvent::JobDiscarded { id }
+                if self.state.repair_jobs.contains_key(&id) =>
+            {
+                self.abort_repair_step(id);
+            }
             WorkerEvent::ModelState {
                 generation,
                 engine,
@@ -1257,6 +2465,45 @@ impl AppHandler {
                     &format!("OpenWritr — {engine} failed: {short_error}; choose Retry"),
                 );
             }
+            WorkerEvent::JobStarted { id } if self.is_windowed_job(id) => {
+                self.state.active_job = Some(id);
+                self.tell_job_window(
+                    id,
+                    WindowMsg::Stage {
+                        stage: transcript_window::Stage::Transcribing,
+                        done: 0,
+                        total: 0,
+                    },
+                );
+                self.update_job_status();
+            }
+            WorkerEvent::EnhancementStarted { id } if self.is_windowed_job(id) => {
+                self.tell_job_window(
+                    id,
+                    WindowMsg::Stage {
+                        stage: transcript_window::Stage::CleaningUp,
+                        done: 0,
+                        total: 0,
+                    },
+                );
+                self.state.tray.set_status(
+                    tray::IconColor::Transcribing,
+                    "OpenWritr — cleaning up transcript",
+                );
+            }
+            WorkerEvent::JobProgress {
+                id,
+                stage,
+                done,
+                total,
+            } => {
+                let stage = match stage {
+                    JobStage::Diarizing => transcript_window::Stage::Diarizing,
+                    JobStage::Transcribing => transcript_window::Stage::Transcribing,
+                    JobStage::CleaningUp => transcript_window::Stage::CleaningUp,
+                };
+                self.tell_job_window(id, WindowMsg::Stage { stage, done, total });
+            }
             WorkerEvent::JobStarted { id } => {
                 if !self.state.overlay_state.job_started(id) {
                     warn!(id, "ignoring start event for unknown or inactive job");
@@ -1283,11 +2530,22 @@ impl AppHandler {
             WorkerEvent::JobCompleted {
                 id,
                 text,
+                diarization,
+                cleanup,
+                repair,
+                notes,
                 auto_paste,
                 enhancement_warning,
                 delivery_target,
             } => {
-                if !self.finish_job(id) {
+                let file_output = self.state.file_jobs.remove(&id);
+                let windowed = file_output.as_ref().is_some_and(FileJob::overlay_free);
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     warn!(id, "ignoring completion for tombstoned or unknown job");
                     return;
                 }
@@ -1295,6 +2553,27 @@ impl AppHandler {
                 self.sync_overlay();
                 if self.state.discarding_jobs {
                     warn!(id, "suppressing completed job during discard shutdown");
+                    return;
+                }
+                if let Some(job) = file_output {
+                    if job.background {
+                        // A non-final meeting part. The worker keeps its text
+                        // for the final stitch; here it only extends the
+                        // in-progress transcript on disk.
+                        if let Err(error) = meeting::append_partial(&job.output, &text) {
+                            warn!(error = %error, "could not extend the in-progress transcript");
+                        }
+                        return;
+                    }
+                    self.deliver_file_transcript(
+                        job,
+                        &text,
+                        notes,
+                        diarization,
+                        cleanup,
+                        repair,
+                        enhancement_warning,
+                    );
                     return;
                 }
                 if text.is_empty() {
@@ -1399,7 +2678,14 @@ impl AppHandler {
                 }
             }
             WorkerEvent::JobFailed { id, error } => {
-                if !self.finish_job(id) {
+                let file_job = self.state.file_jobs.remove(&id);
+                let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     warn!(id, "ignoring failure for tombstoned or unknown job");
                     return;
                 }
@@ -1412,14 +2698,32 @@ impl AppHandler {
                 } else {
                     self.update_job_status();
                 }
-                self.show_overlay_notice(
-                    NoticeKind::Error,
-                    format!("Transcription failed: {}", short_error(&error)),
-                );
+                if let Some(job) = file_job.filter(FileJob::overlay_free) {
+                    job.tell_window(WindowMsg::Failed {
+                        error: error.clone(),
+                    });
+                } else {
+                    self.show_overlay_notice(
+                        NoticeKind::Error,
+                        format!("Transcription failed: {}", short_error(&error)),
+                    );
+                }
             }
             WorkerEvent::JobDiscarded { id } => {
-                if !self.finish_job(id) {
+                let file_job = self.state.file_jobs.remove(&id);
+                let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
+                let finished = if windowed {
+                    self.finish_windowed_job(id)
+                } else {
+                    self.finish_job(id)
+                };
+                if !finished {
                     return;
+                }
+                if let Some(job) = file_job {
+                    job.tell_window(WindowMsg::Failed {
+                        error: "Cancelled because OpenWritr is quitting".into(),
+                    });
                 }
                 info!(id, "transcription job discarded");
                 self.update_job_status();
@@ -1430,6 +2734,30 @@ impl AppHandler {
                 self.exit_after_clipboard_settles(el);
             }
         }
+    }
+
+    /// Whether `id` is a file job whose progress lives in a popup window
+    /// rather than the overlay pill.
+    fn is_windowed_job(&self, id: u64) -> bool {
+        self.state
+            .file_jobs
+            .get(&id)
+            .is_some_and(FileJob::overlay_free)
+    }
+
+    fn tell_job_window(&self, id: u64, message: WindowMsg) {
+        if let Some(job) = self.state.file_jobs.get(&id) {
+            job.tell_window(message);
+        }
+    }
+
+    /// `finish_job` for jobs the overlay reducer never saw.
+    fn finish_windowed_job(&mut self, id: u64) -> bool {
+        self.state.pending_jobs = self.state.pending_jobs.saturating_sub(1);
+        if self.state.active_job == Some(id) {
+            self.state.active_job = None;
+        }
+        true
     }
 
     fn finish_job(&mut self, id: u64) -> bool {
@@ -1444,6 +2772,31 @@ impl AppHandler {
     }
 
     fn update_job_status(&self) {
+        // While a meeting is being recorded the tray shows *that*, however
+        // many earlier parts are being transcribed in the background.
+        if let Some(recorder) = &self.state.meeting {
+            let (color, state) = if recorder.is_paused() {
+                (
+                    tray::IconColor::Transcribing,
+                    "meeting paused, not recording",
+                )
+            } else {
+                (tray::IconColor::Recording, "recording meeting")
+            };
+            let queued = if self.state.pending_jobs > 0 {
+                format!(
+                    " · transcribing earlier parts ({} queued)",
+                    self.state.pending_jobs
+                )
+            } else {
+                String::new()
+            };
+            self.state.tray.set_status(
+                color,
+                &format!("OpenWritr — {state} ({}){queued}", recorder.sources()),
+            );
+            return;
+        }
         if self.state.pending_jobs > 0 {
             let noun = if self.state.pending_jobs == 1 {
                 "job"
@@ -1606,6 +2959,13 @@ impl AppHandler {
         if self.state.shutting_down {
             return;
         }
+        // Queue the meeting recorded so far so quitting never loses it; the
+        // existing "finish queued jobs?" prompt then covers it.
+        self.stop_meeting(false);
+        if self.state.pending_meeting.is_some() {
+            // Quit while the notes question was open: keep the transcript.
+            self.finish_pending_meeting(false);
+        }
         info!(pending_jobs = self.state.pending_jobs, "quit requested");
         self.state.shutting_down = true;
         self.state.hk_stop.store(true, Ordering::Relaxed);
@@ -1644,7 +3004,79 @@ impl AppHandler {
         if !paste::wait_for_pending_restorations(Duration::from_secs(2)) {
             warn!("clipboard restoration did not settle before the shutdown timeout");
         }
+        crate::local_llm::shutdown();
         el.exit();
+    }
+}
+
+/// Runs on the file-import thread after a file was picked: opens the popup,
+/// decodes, and returns the event that hands everything to the tray loop.
+fn import_file(
+    path: PathBuf,
+    markdown: bool,
+    cleanup: bool,
+    cleanup_engine: String,
+    engine: String,
+) -> UserEvent {
+    let (window, messages) = mpsc::channel();
+    if let Err(error) = transcript_window::spawn_window_thread(messages) {
+        // The job still runs; the result is saved and revealed as usual.
+        warn!(error = %error, "could not open the transcript window");
+    }
+    let output = media::unique_path(path.with_extension(if markdown { "md" } else { "txt" }));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio file".into());
+    let init = |duration: String| WindowMsg::Init {
+        title: name.clone(),
+        source_path: path.display().to_string(),
+        duration,
+        engine: engine.clone(),
+        cleanup,
+        cleanup_engine: cleanup_engine.clone(),
+        markdown,
+        output_path: output.display().to_string(),
+    };
+    let _ = window.send(init("reading…".into()));
+    let _ = window.send(WindowMsg::Stage {
+        stage: transcript_window::Stage::Decoding,
+        done: 0,
+        total: 0,
+    });
+    match media::decode_file(&path) {
+        Ok(samples) => {
+            let seconds = samples.len() / media::TARGET_RATE as usize;
+            info!(seconds, "file decoded");
+            let _ = window.send(init(format_duration(seconds)));
+            UserEvent::FileDecoded {
+                path,
+                samples,
+                output,
+                markdown,
+                window,
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let _ = window.send(WindowMsg::Failed {
+                error: message.clone(),
+            });
+            UserEvent::FileImportEnded(Some(message))
+        }
+    }
+}
+
+fn format_duration(total_seconds: usize) -> String {
+    let (hours, minutes, seconds) = (
+        total_seconds / 3600,
+        total_seconds % 3600 / 60,
+        total_seconds % 60,
+    );
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -1697,6 +3129,128 @@ mod tests {
     use crate::settings::{EnhanceMode, Settings};
     use crate::worker::RecordingIntent;
     use std::time::Instant;
+
+    fn file_job(window: bool, background: bool) -> super::FileJob {
+        super::FileJob {
+            output: std::path::PathBuf::new(),
+            markdown: false,
+            notes: false,
+            notes_output: None,
+            title: String::new(),
+            details: String::new(),
+            window: window.then(|| std::sync::mpsc::channel().0),
+            background,
+            session: None,
+            partial: None,
+        }
+    }
+
+    #[test]
+    fn repairs_back_off_and_eventually_give_up() {
+        let seconds: Vec<Option<u64>> = (1..=6)
+            .map(|round| super::repair_delay(round).map(|d| d.as_secs()))
+            .collect();
+        assert_eq!(
+            seconds,
+            vec![
+                Some(120),
+                Some(300),
+                Some(600),
+                Some(1_200),
+                Some(1_800),
+                None
+            ]
+        );
+        // Round zero (nothing failed yet) behaves like the first.
+        assert_eq!(super::repair_delay(0).map(|d| d.as_secs()), Some(120));
+    }
+
+    #[test]
+    fn repairs_fix_unfinished_pieces_in_order_then_the_notes() {
+        use super::{next_repair_step, RepairStep};
+        use crate::worker::{RepairPiece, RepairPlan};
+        let piece = |raw: Option<&str>| RepairPiece {
+            text: "t".into(),
+            raw: raw.map(str::to_string),
+        };
+        let mut plan = RepairPlan {
+            pieces: vec![piece(None), piece(Some("b")), piece(Some("c"))],
+            separator: " ".into(),
+            unlabel: false,
+            notes_failed: true,
+        };
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Piece(1)));
+        plan.pieces[1].raw = None;
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Piece(2)));
+        plan.pieces[2].raw = None;
+        assert_eq!(next_repair_step(&plan), Some(RepairStep::Notes));
+        plan.notes_failed = false;
+        assert_eq!(next_repair_step(&plan), None);
+    }
+
+    #[test]
+    fn documents_are_rendered_the_same_way_every_time() {
+        use super::{render_notes, render_transcript};
+        assert_eq!(render_transcript(false, "T", "d", "plain"), "plain");
+        let markdown = render_transcript(true, "Meeting 1", "details", "body text.");
+        assert!(markdown.starts_with("# Meeting 1\n\n*details*\n\n"));
+        let notes = render_notes(
+            "Meeting 2026-03-09 14:05",
+            "Recorded",
+            "Meeting.txt",
+            "## Summary",
+        );
+        assert!(notes.starts_with("# Meeting notes 2026-03-09 14:05\n"));
+        assert!(notes.contains("transcript: Meeting.txt"));
+    }
+
+    #[test]
+    fn the_cleanup_summary_only_appears_when_something_is_left() {
+        use super::cleanup_summary;
+        use crate::enhance::CleanupReport;
+        let report = |total, cleaned| CleanupReport {
+            total,
+            cleaned,
+            unreachable: 0,
+        };
+        assert_eq!(
+            cleanup_summary(&report(25, 21)).unwrap(),
+            "cleaned 21 of 25 sections"
+        );
+        assert!(cleanup_summary(&report(25, 25)).is_none());
+        assert!(cleanup_summary(&report(0, 0)).is_none());
+    }
+
+    #[test]
+    fn notes_decision_covers_every_mode() {
+        use super::notes_decision;
+        use super::NotesDecision::{Ask as AskUser, Create, Skip, SkipNoProvider};
+        use crate::settings::MeetingNotesMode::{Always, Ask, Never};
+        // Never: no notes, no question, no hint.
+        for ready in [true, false] {
+            for may_ask in [true, false] {
+                assert_eq!(notes_decision(Never, ready, may_ask), Skip);
+            }
+        }
+        // Always: notes whenever a provider is ready, even while quitting.
+        assert_eq!(notes_decision(Always, true, true), Create);
+        assert_eq!(notes_decision(Always, true, false), Create);
+        assert_eq!(notes_decision(Always, false, true), SkipNoProvider);
+        // Ask: the question only when it can be shown and notes are possible.
+        assert_eq!(notes_decision(Ask, true, true), AskUser);
+        assert_eq!(notes_decision(Ask, true, false), Skip);
+        assert_eq!(notes_decision(Ask, false, true), SkipNoProvider);
+        assert_eq!(notes_decision(Ask, false, false), Skip);
+    }
+
+    #[test]
+    fn popup_and_background_jobs_stay_out_of_the_dictation_overlay() {
+        // Dictation-style meeting jobs (the final part, with the pill) use it.
+        assert!(!file_job(false, false).overlay_free());
+        // A file job shows in its popup, a background meeting part nowhere.
+        assert!(file_job(true, false).overlay_free());
+        assert!(file_job(false, true).overlay_free());
+    }
 
     #[test]
     fn recording_intent_covers_the_full_shift_truth_table() {
@@ -1759,7 +3313,13 @@ mod tests {
         assert_eq!(active.settings.prompt_target().unwrap(), target);
         let resolved = active.settings.resolve_prompt(&target);
         assert_eq!(resolved.source, PromptSource::CustomOverride);
-        assert_eq!(resolved.system, "snapshot prompt");
+        assert_eq!(
+            resolved.system,
+            format!(
+                "snapshot prompt\n\n{}",
+                crate::cleanup::prompt::TRANSCRIPT_ONLY_POLICY
+            )
+        );
         assert_eq!(active.intent, RecordingIntent::Enhance);
     }
 

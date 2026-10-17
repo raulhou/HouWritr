@@ -6,14 +6,19 @@ use crate::cleanup::{catalog, PromptSource, PromptTarget};
 use crate::credentials::{store_verified, CredentialStore, WindowsCredentialStore};
 use crate::diagnostics;
 use crate::enhance::{self, CopilotReadiness};
-use crate::model_manager::{ModelCacheState, ModelInfo, ModelManager};
+use crate::model_manager::{
+    CancellationToken, ModelCacheState, ModelDetails, ModelInfo, ModelManager, ModelState,
+};
 use crate::paths::settings_path;
-use crate::settings::{Enhance, EnhanceMode, Settings, SettingsRevision};
+use crate::settings::{Enhance, EnhanceMode, MeetingNotesMode, Settings, SettingsRevision};
 use crate::single_instance::SettingsTransaction;
 use anyhow::{anyhow, Result};
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+mod local_model;
+use local_model::LocalModelUi;
 
 pub fn run_dialog(show_about: bool) -> Result<()> {
     let (settings, initial_error, migration_blocked, load_failed, settings_revision) =
@@ -64,6 +69,7 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
         Box::new(move |cc| {
             apply_dark_theme(&cc.egui_ctx);
             Ok(Box::new(SettingsApp {
+                local_model: LocalModelUi::new(&settings.enhance),
                 settings,
                 dirty: false,
                 api_key_input: String::new(),
@@ -82,14 +88,55 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
                 show_about,
                 about_error: None,
                 autostart: AutostartUi::new(),
+                speaker_model: SpeakerModelUi::load(),
             }))
         }),
     )
     .map_err(|error| anyhow!("egui run failed: {error}"))
 }
 
-fn apply_dark_theme(ctx: &egui::Context) {
+/// Windows fonts that cover Chinese, best first. egui's built-in fonts have
+/// no CJK glyphs, so without one of these Chinese text shows as boxes.
+const CJK_FONT_FILES: &[&str] = &["msyh.ttc", "msjh.ttc", "simsun.ttc", "Deng.ttf"];
+
+fn cjk_font_candidates(windows_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    CJK_FONT_FILES
+        .iter()
+        .map(|file| windows_dir.join("Fonts").join(file))
+        .collect()
+}
+
+/// Add the first installed Chinese-capable system font behind egui's own
+/// fonts, so Latin text looks the same and Chinese falls through to it.
+fn install_cjk_fallback_font(ctx: &egui::Context) {
+    let windows_dir = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SystemRoot"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let Some(bytes) = cjk_font_candidates(&windows_dir)
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "system-cjk".into(),
+        egui::FontData::from_owned(bytes).into(),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("system-cjk".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+pub(crate) fn apply_dark_theme(ctx: &egui::Context) {
     use egui::{Color32, FontFamily, FontId, Stroke, Style, Visuals};
+    install_cjk_fallback_font(ctx);
     let mut style = Style::default();
     style.visuals = Visuals::dark();
     style.visuals.window_fill = Color32::from_rgb(20, 23, 31);
@@ -138,6 +185,49 @@ struct SettingsApp {
     show_about: bool,
     about_error: Option<String>,
     autostart: AutostartUi,
+    speaker_model: SpeakerModelUi,
+    local_model: LocalModelUi,
+}
+
+/// Id of the speaker-label models in `models-manifest.json`.
+const SPEAKER_MODEL_ID: &str = "diarization";
+
+/// Progress messages from a background download / verification.
+enum ModelJobEvent {
+    State(ModelState),
+    Done(std::result::Result<(), String>),
+}
+
+/// A running download or verification of the speaker-label models.
+struct ModelJob {
+    events: Receiver<ModelJobEvent>,
+    cancel: CancellationToken,
+    state: Option<ModelState>,
+    verify_only: bool,
+}
+
+/// What the "Speaker labels" section shows about the local models.
+struct SpeakerModelUi {
+    details: std::result::Result<ModelDetails, String>,
+    job: Option<ModelJob>,
+    /// Result of the last download/verify: `Ok(message)` or `Err(message)`.
+    outcome: Option<std::result::Result<String, String>>,
+    link_error: Option<String>,
+}
+
+impl SpeakerModelUi {
+    fn load() -> Self {
+        Self {
+            details: ModelManager::describe(SPEAKER_MODEL_ID).map_err(|error| error.to_string()),
+            job: None,
+            outcome: None,
+            link_error: None,
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.details = ModelManager::describe(SPEAKER_MODEL_ID).map_err(|error| error.to_string());
+    }
 }
 
 /// OS autostart state, kept separate from `Settings`: it is machine/OS state,
@@ -353,6 +443,96 @@ impl SettingsApp {
         self.copilot_rx = Some(start_copilot_probe());
     }
 
+    /// Start downloading (`verify_only == false`) or just verifying the
+    /// speaker-label models on a background thread.
+    fn start_speaker_model_job(&mut self, verify_only: bool) {
+        if self.speaker_model.job.is_some() {
+            return;
+        }
+        let (sender, events) = mpsc::channel();
+        let cancel = CancellationToken::default();
+        let token = cancel.clone();
+        let spawned = std::thread::Builder::new()
+            .name("speaker-model".into())
+            .spawn(move || {
+                let result = (|| -> std::result::Result<(), String> {
+                    let manager = ModelManager::new_preserving_work_dirs()
+                        .map_err(|error| error.to_string())?;
+                    if verify_only {
+                        let _ = sender.send(ModelJobEvent::State(ModelState::Verifying));
+                        manager
+                            .verify_existing(SPEAKER_MODEL_ID, &token)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        manager
+                            .ensure(SPEAKER_MODEL_ID, &token, |state| {
+                                let _ = sender.send(ModelJobEvent::State(state));
+                            })
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                })();
+                let _ = sender.send(ModelJobEvent::Done(result));
+            });
+        match spawned {
+            Ok(_) => {
+                self.speaker_model.outcome = None;
+                self.speaker_model.link_error = None;
+                self.speaker_model.job = Some(ModelJob {
+                    events,
+                    cancel,
+                    state: None,
+                    verify_only,
+                });
+            }
+            Err(error) => {
+                self.speaker_model.outcome =
+                    Some(Err(format!("Could not start the background task: {error}")));
+            }
+        }
+    }
+
+    fn poll_speaker_model_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.speaker_model.job.as_mut() else {
+            return;
+        };
+        let mut finished = None;
+        loop {
+            match job.events.try_recv() {
+                Ok(ModelJobEvent::State(state)) => job.state = Some(state),
+                Ok(ModelJobEvent::Done(result)) => {
+                    finished = Some((result, job.verify_only));
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some((
+                        Err("the background task stopped unexpectedly".into()),
+                        job.verify_only,
+                    ));
+                    break;
+                }
+            }
+        }
+        match finished {
+            Some((result, verify_only)) => {
+                self.speaker_model.job = None;
+                self.speaker_model.outcome = Some(match result {
+                    Ok(()) if verify_only => {
+                        Ok("Files verified: sizes and SHA-256 hashes match.".into())
+                    }
+                    Ok(()) => Ok("Speaker label models are installed and verified.".into()),
+                    Err(message) if message.contains("cancelled") => {
+                        Err("Download cancelled. Nothing was installed.".into())
+                    }
+                    Err(message) => Err(message),
+                });
+                self.speaker_model.refresh();
+            }
+            None => ctx.request_repaint_after(std::time::Duration::from_millis(150)),
+        }
+    }
+
     fn refresh_engine_states(&mut self) {
         self.engine_states = load_engine_states();
     }
@@ -402,7 +582,7 @@ impl SettingsApp {
                 "github_copilot" => match self.copilot_readiness.as_ref() {
                     Some(CopilotReadiness::Ready) => {}
                     Some(CopilotReadiness::CliMissing) => {
-                        return Some("GitHub CLI is not installed or is not on PATH.".into())
+                        return Some("GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.".into())
                     }
                     Some(CopilotReadiness::NotAuthenticated) => {
                         return Some(
@@ -770,6 +950,236 @@ impl SettingsApp {
         }
     }
 
+    fn render_speaker_labels(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            self.dirty |= ui
+                .checkbox(
+                    &mut self.settings.diarize_speakers,
+                    "Label speakers in file and meeting transcripts",
+                )
+                .changed();
+            info_button(
+                ui,
+                "Adds \"Speaker 1:\", \"Speaker 2:\" … labels and a [m:ss] time marker per turn, using small on-device models that run on the CPU. Nothing is sent anywhere. Accuracy drops with overlapping talk or poor audio.",
+            );
+        });
+        ui.add_space(6.0);
+
+        let details = self.speaker_model.details.clone();
+        let busy = self.speaker_model.job.is_some();
+        let mut start_download = false;
+        let mut start_verify = false;
+        let mut refresh = false;
+        let mut cancel = false;
+        let mut open_folder = None;
+        let mut open_link: Option<String> = None;
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Local models").strong());
+            match &details {
+                Ok(details) => {
+                    let (text, color) = match details.info.cache_state {
+                        ModelCacheState::Installed => ("Installed", status_green()),
+                        ModelCacheState::Missing => ("Not downloaded", warning_color()),
+                        ModelCacheState::Incomplete => (
+                            "Incomplete: files are missing or the wrong size",
+                            warning_color(),
+                        ),
+                    };
+                    status_label(ui, text, color);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "pyannote segmentation 3.0 + WeSpeaker ResNet34 · {} · runs on the CPU",
+                            format_bytes(details.info.download_bytes)
+                        ))
+                        .small()
+                        .color(secondary_text()),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Location: {}",
+                            details.directory.display()
+                        ))
+                        .small()
+                        .color(secondary_text()),
+                    );
+                    if !self.settings.diarize_speakers
+                        && details.info.cache_state != ModelCacheState::Installed
+                    {
+                        ui.label(
+                            egui::RichText::new(
+                                "Speaker labels are off, so nothing is downloaded until you turn them on or install the models here.",
+                            )
+                            .small()
+                            .color(secondary_text()),
+                        );
+                    }
+                }
+                Err(error) => inline_error(
+                    ui,
+                    format!("Could not inspect the local models: {error}"),
+                ),
+            }
+
+            if let Some(job) = &self.speaker_model.job {
+                ui.add_space(6.0);
+                match &job.state {
+                    Some(ModelState::Downloading {
+                        downloaded_bytes,
+                        total_bytes,
+                    }) => {
+                        let fraction = if *total_bytes == 0 {
+                            0.0
+                        } else {
+                            (*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0)
+                        };
+                        ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                        status_label(
+                            ui,
+                            &format!(
+                                "Downloading {} of {}",
+                                format_bytes(*downloaded_bytes),
+                                format_bytes(*total_bytes)
+                            ),
+                            secondary_text(),
+                        );
+                    }
+                    Some(ModelState::Verifying) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Verifying files…");
+                        });
+                    }
+                    _ => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(if job.verify_only {
+                                "Checking files…"
+                            } else {
+                                "Preparing download…"
+                            });
+                        });
+                    }
+                }
+            }
+
+            ui.add_space(6.0);
+            let installed = matches!(
+                &details,
+                Ok(details) if details.info.cache_state == ModelCacheState::Installed
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!busy && !installed, egui::Button::new("Download and install"))
+                    .clicked()
+                {
+                    start_download = true;
+                }
+                if busy && ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Verify files"))
+                    .clicked()
+                {
+                    start_verify = true;
+                }
+                if ui.button("Open model folder").clicked() {
+                    if let Ok(details) = &details {
+                        open_folder = Some(details.directory.clone());
+                    }
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Refresh status"))
+                    .clicked()
+                {
+                    refresh = true;
+                }
+            });
+        });
+
+        match &self.speaker_model.outcome {
+            Some(Ok(message)) => status_label(ui, message, status_green()),
+            Some(Err(message)) => inline_error(ui, message.clone()),
+            None => {}
+        }
+        if let Some(error) = &self.speaker_model.link_error {
+            inline_error(ui, error.clone());
+        }
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Install manually (offline or restricted network)")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    "1. Download both files below in your browser.\n\
+                     2. Save them with exactly these names into the model folder.\n\
+                     3. Click \"Verify files\". OpenWritr checks each file's size and SHA-256 and \
+                        rejects anything that does not match.",
+                );
+                if let Ok(details) = &details {
+                    ui.add_space(4.0);
+                    for file in &details.files {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(&file.path).monospace().strong());
+                                if file.present {
+                                    status_label(ui, "present", status_green());
+                                } else {
+                                    status_label(ui, "missing", warning_color());
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} bytes · SHA-256 {}",
+                                    file.bytes, file.sha256
+                                ))
+                                .small()
+                                .color(secondary_text()),
+                            );
+                            if ui.small_button("Open download link").clicked() {
+                                open_link = Some(file.url.clone());
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Open model folder").clicked() {
+                        open_folder = Some(details.directory.clone());
+                    }
+                }
+            });
+
+        if cancel {
+            if let Some(job) = &self.speaker_model.job {
+                job.cancel.cancel();
+            }
+        }
+        if start_download {
+            self.start_speaker_model_job(false);
+        }
+        if start_verify {
+            self.start_speaker_model_job(true);
+        }
+        if refresh {
+            self.speaker_model.refresh();
+            self.speaker_model.outcome = None;
+        }
+        if let Some(directory) = open_folder {
+            if let Err(error) = diagnostics::open_directory(&directory) {
+                self.speaker_model.link_error =
+                    Some(format!("Could not open the model folder: {error}"));
+            }
+        }
+        if let Some(url) = open_link {
+            if let Err(error) = about::open_url(&url) {
+                self.speaker_model.link_error =
+                    Some(format!("Could not open the download link: {error}"));
+            }
+        }
+    }
+
     fn render_output(&mut self, ui: &mut egui::Ui) {
         let before = self.settings.auto_paste;
         ui.horizontal_wrapped(|ui| {
@@ -806,10 +1216,47 @@ impl SettingsApp {
             .changed();
         self.dirty |= ui
             .checkbox(
+                &mut self.settings.show_meeting_indicator,
+                "Show a recording indicator during meeting recordings",
+            )
+            .changed();
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("When a meeting recording stops, create AI meeting notes:");
+            info_button(
+                ui,
+                "Notes (summary, decisions, action items) are written by your AI provider from the transcript text, so they need a provider set up under Text enhancement. The transcript itself is always saved.",
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (mode, label) in [
+                (MeetingNotesMode::Ask, "Ask every time"),
+                (MeetingNotesMode::Always, "Always"),
+                (MeetingNotesMode::Never, "Never"),
+            ] {
+                self.dirty |= ui
+                    .radio_value(&mut self.settings.meeting_notes, mode, label)
+                    .changed();
+            }
+        });
+        self.dirty |= ui
+            .checkbox(
                 &mut self.settings.sounds,
                 "Play recording start and stop sounds",
             )
             .changed();
+        ui.horizontal_wrapped(|ui| {
+            self.dirty |= ui
+                .checkbox(
+                    &mut self.settings.markdown_transcripts,
+                    "Save file and meeting transcripts as Markdown",
+                )
+                .changed();
+            info_button(
+                ui,
+                "Imported-file and meeting transcripts are saved as .md with a title, details line and paragraphs instead of plain .txt. AI cleanup applies to both formats.",
+            );
+        });
     }
 
     fn render_enhancement(&mut self, ui: &mut egui::Ui) {
@@ -884,31 +1331,13 @@ impl SettingsApp {
                 "Only recognized transcript text is sent to the provider. Recorded audio stays on this PC.",
             );
         });
-        let before_provider = self.settings.enhance.provider.clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(
-                &mut self.settings.enhance.provider,
-                "github_copilot".into(),
-                "GitHub Copilot",
-            );
-            ui.radio_value(
-                &mut self.settings.enhance.provider,
-                "openai_compatible".into(),
-                "OpenAI-compatible API",
-            );
-        });
-        if before_provider != self.settings.enhance.provider {
-            if self.settings.enhance.provider != "openai_compatible" {
-                self.api_key_input.clear();
-                self.remove_api_key = false;
-            }
-            self.dirty = true;
-        }
+        self.render_provider_choice(ui);
 
         ui.add_space(8.0);
 
         match self.settings.enhance.provider.as_str() {
             "github_copilot" => self.render_github_copilot(ui),
+            "openai_compatible" if self.local_model.local_selected => self.render_local_model(ui),
             "openai_compatible" => self.render_openai_compatible(ui),
             _ => inline_error(ui, "Select a supported enhancement provider."),
         }
@@ -937,7 +1366,7 @@ impl SettingsApp {
                 }
                 Some(CopilotReadiness::CliMissing) => status_label(
                     ui,
-                    "GitHub CLI is not installed or is not on PATH.",
+                    "GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.",
                     error_color(),
                 ),
                 Some(CopilotReadiness::NotAuthenticated) => status_label(
@@ -1029,6 +1458,10 @@ impl SettingsApp {
         }
 
         ui.add_space(6.0);
+        self.render_api_key_controls(ui);
+    }
+
+    fn render_api_key_controls(&mut self, ui: &mut egui::Ui) {
         match &self.credential_status {
             CredentialStatus::Saved if !self.remove_api_key => status_label(
                 ui,
@@ -1448,6 +1881,8 @@ impl SettingsApp {
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_copilot_probe();
+        self.poll_speaker_model_job(ctx);
+        self.poll_local_model(ctx);
 
         if ctx.input(|input| input.viewport().close_requested()) && self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1555,6 +1990,12 @@ impl eframe::App for SettingsApp {
                         "Output and feedback",
                         "Choose where completed text goes and what OpenWritr shows.",
                         |ui| self.render_output(ui),
+                    );
+                    section(
+                        ui,
+                        "Speaker labels",
+                        "Label who is speaking in file and meeting transcripts.",
+                        |ui| self.render_speaker_labels(ui),
                     );
                     section(
                         ui,
@@ -1746,7 +2187,7 @@ fn info_button(ui: &mut egui::Ui, help: &str) {
         .on_hover_text_at_pointer(help);
 }
 
-fn inline_error(ui: &mut egui::Ui, message: impl Into<String>) {
+pub(crate) fn inline_error(ui: &mut egui::Ui, message: impl Into<String>) {
     ui.label(
         egui::RichText::new(message.into())
             .small()
@@ -1911,6 +2352,19 @@ fn label_for_trigger(trigger: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cjk_font_candidates_live_in_the_windows_fonts_folder_best_first() {
+        let found = cjk_font_candidates(std::path::Path::new("win"));
+        assert_eq!(found.len(), CJK_FONT_FILES.len());
+        assert_eq!(
+            found[0],
+            std::path::Path::new("win").join("Fonts").join("msyh.ttc")
+        );
+        assert!(found
+            .iter()
+            .all(|path| path.parent().unwrap().ends_with("Fonts")));
+    }
+
     use super::*;
     use crate::credentials::CredentialError;
     use parking_lot::Mutex;

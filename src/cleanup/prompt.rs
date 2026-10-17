@@ -323,7 +323,10 @@ mod tests {
         let target = PromptTarget::github_copilot("gpt-5-mini").unwrap();
         let resolved = resolve_prompt(&target, &FixedOverride(Some("  custom prompt  ")));
         assert_eq!(resolved.source, PromptSource::CustomOverride);
-        assert_eq!(resolved.system, "custom prompt");
+        assert_eq!(
+            resolved.system,
+            format!("custom prompt\n\n{TRANSCRIPT_ONLY_POLICY}")
+        );
     }
 
     #[test]

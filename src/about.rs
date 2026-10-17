@@ -26,6 +26,8 @@ pub const PRIVACY_URL: &str = "https://github.com/trsdn/openwritr-windows/blob/m
 pub const LICENSE_URL: &str = "https://github.com/trsdn/openwritr-windows/blob/main/LICENSE";
 
 pub const PARAKEET_URL: &str = "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3";
+pub const PYANNOTE_SEGMENTATION_URL: &str = "https://huggingface.co/pyannote/segmentation-3.0";
+pub const WESPEAKER_URL: &str = "https://github.com/wenet-e2e/wespeaker";
 pub const PARAKEET_ONNX_URL: &str = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx";
 pub const PARAKEET_NPU_URL: &str = "https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s";
 pub const WHISPER_QNN_URL: &str = "https://huggingface.co/qualcomm/Whisper-Large-V3-Turbo";
@@ -96,6 +98,16 @@ pub const CREDITS: &[Credit] = &[
         name: "Whisper Large v3 Turbo QNN assets",
         attribution: "Qualcomm · Apache-2.0 / BSD-3-Clause",
         url: WHISPER_QNN_URL,
+    },
+    Credit {
+        name: "pyannote segmentation 3.0 (speaker labels)",
+        attribution: "CNRS / pyannote · MIT",
+        url: PYANNOTE_SEGMENTATION_URL,
+    },
+    Credit {
+        name: "WeSpeaker ResNet34-LM (speaker labels)",
+        attribution: "WeSpeaker · weights trained on VoxCeleb · CC-BY-4.0",
+        url: WESPEAKER_URL,
     },
     Credit {
         name: "ONNX Runtime",

@@ -41,6 +41,19 @@ const VALID_TRIGGERS: &[&str] = &[
 const VALID_ENGINES: &[&str] = &["parakeet_cpu", "parakeet_npu", "whisper_npu"];
 const PROMPT_OVERRIDES_VERSION: u64 = 1;
 
+/// What to do about AI meeting notes when a meeting recording stops.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingNotesMode {
+    /// Show the "also create meeting notes?" question every time.
+    #[default]
+    Ask,
+    /// Create notes without asking (needs an AI provider).
+    Always,
+    /// Never create notes and never ask.
+    Never,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnhanceMode {
@@ -336,7 +349,19 @@ pub struct Settings {
     pub engine: String,
     pub auto_paste: bool,
     pub overlay: bool,
+    /// Keep a "Recording 12:34" pill on screen for the whole meeting
+    /// recording (independent of the dictation overlay).
+    pub show_meeting_indicator: bool,
+    /// Whether stopping a meeting recording creates AI notes: ask, always
+    /// or never.
+    pub meeting_notes: MeetingNotesMode,
     pub sounds: bool,
+    /// Save imported-file and meeting transcripts as Markdown (`.md`, with a
+    /// title and paragraphs) instead of plain `.txt`.
+    pub markdown_transcripts: bool,
+    /// Label speakers ("Speaker 1: …") in file and meeting transcripts using
+    /// the on-device diarization models.
+    pub diarize_speakers: bool,
     pub min_record_seconds: f32,
     pub max_record_seconds: f32,
     pub enhance: Enhance,
@@ -351,7 +376,11 @@ impl Default for Settings {
             engine: "parakeet_cpu".into(),
             auto_paste: true,
             overlay: true,
+            show_meeting_indicator: true,
+            meeting_notes: MeetingNotesMode::Ask,
             sounds: true,
+            markdown_transcripts: false,
+            diarize_speakers: false,
             min_record_seconds: 0.25,
             max_record_seconds: 60.0,
             enhance: Enhance::default(),
@@ -984,6 +1013,49 @@ mod tests {
     }
 
     #[test]
+    fn meeting_notes_default_to_asking_and_round_trip_every_mode() {
+        assert_eq!(Settings::default().meeting_notes, MeetingNotesMode::Ask);
+        // A settings file from before the option existed.
+        let old: Settings = serde_json::from_str(r#"{ "overlay": false }"#).unwrap();
+        assert_eq!(old.meeting_notes, MeetingNotesMode::Ask);
+
+        for mode in [
+            MeetingNotesMode::Ask,
+            MeetingNotesMode::Always,
+            MeetingNotesMode::Never,
+        ] {
+            let mut settings = Settings::default();
+            settings.meeting_notes = mode;
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                json["meeting_notes"],
+                match mode {
+                    MeetingNotesMode::Ask => "ask",
+                    MeetingNotesMode::Always => "always",
+                    MeetingNotesMode::Never => "never",
+                }
+            );
+            let reloaded: Settings = serde_json::from_value(json).unwrap();
+            assert_eq!(reloaded.meeting_notes, mode);
+        }
+    }
+
+    #[test]
+    fn meeting_indicator_defaults_on_and_old_files_keep_it() {
+        assert!(Settings::default().show_meeting_indicator);
+        // A settings file from before the option existed.
+        let old: Settings = serde_json::from_str(r#"{ "overlay": false }"#).unwrap();
+        assert!(old.show_meeting_indicator);
+        assert!(!old.overlay);
+
+        let mut hidden = Settings::default();
+        hidden.show_meeting_indicator = false;
+        let reloaded: Settings =
+            serde_json::from_value(serde_json::to_value(&hidden).unwrap()).unwrap();
+        assert!(!reloaded.show_meeting_indicator);
+    }
+
+    #[test]
     fn enhancement_mode_round_trips() {
         let mut settings = Settings::default();
         settings.enhance.mode = EnhanceMode::Always;
@@ -1083,7 +1155,13 @@ mod tests {
         );
         let resolved = settings.resolve_prompt(&target);
         assert_eq!(resolved.source, cleanup::PromptSource::CustomOverride);
-        assert_eq!(resolved.system, "custom cleanup prompt");
+        assert_eq!(
+            resolved.system,
+            format!(
+                "custom cleanup prompt\n\n{}",
+                crate::cleanup::prompt::TRANSCRIPT_ONLY_POLICY
+            )
+        );
     }
 
     #[test]

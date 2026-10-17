@@ -116,9 +116,22 @@ pub enum OverlayViewState {
         kind: NoticeKind,
         message: String,
     },
+    /// A meeting recording is in progress (or paused). Shown by its own
+    /// pill so it stays visible through dictation, jobs and notices.
+    Meeting {
+        elapsed_secs: u64,
+        paused: bool,
+    },
 }
 
 impl OverlayViewState {
+    pub fn meeting(elapsed_secs: u64, paused: bool) -> Self {
+        OverlayViewState::Meeting {
+            elapsed_secs,
+            paused,
+        }
+    }
+
     pub fn listening(intent: ListeningIntent) -> Self {
         OverlayViewState::Listening {
             enhanced: intent.is_enhance(),
@@ -171,6 +184,10 @@ impl OverlayController {
     }
 }
 
+/// Spawn one pill window at the standard overlay position (bottom-centre of
+/// the primary monitor). The dictation pill and the meeting pill are both
+/// created here and so sit in exactly the same place; the app keeps only one
+/// of them visible at a time.
 pub fn spawn(handles: OverlayHandles, enabled: bool) -> std::io::Result<OverlayController> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
@@ -195,6 +212,8 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
+        // A second pill registers the same class; that fails harmlessly and
+        // the existing registration is used.
         RegisterClassExW(&wc);
 
         let sw = GetSystemMetrics(SM_CXSCREEN);
@@ -224,6 +243,11 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
         // fully transparent. Lets the pill have a true rounded shape with no
         // visible rectangle around it.
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+
+        // Per-window render state, owned by this window's message-loop thread
+        // (read from `wnd_proc`) and written by its tick thread.
+        let shared = Arc::new(WindowShared::default());
+        SHARED.with(|slot| *slot.borrow_mut() = Some(shared.clone()));
 
         let level = handles.level_x10000.clone();
         let stop = handles.stop.clone();
@@ -268,7 +292,7 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
                     }
                     if visible {
                         let lvl = level.load(Ordering::Relaxed);
-                        *RENDER.lock() = RenderFrame::for_view(&state.view, lvl);
+                        *shared.render.lock() = RenderFrame::for_view(&state.view, lvl);
                         let phase = started.elapsed().as_millis() as u32;
                         let _ = PostMessageW(
                             Some(hwnd),
@@ -290,12 +314,48 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
     }
 }
 
-static PHASE_MS: AtomicU32 = AtomicU32::new(0);
-static RENDER: parking_lot::Mutex<RenderFrame> = parking_lot::Mutex::new(RenderFrame::Waveform {
-    color: 0x00FF_FFFF,
-    amplitude: 0.0,
-    label: String::new(),
-});
+/// What one overlay window paints. Each window has its own, so two pills
+/// (dictation and meeting) never draw each other's frame.
+struct WindowShared {
+    render: parking_lot::Mutex<RenderFrame>,
+    phase_ms: AtomicU32,
+}
+
+impl Default for WindowShared {
+    fn default() -> Self {
+        Self {
+            render: parking_lot::Mutex::new(RenderFrame::Waveform {
+                color: 0x00FF_FFFF,
+                amplitude: 0.0,
+                label: String::new(),
+            }),
+            phase_ms: AtomicU32::new(0),
+        }
+    }
+}
+
+thread_local! {
+    /// Set once on a window's message-loop thread; `wnd_proc` and the draw
+    /// helpers run on that same thread.
+    static SHARED: std::cell::RefCell<Option<Arc<WindowShared>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_phase_ms() -> u32 {
+    SHARED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(0, |shared| shared.phase_ms.load(Ordering::Relaxed))
+    })
+}
+
+fn current_frame() -> Option<RenderFrame> {
+    SHARED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|shared| shared.render.lock().clone())
+    })
+}
 
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -306,7 +366,11 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_CREATE => LRESULT(0),
         WM_APP_TICK => {
-            PHASE_MS.store(lparam.0 as u32, Ordering::Relaxed);
+            SHARED.with(|slot| {
+                if let Some(shared) = slot.borrow().as_ref() {
+                    shared.phase_ms.store(lparam.0 as u32, Ordering::Relaxed);
+                }
+            });
             let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
@@ -340,7 +404,11 @@ unsafe extern "system" fn wnd_proc(
             SelectObject(mem_dc, old_brush);
             let _ = DeleteObject(pill.into());
 
-            match RENDER.lock().clone() {
+            match current_frame().unwrap_or(RenderFrame::Waveform {
+                color: 0x00FF_FFFF,
+                amplitude: 0.0,
+                label: String::new(),
+            }) {
                 RenderFrame::Text { color, message } => {
                     draw_notice_text(mem_dc, w, h, color, &message);
                 }
@@ -409,7 +477,7 @@ fn waveform_layout(w: i32, h: i32, label_width: i32) -> WaveformLayout {
 /// and amplitude source are now parameterized by typed state.
 unsafe fn draw_waveform_bars(mem_dc: HDC, layout: &WaveformLayout, color: u32, amplitude: f32) {
     let amp = amplitude.clamp(0.0, 1.0);
-    let phase = PHASE_MS.load(Ordering::Relaxed) as f32 / 1000.0;
+    let phase = current_phase_ms() as f32 / 1000.0;
 
     let bar_brush = CreateSolidBrush(COLORREF(color));
     let old_brush = SelectObject(mem_dc, bar_brush.into());
@@ -603,6 +671,33 @@ fn listening_label(enhanced: bool) -> &'static str {
     }
 }
 
+/// `m:ss`, or `h:mm:ss` from one hour on.
+fn clock_label(total_seconds: u64) -> String {
+    let (hours, minutes, seconds) = (
+        total_seconds / 3600,
+        total_seconds % 3600 / 60,
+        total_seconds % 60,
+    );
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn meeting_label(elapsed_secs: u64, paused: bool) -> String {
+    let word = if paused { "Paused" } else { "Recording" };
+    format!("{word} {}", clock_label(elapsed_secs))
+}
+
+fn meeting_color(paused: bool) -> u32 {
+    if paused {
+        rgb(251, 191, 36) // amber: not recording right now
+    } else {
+        rgb(239, 68, 68) // red: recording
+    }
+}
+
 fn phase_label(phase: ProcessingPhase, queue_depth: usize) -> String {
     let base = match phase {
         ProcessingPhase::Queued => "Queued",
@@ -662,13 +757,21 @@ fn waveform_amplitude(view: &OverlayViewState, level_x10000: u32) -> f32 {
             // strong movement, then a generous multiplier saturates loud speech.
             (0.20 + level.sqrt() * 2.2).min(1.0)
         }
+        OverlayViewState::Meeting { paused: false, .. } => {
+            let level = (level_x10000 as f32 / 10_000.0).clamp(0.0, 1.0);
+            // Never fully flat while recording, so the pill reads as "live"
+            // even in a quiet room.
+            (0.20 + level.sqrt() * 2.2).min(1.0)
+        }
+        OverlayViewState::Meeting { paused: true, .. } => 0.12,
         OverlayViewState::Processing { .. } => 0.55,
         OverlayViewState::Hidden | OverlayViewState::Notice { .. } => 0.0,
     }
 }
 
 /// Everything `WM_PAINT` needs to draw one frame, computed once per tick on
-/// the background thread and handed to the message-loop thread via `RENDER`.
+/// the background thread and handed to the message-loop thread via the
+/// window's `WindowShared`.
 #[derive(Clone)]
 enum RenderFrame {
     Waveform {
@@ -696,6 +799,14 @@ impl RenderFrame {
                 color: phase_color(*phase),
                 amplitude: waveform_amplitude(view, level_x10000),
                 label: phase_label(*phase, *queue_depth),
+            },
+            OverlayViewState::Meeting {
+                elapsed_secs,
+                paused,
+            } => RenderFrame::Waveform {
+                color: meeting_color(*paused),
+                amplitude: waveform_amplitude(view, level_x10000),
+                label: meeting_label(*elapsed_secs, *paused),
             },
             OverlayViewState::Notice { kind, message } => RenderFrame::Text {
                 color: notice_color(*kind),
@@ -1019,6 +1130,79 @@ mod tests {
             }
             RenderFrame::Waveform { .. } => panic!("notices must render as text"),
         }
+    }
+
+    // --- meeting recording pill -------------------------------------------
+
+    fn meeting_frame(elapsed_secs: u64, paused: bool, level: u32) -> (u32, f32, String) {
+        let view = OverlayViewState::meeting(elapsed_secs, paused);
+        match RenderFrame::for_view(&view, level) {
+            RenderFrame::Waveform {
+                color,
+                amplitude,
+                label,
+            } => (color, amplitude, label),
+            RenderFrame::Text { .. } => panic!("the meeting pill renders bars and a caption"),
+        }
+    }
+
+    #[test]
+    fn meeting_pill_shows_a_running_clock() {
+        assert_eq!(meeting_frame(0, false, 0).2, "Recording 0:00");
+        assert_eq!(meeting_frame(65, false, 0).2, "Recording 1:05");
+        assert_eq!(meeting_frame(3_725, false, 0).2, "Recording 1:02:05");
+        assert_eq!(meeting_frame(65, true, 0).2, "Paused 1:05");
+    }
+
+    #[test]
+    fn meeting_pill_is_red_when_recording_and_amber_when_paused() {
+        let recording = meeting_frame(10, false, 0).0;
+        let paused = meeting_frame(10, true, 0).0;
+        assert_eq!(recording, rgb(239, 68, 68));
+        assert_eq!(paused, rgb(251, 191, 36));
+        assert_ne!(recording, paused);
+        // Distinct from the dictation pill's white/violet.
+        assert_ne!(recording, listening_color(false));
+        assert_ne!(recording, listening_color(true));
+    }
+
+    #[test]
+    fn meeting_bars_follow_the_level_and_freeze_when_paused() {
+        let quiet = meeting_frame(10, false, 0).1;
+        let loud = meeting_frame(10, false, 9_000).1;
+        assert!(quiet >= 0.2, "a quiet room must still read as live");
+        assert!(loud > quiet);
+        assert!(loud <= 1.0);
+        // Paused ignores the level and sits flat and low.
+        assert_eq!(meeting_frame(10, true, 9_000).1, 0.12);
+    }
+
+    #[test]
+    fn meeting_view_is_visible_until_hidden_and_never_expires() {
+        let mut state = TickState::new(true);
+        let now = Instant::now();
+        state.apply_command(
+            OverlayCommand::SetState(OverlayViewState::meeting(5, false)),
+            now,
+        );
+        assert!(state.tick(now));
+        // Unlike a notice, it has no deadline.
+        assert!(state.tick(now + Duration::from_secs(3_600)));
+        state.apply_command(OverlayCommand::SetState(OverlayViewState::Hidden), now);
+        assert!(!state.tick(now));
+    }
+
+    #[test]
+    fn meeting_pill_respects_the_enabled_flag() {
+        let mut state = TickState::new(false);
+        let now = Instant::now();
+        state.apply_command(
+            OverlayCommand::SetState(OverlayViewState::meeting(5, false)),
+            now,
+        );
+        assert!(!state.tick(now), "hidden by setting");
+        state.apply_command(OverlayCommand::SetEnabled(true), now);
+        assert!(state.tick(now), "shown again once enabled");
     }
 
     // --- long notice text robustness -------------------------------------
