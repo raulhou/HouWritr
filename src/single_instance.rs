@@ -94,7 +94,7 @@ impl SettingsTransaction {
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
-                    "timed out waiting for another OpenWritr settings transaction"
+                    "timed out waiting for another HouWritr settings transaction"
                 ));
             }
             std::thread::sleep(Duration::from_millis(25));

@@ -221,9 +221,14 @@ fn download_verified(
         if read == 0 {
             break;
         }
+        done += read as u64;
+        if done > expected_bytes {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            bail!("the download is larger than expected");
+        }
         hasher.update(&buffer[..read]);
         file.write_all(&buffer[..read])?;
-        done += read as u64;
         progress((done as f32 / total as f32).min(1.0));
     }
     file.flush()?;
@@ -572,6 +577,17 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     .spawn()
     .map_err(|error| LocalLlmError::StartFailed(error.to_string()))?;
     kill_with_parent(&child);
+    {
+        use std::os::windows::io::AsRawHandle;
+        // The server drives the NPU from the CPU; a throttled server process
+        // would feed it slowly.
+        if !crate::power::opt_out_of_throttling(child.as_raw_handle() as _) {
+            warn!(
+                error = %std::io::Error::last_os_error(),
+                "could not opt the local model server out of power throttling"
+            );
+        }
+    }
     // Everything the server prints goes into OpenWritr's log, so a model
     // that fails or stalls can be diagnosed from one file.
     if let Some(stream) = child.stdout.take() {

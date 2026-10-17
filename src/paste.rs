@@ -714,6 +714,7 @@ fn write_injected_payload(
 
         write_clipboard_text(&payload.text)?;
         write_clipboard_marker(payload.marker_format, &payload.marker)?;
+        mark_clipboard_private();
         Ok(())
     });
     if let Err(error) = result {
@@ -911,6 +912,32 @@ fn write_clipboard_marker(marker_format: u32, marker: &str) -> Result<()> {
     let mut bytes = marker.as_bytes().to_vec();
     bytes.push(0);
     set_clipboard_memory(marker_format, &bytes).context("write the HouWritr clipboard marker")
+}
+
+/// Clipboard formats Windows reads to keep content out of Clipboard History
+/// (Win+V), cloud clipboard sync to the user's other devices, and clipboard
+/// monitoring apps. The transcript is only on the clipboard for the moment
+/// the paste takes, so none of them should keep a copy.
+const PRIVATE_CLIPBOARD_FORMATS: [&str; 3] = [
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+];
+
+/// Add the [`PRIVATE_CLIPBOARD_FORMATS`] to the open clipboard. Best effort:
+/// a failure here must not stop the paste. The two "Can..." formats take a
+/// u32 of 0 meaning "no"; the first only has to be present.
+fn mark_clipboard_private() {
+    for name in PRIVATE_CLIPBOARD_FORMATS {
+        let wide = wide_null(name);
+        let format = unsafe { RegisterClipboardFormatW(wide.as_ptr()) };
+        if format == 0 {
+            continue;
+        }
+        if let Err(error) = set_clipboard_memory(format, &0_u32.to_le_bytes()) {
+            tracing::debug!(error = %error, format = name, "could not mark the paste as private");
+        }
+    }
 }
 
 fn set_clipboard_memory(format: u32, bytes: &[u8]) -> Result<()> {

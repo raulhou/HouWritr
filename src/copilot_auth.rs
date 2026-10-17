@@ -61,8 +61,16 @@ const TOKEN_VARIABLES: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_
 const CACHE_FOR: Duration = Duration::from_secs(600);
 
 /// The token to send to GitHub Copilot, and where it came from.
+/// The last token found, where from, and when.
+static CACHE: Mutex<Option<(String, TokenSource, Instant)>> = Mutex::new(None);
+
+/// Forget the cached token (GitHub refused it), so the next request looks
+/// again and picks up a fresh `copilot login`.
+pub fn forget_token() {
+    *CACHE.lock() = None;
+}
+
 pub fn copilot_token() -> Result<(String, TokenSource), CopilotAuthError> {
-    static CACHE: Mutex<Option<(String, TokenSource, Instant)>> = Mutex::new(None);
     if let Some((token, source, at)) = CACHE.lock().as_ref() {
         if at.elapsed() < CACHE_FOR {
             return Ok((token.clone(), *source));

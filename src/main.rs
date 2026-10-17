@@ -1,4 +1,4 @@
-//! OpenWritr — native push-to-talk voice-to-text for Windows.
+//! HouWritr: native push to talk voice to text for Windows.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -21,6 +21,7 @@ mod model_manager;
 mod overlay;
 mod paste;
 mod paths;
+mod power;
 mod self_check;
 mod settings;
 mod settings_ui;
@@ -91,6 +92,9 @@ fn main() -> Result<()> {
     // polling for keys. It tracks physical key state across focus changes,
     // which GetAsyncKeyState cannot.
     key_hook::install_once();
+    // The tray process does the heavy work (transcription, speaker labels,
+    // cleanup) without ever having a foreground window.
+    power::opt_out_for_this_process();
     let result = app::run();
     if let Err(ref failure) = result {
         error!(error = %failure, "tray process stopping after error");
