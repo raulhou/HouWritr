@@ -55,6 +55,9 @@ pub enum WindowMsg {
         duration: String,
         engine: String,
         cleanup: bool,
+        /// Which model does the AI cleanup; empty when unknown.
+        #[serde(default)]
+        cleanup_engine: String,
         markdown: bool,
         output_path: String,
     },
@@ -86,6 +89,7 @@ pub struct WindowState {
     pub duration: String,
     pub engine: String,
     pub cleanup: bool,
+    pub cleanup_engine: String,
     pub markdown: bool,
     pub output_path: String,
     pub stage: Stage,
@@ -116,6 +120,7 @@ impl WindowState {
             duration: String::new(),
             engine: String::new(),
             cleanup: false,
+            cleanup_engine: String::new(),
             markdown: false,
             output_path: String::new(),
             stage: Stage::Decoding,
@@ -137,6 +142,7 @@ impl WindowState {
                 duration,
                 engine,
                 cleanup,
+                cleanup_engine,
                 markdown,
                 output_path,
             } => {
@@ -145,6 +151,7 @@ impl WindowState {
                 self.duration = duration;
                 self.engine = engine;
                 self.cleanup = cleanup;
+                self.cleanup_engine = cleanup_engine;
                 self.markdown = markdown;
                 self.output_path = output_path;
             }
@@ -439,15 +446,14 @@ impl eframe::App for TranscriptWindow {
                     row(ui, "Source", &self.state.source_path);
                     row(ui, "Length", &self.state.duration);
                     row(ui, "Engine", &self.state.engine);
-                    row(
-                        ui,
-                        "AI cleanup",
-                        if self.state.cleanup {
-                            "On"
-                        } else {
-                            "Off (raw transcript)"
-                        },
-                    );
+                    let cleanup = if !self.state.cleanup {
+                        "Off (raw transcript)".to_string()
+                    } else if self.state.cleanup_engine.is_empty() {
+                        "On".to_string()
+                    } else {
+                        format!("On · {}", self.state.cleanup_engine)
+                    };
+                    row(ui, "AI cleanup", &cleanup);
                     row(
                         ui,
                         "Format",
@@ -529,6 +535,7 @@ mod tests {
                 duration: "12:03".into(),
                 engine: "Parakeet CPU".into(),
                 cleanup: true,
+                cleanup_engine: "Qwen3-4B-Instruct-2507 · this PC (NPU)".into(),
                 markdown: false,
                 output_path: "C:\\a\\talk.txt".into(),
             },

@@ -1539,6 +1539,7 @@ impl AppHandler {
         let proxy = self.state.proxy.clone();
         let markdown = self.state.settings.markdown_transcripts;
         let cleanup = self.state.settings.enhance.mode.is_enabled();
+        let cleanup_engine = crate::enhance::cleanup_engine_label(&self.state.settings);
         let engine = match &self.state.engine_state {
             EngineState::Ready { label } => label.clone(),
             _ => self.state.settings.engine.clone(),
@@ -1552,7 +1553,7 @@ impl AppHandler {
                     let _ = proxy.send_event(UserEvent::FileImportEnded(None));
                     return;
                 };
-                let event = import_file(path, markdown, cleanup, engine);
+                let event = import_file(path, markdown, cleanup, cleanup_engine, engine);
                 let _ = proxy.send_event(event);
             });
         if let Err(error) = spawned {
@@ -3010,7 +3011,13 @@ impl AppHandler {
 
 /// Runs on the file-import thread after a file was picked: opens the popup,
 /// decodes, and returns the event that hands everything to the tray loop.
-fn import_file(path: PathBuf, markdown: bool, cleanup: bool, engine: String) -> UserEvent {
+fn import_file(
+    path: PathBuf,
+    markdown: bool,
+    cleanup: bool,
+    cleanup_engine: String,
+    engine: String,
+) -> UserEvent {
     let (window, messages) = mpsc::channel();
     if let Err(error) = transcript_window::spawn_window_thread(messages) {
         // The job still runs; the result is saved and revealed as usual.
@@ -3027,6 +3034,7 @@ fn import_file(path: PathBuf, markdown: bool, cleanup: bool, engine: String) -> 
         duration,
         engine: engine.clone(),
         cleanup,
+        cleanup_engine: cleanup_engine.clone(),
         markdown,
         output_path: output.display().to_string(),
     };

@@ -192,6 +192,24 @@ pub fn uses_local_model(settings: &Settings) -> bool {
         .unwrap_or(false)
 }
 
+/// What the transcript window shows for "AI cleanup": which model does it
+/// and where it runs, e.g. `Qwen3-4B-Instruct-2507 · this PC (NPU)`.
+pub fn cleanup_engine_label(settings: &Settings) -> String {
+    let model = settings.enhance.model.trim();
+    let name = model.rsplit('/').next().unwrap_or(model);
+    match settings.prompt_target() {
+        Ok(target) => match target.endpoint() {
+            Some(endpoint) if crate::local_llm::is_managed(endpoint) => {
+                format!("{name} · this PC (NPU)")
+            }
+            Some(endpoint) if endpoint.is_loopback() => format!("{name} · this PC"),
+            Some(endpoint) => format!("{name} · {}", endpoint.host()),
+            None => format!("GitHub Copilot · {name}"),
+        },
+        Err(_) => name.to_string(),
+    }
+}
+
 /// Small local models have short context windows and generate slowly, so
 /// they get smaller slices than a hosted model.
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
@@ -844,6 +862,30 @@ mod long_form_tests {
         let mut copilot = Settings::default();
         copilot.enhance.provider = "github_copilot".into();
         assert!(!uses_local_model(&copilot));
+    }
+
+    #[test]
+    fn cleanup_label_names_the_model_and_where_it_runs() {
+        assert_eq!(
+            cleanup_engine_label(&{
+                let mut s = openai_settings("http://127.0.0.1:18651/v1");
+                s.enhance.model = "ai-hub-models/Qwen3-4B-Instruct-2507".into();
+                s
+            }),
+            "Qwen3-4B-Instruct-2507 · this PC (NPU)"
+        );
+        assert_eq!(
+            cleanup_engine_label(&openai_settings("http://localhost:11434/v1")),
+            "some-model · this PC"
+        );
+        assert_eq!(
+            cleanup_engine_label(&openai_settings("https://api.openai.com/v1")),
+            "some-model · api.openai.com"
+        );
+        let mut copilot = Settings::default();
+        copilot.enhance.provider = "github_copilot".into();
+        copilot.enhance.model = "gpt-4.1".into();
+        assert_eq!(cleanup_engine_label(&copilot), "GitHub Copilot · gpt-4.1");
     }
 
     #[test]
