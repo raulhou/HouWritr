@@ -55,6 +55,46 @@ pub struct DecodedChunk {
     pub tokens: Vec<i32>,
     pub language_token: i32,
     pub steps: usize,
+    pub ending: Ending,
+}
+
+/// How decoding a chunk stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// The model said it was done.
+    Finished,
+    /// The decoder ran out of room (199 steps): the rest of the chunk's
+    /// speech is missing.
+    OutOfRoom,
+    /// The model kept repeating the same words; one copy is kept and the
+    /// rest of the chunk's speech is missing.
+    Looping,
+}
+
+/// Longest run of tokens checked for repetition.
+const LOOP_MAX_PERIOD: usize = 24;
+/// A run repeated this many times in a row ...
+const LOOP_MIN_REPEATS: usize = 4;
+/// ... and covering at least this many tokens is a loop, not speech.
+const LOOP_MIN_SPAN: usize = 24;
+
+/// If `tokens` ends in a loop, how many tokens to keep: everything before the
+/// loop plus one copy of the repeated run.
+pub fn loop_cut(tokens: &[i32]) -> Option<usize> {
+    let len = tokens.len();
+    for period in 1..=LOOP_MAX_PERIOD.min(len / LOOP_MIN_REPEATS) {
+        let last = &tokens[len - period..];
+        let mut repeats = 1;
+        while (repeats + 1) * period <= len
+            && &tokens[len - (repeats + 1) * period..len - repeats * period] == last
+        {
+            repeats += 1;
+        }
+        if repeats >= LOOP_MIN_REPEATS && repeats * period >= LOOP_MIN_SPAN {
+            return Some(len - (repeats - 1) * period);
+        }
+    }
+    None
 }
 
 pub fn encoder_contract() -> Result<SessionContract> {
@@ -266,6 +306,7 @@ pub fn decode_chunk(
     let mut detected_language = language_token;
     let mut emitted = Vec::new();
     let mut steps = 0;
+    let mut ending = Ending::OutOfRoom;
 
     for position in 0..SELF_CACHE_LENGTH {
         attention_mask[DECODE_WINDOW - position - 1] = f16::ZERO.to_bits();
@@ -296,9 +337,15 @@ pub fn decode_chunk(
             continue;
         }
         if predicted == TOKEN_EOT {
+            ending = Ending::Finished;
             break;
         }
         emitted.push(predicted);
+        if let Some(keep) = loop_cut(&emitted) {
+            emitted.truncate(keep);
+            ending = Ending::Looping;
+            break;
+        }
         current_token = predicted;
     }
 
@@ -306,6 +353,7 @@ pub fn decode_chunk(
         tokens: emitted,
         language_token: detected_language.expect("language is set before decoding text"),
         steps,
+        ending,
     })
 }
 
@@ -453,6 +501,34 @@ mod tests {
         assert!(decoder.selections[1..]
             .iter()
             .all(|selection| *selection == TokenSelection::All));
+    }
+
+    #[test]
+    fn a_repeating_phrase_is_cut_to_one_copy() {
+        let phrase = [501, 502, 503, 504, 505];
+        let mut tokens = vec![7, 8, 9];
+        for _ in 0..6 {
+            tokens.extend(phrase);
+        }
+        // Everything before the loop and one copy of the phrase.
+        assert_eq!(loop_cut(&tokens), Some(3 + phrase.len()));
+        // A phrase said twice, or a short stutter, is speech.
+        let mut twice = vec![7, 8, 9];
+        twice.extend(phrase);
+        twice.extend(phrase);
+        assert_eq!(loop_cut(&twice), None);
+        assert_eq!(loop_cut(&[42, 42, 42, 42]), None);
+        assert_eq!(loop_cut(&[]), None);
+    }
+
+    #[test]
+    fn decoding_stops_when_the_model_loops() {
+        let mut predictions = vec![10, 20, 30, 1_000];
+        predictions.extend(std::iter::repeat([2_000, 2_001, 2_002]).take(40).flatten());
+        let mut decoder = FakeDecoder::new(predictions);
+        let decoded = decode_chunk(&mut decoder, &[], Some(LANGUAGE_TOKEN_END)).unwrap();
+        assert_eq!(decoded.ending, Ending::Looping);
+        assert_eq!(decoded.tokens, [1_000, 2_000, 2_001, 2_002]);
     }
 
     #[test]

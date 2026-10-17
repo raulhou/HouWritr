@@ -521,7 +521,10 @@ fn is_diagnostic_bundle(path: &Path) -> bool {
 fn open_explorer(path: &Path, select: bool) -> Result<()> {
     let mut command = Command::new("explorer.exe");
     if select {
-        command.arg(format!("/select,{}", path.display()));
+        // Explorer wants `/select,"C:\path\file name.md"`. Passed as one
+        // argument, a path with a space gets the whole `/select,...` quoted,
+        // which Explorer does not understand: it opened Documents instead.
+        command.raw_arg(select_argument(path));
     } else {
         command.arg(path);
     }
@@ -533,6 +536,15 @@ fn open_explorer(path: &Path, select: bool) -> Result<()> {
         .spawn()
         .with_context(|| format!("open Explorer for {}", path.display()))?;
     Ok(())
+}
+
+/// Explorer's argument to open the folder of `path` with the file selected.
+/// Paths cannot contain `"`, so quoting the path is enough. Explorer does not
+/// understand the `\\?\` long path prefix, so it is dropped.
+fn select_argument(path: &Path) -> String {
+    let text = path.display().to_string();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    format!("/select,\"{text}\"")
 }
 
 trait UnlinkIfExists {
@@ -668,6 +680,18 @@ mod tests {
         }
         prune_matching(temp.path(), 7, is_log_file).unwrap();
         assert_eq!(recent_files(temp.path(), is_log_file).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn explorer_selects_files_whose_path_has_spaces() {
+        assert_eq!(
+            select_argument(Path::new(r"C:\Users\me\Downloads\talk (7).md")),
+            r#"/select,"C:\Users\me\Downloads\talk (7).md""#
+        );
+        assert_eq!(
+            select_argument(Path::new(r"\\?\C:\a b\c.md")),
+            r#"/select,"C:\a b\c.md""#
+        );
     }
 
     #[test]
