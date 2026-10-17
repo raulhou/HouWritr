@@ -121,7 +121,7 @@ pub fn begin(job: u64, kind: RecordingKind) {
     }
 }
 
-/// Stop writing the log of job `job`, once the app has finished with it.
+/// Stop writing the log of job `job`, once the app has saved its result.
 pub fn end(job: u64) {
     let mut current = CURRENT.lock();
     if current.as_ref().is_some_and(|current| current.job == job) {

@@ -11,7 +11,6 @@ use crate::cleanup::{
 };
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
-use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -345,6 +344,7 @@ pub(crate) struct PreparedCleanupRequest {
 
 /// Resolve provider/model/endpoint/prompt and build the exact adapter request
 /// from a frozen settings snapshot. Credentials are intentionally absent.
+#[cfg(test)]
 pub(crate) fn prepare_cleanup_request(
     text: &str,
     settings: &Settings,
@@ -1543,49 +1543,6 @@ pub fn generate_meeting_notes(
     ) {
         Ok(notes) => NotesOutcome::Notes(notes),
         Err(reason) => NotesOutcome::Failed(reason),
-    }
-}
-
-/// Compatibility facade retained for callers that still expect provider and
-/// credential failures as `Err`. New worker code consumes [`EnhanceOutcome`]
-/// directly.
-pub fn enhance(text: &str, settings: &Settings) -> Result<String> {
-    let outcome = enhance_outcome(text, settings, || true)
-        .ok_or_else(|| anyhow!("enhancement was cancelled"))?;
-    match outcome {
-        EnhanceOutcome::RawFallback { reason, .. }
-            if matches!(
-                reason,
-                FallbackReason::UnknownProvider
-                    | FallbackReason::MissingCredential
-                    | FallbackReason::CredentialTargetChanged
-                    | FallbackReason::InvalidEndpoint
-                    | FallbackReason::EmptyModelId
-                    | FallbackReason::RequestFailed
-                    | FallbackReason::ResponseUnparseable
-            ) =>
-        {
-            Err(anyhow!(fallback_diagnostic(&reason)))
-        }
-        outcome => Ok(outcome.into_text()),
-    }
-}
-
-fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
-    match reason {
-        FallbackReason::UnknownProvider => "unknown enhancement provider",
-        FallbackReason::MissingCredential => "enhancement credential is not configured",
-        FallbackReason::CredentialTargetChanged => {
-            "enhancement provider or endpoint changed before send"
-        }
-        FallbackReason::InvalidEndpoint => "invalid OpenAI-compatible endpoint",
-        FallbackReason::EmptyModelId => "enhancement model ID is empty",
-        FallbackReason::RequestFailed => "enhancement provider request failed",
-        FallbackReason::ProviderRejected(_) => "enhancement provider rejected the request",
-        FallbackReason::ResponseUnparseable => "enhancement provider response was invalid",
-        FallbackReason::EmptyCandidate => "enhancement returned an empty candidate",
-        FallbackReason::IntegrityRejected(_) => "enhancement failed integrity validation",
-        FallbackReason::ValidatorError => "enhancement validator failed",
     }
 }
 

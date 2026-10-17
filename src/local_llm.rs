@@ -835,28 +835,6 @@ fn kill_with_parent(child: &Child) {
 // Test connection (used by Settings)
 // ---------------------------------------------------------------------------
 
-/// Start the built-in server and load its model in the background, so the
-/// cleanup that follows a dictation does not wait for the NPU to wake up.
-/// Does nothing unless `base_url` is the built-in endpoint.
-pub fn prewarm(base_url: &str, model: &str) {
-    static RUNNING: AtomicBool = AtomicBool::new(false);
-    if !is_managed_url(base_url) || RUNNING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let (base_url, model) = (base_url.to_string(), model.to_string());
-    let spawned = std::thread::Builder::new()
-        .name("local-llm-prewarm".into())
-        .spawn(move || {
-            if let Err(error) = test_chat(&base_url, &model) {
-                warn!(error = %error, "local model prewarm failed");
-            }
-            RUNNING.store(false, Ordering::Release);
-        });
-    if spawned.is_err() {
-        RUNNING.store(false, Ordering::Release);
-    }
-}
-
 /// Models a server reports at `GET <base>/models` (OpenAI list format).
 pub fn discover_models(base_url: &str) -> Result<Vec<String>> {
     let scope = EndpointScope::parse(base_url).map_err(|error| anyhow!(error.to_string()))?;

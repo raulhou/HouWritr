@@ -2,7 +2,7 @@
 //!
 //! The tray process never draws this window itself. Like Settings and About
 //! it runs as its own `--transcript-window` subprocess, so a GUI failure can
-//! never take down hotkeys or dictation. The tray streams [`WindowMsg`]s as
+//! never take down meeting recording. The tray streams [`WindowMsg`]s as
 //! JSON lines to the child's stdin; the child only renders them. The window
 //! uses native decorations, so minimize / restore / close come from Windows.
 //! Closing it never cancels the job: the tray keeps going, saves the file and
@@ -389,17 +389,6 @@ impl TranscriptWindow {
             self.notice = Some(format!("Could not open the folder: {error}"));
         }
     }
-
-    fn copy_output(&mut self, ctx: &egui::Context) {
-        // The popup only previews; copy the whole saved transcript.
-        match std::fs::read_to_string(&self.state.output_path) {
-            Ok(text) => {
-                ctx.copy_text(text);
-                self.notice = Some("Copied the transcript".into());
-            }
-            Err(error) => self.notice = Some(format!("Could not read the file: {error}")),
-        }
-    }
 }
 
 impl eframe::App for TranscriptWindow {
@@ -514,9 +503,6 @@ impl eframe::App for TranscriptWindow {
                     }
                     if ui.button("Show in folder").clicked() {
                         self.reveal_output();
-                    }
-                    if ui.button("Copy text").clicked() {
-                        self.copy_output(ctx);
                     }
                     if ui.button("Close").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -8,8 +8,8 @@
 //! state with the tray's winit loop — so it can never deadlock the main app,
 //! no matter what happens here.
 //!
-//! Look: a horizontal pill near the bottom-center. While listening or
-//! processing a job it shows a row of vertical bars whose heights breathe
+//! Look: a horizontal pill near the bottom-center. While recording a meeting
+//! or processing a job it shows a row of vertical bars whose heights breathe
 //! with the audio level (or a steady pulse once there's no live audio),
 //! plus a small caption. Transient notices instead show word-wrapped text.
 //! Gaussian envelope makes the center bars react strongest, with a per-bar
@@ -59,23 +59,6 @@ pub struct OverlayHandles {
     pub stop: Arc<AtomicBool>,
 }
 
-/// What the in-flight recording intends to do with the transcript. Mirrors
-/// `worker::RecordingIntent` (Raw/Enhance) in shape, but is defined locally —
-/// under a distinct name — so this module has no compile-time dependency on
-/// `worker`. The integration layer added later is expected to map
-/// `worker::RecordingIntent` to this type when calling `set_state`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListeningIntent {
-    Raw,
-    Enhance,
-}
-
-impl ListeningIntent {
-    pub fn is_enhance(self) -> bool {
-        matches!(self, ListeningIntent::Enhance)
-    }
-}
-
 /// Stage of a queued transcription/enhancement job, used by
 /// `OverlayViewState::Processing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,21 +74,15 @@ pub enum NoticeKind {
     Success,
     Info,
     Warning,
-    RawFallback,
-    ProviderWarning,
-    DeliveryWarning,
     Error,
 }
 
 /// The overlay's entire presentation state. The renderer is a pure function
-/// of the most recently applied `OverlayViewState` (plus live RMS while
-/// listening) — it never infers anything from recorder/app atomics.
+/// of the most recently applied `OverlayViewState` (plus live RMS while a
+/// meeting records) — it never infers anything from recorder/app atomics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayViewState {
     Hidden,
-    Listening {
-        enhanced: bool,
-    },
     Processing {
         job_id: u64,
         phase: ProcessingPhase,
@@ -117,7 +94,7 @@ pub enum OverlayViewState {
         message: String,
     },
     /// A meeting recording is in progress (or paused). Shown by its own
-    /// pill so it stays visible through dictation, jobs and notices.
+    /// pill so it stays visible through jobs and notices.
     Meeting {
         elapsed_secs: u64,
         paused: bool,
@@ -129,12 +106,6 @@ impl OverlayViewState {
         OverlayViewState::Meeting {
             elapsed_secs,
             paused,
-        }
-    }
-
-    pub fn listening(intent: ListeningIntent) -> Self {
-        OverlayViewState::Listening {
-            enhanced: intent.is_enhance(),
         }
     }
 
@@ -185,7 +156,7 @@ impl OverlayController {
 }
 
 /// Spawn one pill window at the standard overlay position (bottom-centre of
-/// the primary monitor). The dictation pill and the meeting pill are both
+/// the primary monitor). The status pill and the meeting pill are both
 /// created here and so sit in exactly the same place; the app keeps only one
 /// of them visible at a time.
 pub fn spawn(handles: OverlayHandles, enabled: bool) -> std::io::Result<OverlayController> {
@@ -315,7 +286,7 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
 }
 
 /// What one overlay window paints. Each window has its own, so two pills
-/// (dictation and meeting) never draw each other's frame.
+/// (status and meeting) never draw each other's frame.
 struct WindowShared {
     render: parking_lot::Mutex<RenderFrame>,
     phase_ms: AtomicU32,
@@ -471,7 +442,7 @@ fn waveform_layout(w: i32, h: i32, label_width: i32) -> WaveformLayout {
 }
 
 /// Renders the 22-bar Gaussian-envelope waveform. `amplitude` (0.0-1.0)
-/// drives overall bar height — computed from live RMS while listening, or a
+/// drives overall bar height — computed from live RMS while a meeting records, or a
 /// steady synthetic pulse while processing a job (see `waveform_amplitude`).
 /// This is the same bar math the overlay has always used; only the color
 /// and amplitude source are now parameterized by typed state.
@@ -509,8 +480,8 @@ unsafe fn draw_waveform_bars(mem_dc: HDC, layout: &WaveformLayout, color: u32, a
     let _ = DeleteObject(bar_brush.into());
 }
 
-/// Small single-line caption beside the waveform bars (e.g. "Listening",
-/// "Enhanced", "Queued", "Writing", "Polishing").
+/// Small single-line caption beside the waveform bars (e.g. "Recording 1:05",
+/// "Queued", "Writing", "Polishing").
 unsafe fn draw_caption(mem_dc: HDC, rect: RECT, color: u32, label: &str) {
     let mut text = label.encode_utf16().collect::<Vec<_>>();
     let mut rect = rect;
@@ -642,10 +613,7 @@ fn notice_duration(kind: NoticeKind) -> Duration {
     match kind {
         NoticeKind::Success => Duration::from_millis(2500),
         NoticeKind::Info => Duration::from_secs(3),
-        NoticeKind::Warning
-        | NoticeKind::RawFallback
-        | NoticeKind::ProviderWarning
-        | NoticeKind::DeliveryWarning => Duration::from_secs(4),
+        NoticeKind::Warning => Duration::from_secs(4),
         NoticeKind::Error => Duration::from_secs(5),
     }
 }
@@ -660,14 +628,6 @@ fn truncate_notice(message: &str) -> String {
         let mut truncated: String = message.chars().take(MAX_NOTICE_CHARS - 1).collect();
         truncated.push('…');
         truncated
-    }
-}
-
-fn listening_label(enhanced: bool) -> &'static str {
-    if enhanced {
-        "Enhanced"
-    } else {
-        "Listening"
     }
 }
 
@@ -717,19 +677,11 @@ fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((b as u32) << 16) | ((g as u32) << 8) | r as u32
 }
 
-fn listening_color(enhanced: bool) -> u32 {
-    if enhanced {
-        rgb(168, 85, 247) // violet — the "enhanced" accent used across the Mac v1.5 port
-    } else {
-        rgb(255, 255, 255) // plain white waveform for raw dictation
-    }
-}
-
 fn phase_color(phase: ProcessingPhase) -> u32 {
     match phase {
         ProcessingPhase::Queued => rgb(156, 163, 175), // neutral gray
         ProcessingPhase::Transcribing => rgb(96, 165, 250), // light blue
-        ProcessingPhase::Enhancing => rgb(168, 85, 247), // same purple as "enhanced" listening
+        ProcessingPhase::Enhancing => rgb(168, 85, 247), // violet
     }
 }
 
@@ -737,28 +689,21 @@ fn notice_color(kind: NoticeKind) -> u32 {
     match kind {
         NoticeKind::Success => rgb(52, 211, 153), // green
         NoticeKind::Info => rgb(226, 232, 240),   // neutral/white
-        NoticeKind::Warning
-        | NoticeKind::RawFallback
-        | NoticeKind::ProviderWarning
-        | NoticeKind::DeliveryWarning => rgb(251, 191, 36), // yellow/orange
+        NoticeKind::Warning => rgb(251, 191, 36), // yellow/orange
         NoticeKind::Error => rgb(248, 113, 113),  // orange/red
     }
 }
 
-/// Overall bar height (0.0-1.0) for the waveform. While listening this
-/// reacts to the live RMS atomic; once capture has stopped there's no more
+/// Overall bar height (0.0-1.0) for the waveform. While a meeting records
+/// this reacts to the live RMS atomic; once capture has stopped there's no more
 /// audio to show, so processing states get a steady synthetic pulse instead
 /// (still animated via the phase/wobble math in `draw_waveform_bars`).
 fn waveform_amplitude(view: &OverlayViewState, level_x10000: u32) -> f32 {
     match view {
-        OverlayViewState::Listening { .. } => {
+        OverlayViewState::Meeting { paused: false, .. } => {
             let level = (level_x10000 as f32 / 10_000.0).clamp(0.0, 1.0);
             // sqrt() compresses dynamic range so quiet speech still shows
             // strong movement, then a generous multiplier saturates loud speech.
-            (0.20 + level.sqrt() * 2.2).min(1.0)
-        }
-        OverlayViewState::Meeting { paused: false, .. } => {
-            let level = (level_x10000 as f32 / 10_000.0).clamp(0.0, 1.0);
             // Never fully flat while recording, so the pill reads as "live"
             // even in a quiet room.
             (0.20 + level.sqrt() * 2.2).min(1.0)
@@ -788,11 +733,6 @@ enum RenderFrame {
 impl RenderFrame {
     fn for_view(view: &OverlayViewState, level_x10000: u32) -> Self {
         match view {
-            OverlayViewState::Listening { enhanced } => RenderFrame::Waveform {
-                color: listening_color(*enhanced),
-                amplitude: waveform_amplitude(view, level_x10000),
-                label: listening_label(*enhanced).to_string(),
-            },
             OverlayViewState::Processing {
                 phase, queue_depth, ..
             } => RenderFrame::Waveform {
@@ -813,7 +753,7 @@ impl RenderFrame {
                 message: truncate_notice(message),
             },
             OverlayViewState::Hidden => RenderFrame::Waveform {
-                color: listening_color(false),
+                color: rgb(255, 255, 255),
                 amplitude: 0.0,
                 label: String::new(),
             },
@@ -838,15 +778,19 @@ mod tests {
     }
 
     #[test]
-    fn listening_and_processing_states_are_visible_when_enabled() {
+    fn processing_states_are_visible_when_enabled() {
         let now = Instant::now();
 
-        let mut listening = TickState::new(true);
-        listening.apply_command(
-            OverlayCommand::SetState(OverlayViewState::listening(ListeningIntent::Raw)),
+        let mut transcribing = TickState::new(true);
+        transcribing.apply_command(
+            OverlayCommand::SetState(OverlayViewState::processing(
+                1,
+                ProcessingPhase::Transcribing,
+                0,
+            )),
             now,
         );
-        assert!(listening.tick(now));
+        assert!(transcribing.tick(now));
 
         let mut processing = TickState::new(true);
         processing.apply_command(
@@ -865,7 +809,11 @@ mod tests {
         let now = Instant::now();
         let mut state = TickState::new(true);
         state.apply_command(
-            OverlayCommand::SetState(OverlayViewState::listening(ListeningIntent::Enhance)),
+            OverlayCommand::SetState(OverlayViewState::processing(
+                1,
+                ProcessingPhase::Enhancing,
+                0,
+            )),
             now,
         );
         assert!(state.tick(now));
@@ -943,7 +891,11 @@ mod tests {
         let now = Instant::now();
         let mut state = TickState::new(true);
         state.apply_command(
-            OverlayCommand::SetState(OverlayViewState::listening(ListeningIntent::Raw)),
+            OverlayCommand::SetState(OverlayViewState::processing(
+                1,
+                ProcessingPhase::Transcribing,
+                0,
+            )),
             now,
         );
         state.apply_command(
@@ -967,33 +919,17 @@ mod tests {
         assert!(state.notice_deadline.is_some());
 
         state.apply_command(
-            OverlayCommand::SetState(OverlayViewState::listening(ListeningIntent::Raw)),
+            OverlayCommand::SetState(OverlayViewState::processing(
+                1,
+                ProcessingPhase::Transcribing,
+                0,
+            )),
             now,
         );
         assert!(state.notice_deadline.is_none());
     }
 
-    #[test]
-    fn listening_intent_maps_to_the_enhanced_flag() {
-        assert_eq!(
-            OverlayViewState::listening(ListeningIntent::Raw),
-            OverlayViewState::Listening { enhanced: false }
-        );
-        assert_eq!(
-            OverlayViewState::listening(ListeningIntent::Enhance),
-            OverlayViewState::Listening { enhanced: true }
-        );
-        assert!(!ListeningIntent::Raw.is_enhance());
-        assert!(ListeningIntent::Enhance.is_enhance());
-    }
-
     // --- labels ------------------------------------------------------------
-
-    #[test]
-    fn listening_labels_match_mac_v15_wording() {
-        assert_eq!(listening_label(false), "Listening");
-        assert_eq!(listening_label(true), "Enhanced");
-    }
 
     #[test]
     fn waveform_and_label_share_one_centered_row() {
@@ -1031,20 +967,6 @@ mod tests {
     // --- colors --------------------------------------------------------------
 
     #[test]
-    fn listening_colors_differ_between_raw_and_enhanced() {
-        assert_ne!(listening_color(false), listening_color(true));
-        assert_eq!(listening_color(false), rgb(255, 255, 255));
-    }
-
-    #[test]
-    fn enhanced_listening_and_enhancing_phase_share_the_purple_accent() {
-        assert_eq!(
-            listening_color(true),
-            phase_color(ProcessingPhase::Enhancing)
-        );
-    }
-
-    #[test]
     fn phase_colors_are_distinct_per_phase() {
         let queued = phase_color(ProcessingPhase::Queued);
         let transcribing = phase_color(ProcessingPhase::Transcribing);
@@ -1075,17 +997,6 @@ mod tests {
     // --- amplitude -----------------------------------------------------------
 
     #[test]
-    fn listening_amplitude_reacts_to_rms_level() {
-        let view = OverlayViewState::listening(ListeningIntent::Raw);
-        let quiet = waveform_amplitude(&view, 0);
-        let loud = waveform_amplitude(&view, 10_000);
-        assert!(quiet > 0.0, "baseline keeps some motion even at silence");
-        assert!(loud > quiet);
-        assert!((0.0..=1.0).contains(&quiet));
-        assert!((0.0..=1.0).contains(&loud));
-    }
-
-    #[test]
     fn processing_amplitude_is_a_steady_pulse_independent_of_rms() {
         let view = OverlayViewState::processing(1, ProcessingPhase::Queued, 0);
         assert_eq!(
@@ -1106,9 +1017,12 @@ mod tests {
     // --- render frame selection -----------------------------------------------
 
     #[test]
-    fn render_frame_selects_waveform_for_listening_and_processing() {
+    fn render_frame_selects_waveform_for_processing() {
         assert!(matches!(
-            RenderFrame::for_view(&OverlayViewState::listening(ListeningIntent::Raw), 0),
+            RenderFrame::for_view(
+                &OverlayViewState::processing(1, ProcessingPhase::Transcribing, 0),
+                0
+            ),
             RenderFrame::Waveform { .. }
         ));
         assert!(matches!(
@@ -1161,9 +1075,9 @@ mod tests {
         assert_eq!(recording, rgb(239, 68, 68));
         assert_eq!(paused, rgb(251, 191, 36));
         assert_ne!(recording, paused);
-        // Distinct from the dictation pill's white/violet.
-        assert_ne!(recording, listening_color(false));
-        assert_ne!(recording, listening_color(true));
+        // Distinct from the job progress colours.
+        assert_ne!(recording, phase_color(ProcessingPhase::Transcribing));
+        assert_ne!(recording, phase_color(ProcessingPhase::Enhancing));
     }
 
     #[test]

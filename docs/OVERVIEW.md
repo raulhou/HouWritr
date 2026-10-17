@@ -1,178 +1,178 @@
-# OpenWritr — Overview, Architecture & Purpose
+# HouWritr — Overview, Architecture & Purpose
 
 ## What it is
 
-OpenWritr is a **push-to-talk voice-to-text tool for Windows**. You hold a
-hotkey, speak, and release — the recognized text is pasted at your cursor in
-whatever application has focus. It is a small system-tray utility, not a
-window you switch to: dictation happens *into* the app you're already using
-(email, chat, code editor, browser, anything).
+HouWritr is a **Windows tray app that records meetings and transcribes audio
+and video files**, entirely on your own PC. You start a meeting recording or
+pick a file from the tray menu; HouWritr turns the speech into a transcript
+file, optionally labels who is speaking, and can tidy the text and write
+meeting notes with an AI provider you choose.
 
-Two things make it different from the dictation built into Windows or from
-cloud services:
+It started as a fork of [OpenWritr for Windows](https://github.com/trsdn/openwritr-windows),
+a push to talk dictation tool. HouWritr removed dictation (hotkeys, pasting at
+the cursor, clipboard delivery) and builds on what OpenWritr did well:
+fast, private speech recognition on the Snapdragon NPU.
 
-1. **It runs entirely on your device.** Speech recognition happens locally.
-   Your audio never leaves the machine — no cloud, no account, no telemetry.
-2. **It uses the NPU.** On Snapdragon X (Copilot+ PC) hardware, the speech
-   model runs on the Qualcomm Hexagon Neural Processing Unit, which is far
-   faster and far more power-efficient than the CPU. On Intel/AMD machines
-   it runs on the CPU instead.
+What sets it apart from cloud transcription services:
+
+1. **Recognition runs on your device.** Audio never leaves the machine: no
+   cloud, no account, no telemetry.
+2. **It uses the NPU.** On Snapdragon X (Copilot+ PC) hardware, Parakeet and
+   Whisper run on the Qualcomm Hexagon NPU, far faster and more power
+   efficient than the CPU. Intel and AMD machines use the CPU.
+3. **Long recordings are first class.** Meetings up to 12 hours are
+   transcribed while they are recorded, and files of any length are processed
+   in the background with a progress window.
 
 ## Purpose / why it exists
 
-Voice input on Windows-on-ARM was a gap. The Snapdragon X laptops (Surface
-Pro 11, Surface Laptop 7, etc.) ship a powerful NPU that mostly sits idle,
-while the best local speech model — NVIDIA's Parakeet — had no turnkey way
-to run on it. OpenWritr closes that: a genuinely local, fast, multilingual
-dictation tool that puts the Hexagon NPU to work, with a CPU fallback so the
-same app also serves Intel/AMD users.
-
-The design goal is **friction-free dictation**: press a key, talk, done. No
-window management, no "start/stop recording" UI, no sending your voice to a
-server.
+Meetings, lectures, interviews and podcasts produce hours of audio that are
+hard to search or summarise. Hosted transcription services want the audio on
+their servers. HouWritr keeps the audio local, makes use of the NPU that
+Snapdragon laptops otherwise leave idle, and produces plain files (`.txt` or
+`.md`) that work with any tool, including an AI model of your choice for
+notes and reports.
 
 ## What it does, concretely
 
-- **25 languages**, auto-detected (English, German, French, Spanish, Italian,
-  Dutch, Portuguese, Polish, Russian, Ukrainian, Czech, and more European
-  languages).
-- **Push-to-talk**: hold a configurable hotkey (default **Ctrl+Win**), speak,
-  release. Text is pasted at the caret.
-- **Fast**: a 5-second utterance transcribes in well under half a second on
-  the NPU (~25–44× realtime); long dictation is chunked transparently.
-- **Optional AI cleanup ("Enhance")**: press or release Shift at any time
-  during recording to switch cleanup intent live. After transcription the text
-  is sent to GitHub Copilot or any OpenAI-compatible API for
-  punctuation/grammar polish — using *your* credentials, *off by default*.
-  Dictated questions and requests remain transcript text; the model must not
-  answer or carry them out.
-- **Unobtrusive**: a small overlay pill centers the live level meter and status
-  on one line, with purple feedback when enhancement is active; otherwise it's
-  just a tray icon.
+* **Transcribe a file**: WAV, MP3, M4A/AAC, FLAC, OGG and the audio track of
+  MP4/M4V/MOV/MKV. The transcript is saved next to the source.
+* **Record a meeting**: microphone plus everything the PC plays (WASAPI
+  loopback) in one timeline, with pause and resume. Every five minutes the
+  finished part is transcribed in the background and appended to an
+  in progress file, so a crash loses at most a few minutes and stopping only
+  waits for the last part.
+* **Speaker labels** (optional): `[m:ss] Speaker N:` blocks from two small
+  on-device models (pyannote segmentation and WeSpeaker voice prints), kept
+  consistent across the parts of a meeting.
+* **Languages**: Parakeet covers 25 European languages; Whisper Large v3 Turbo
+  covers about 100, including Chinese and Japanese.
+* **AI cleanup** (optional, off by default): the recognised text, never audio,
+  is sent in slices to GitHub Copilot, an OpenAI compatible API, or a model on
+  this PC (Qwen3 4B on the NPU through Qualcomm GenieX, or a local server).
+  Hosted providers get three slices at a time. Every slice is checked by an
+  integrity validator, and a slice that fails or cannot be sent keeps its
+  recognised text and is retried in the background later.
+* **Meeting notes** (optional): summary, key points, decisions, action items
+  and open questions, saved next to the transcript.
+* **Status at a glance**: a tray icon, a small status pill for job progress,
+  a meeting pill with the recording clock, and a progress window per file.
 
 ## Architecture
 
-OpenWritr is a native **Rust** application (no Electron, no web view, no
-bundled runtime). A single ~7 MB executable.
+HouWritr is a native **Rust** application (no Electron, no web view, no Python
+at run time).
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  openwritr.exe  (Rust, winit event loop on the main thread)    │
-│                                                                │
-│  ┌────────────┐   global WH_KEYBOARD_LL hook (own thread)      │
-│  │  key_hook  │── physical key state → atomic bitmap           │
-│  └────────────┘                                                │
-│        │ press / release events                                │
-│  ┌────────────┐   WASAPI capture via cpal, rebuilt per         │
-│  │   audio    │── recording; multi-channel → mono → 16 kHz     │
-│  └────────────┘                                                │
-│        │ f32 samples                                           │
-│  ┌──────────────────────────────────────────────────┐         │
-│  │  asr pipeline                                       │        │
-│  │   mel preprocessor (ONNX, CPU)                      │        │
-│  │        ↓                                            │        │
-│  │   ENCODER  ── NPU (Hexagon HTP)  OR  CPU INT8       │        │
-│  │        ↓                                            │        │
-│  │   TDT decoder loop (ONNX, CPU) → tokens → text      │        │
-│  └──────────────────────────────────────────────────┘         │
-│        │ text                                                  │
-│  ┌────────────┐   optional LLM cleanup (your API)              │
-│  │  enhance   │── then paste at cursor (clipboard + input)     │
-│  └────────────┘                                                │
-│                                                                │
-│  tray icon · overlay window (layered, GDI) · egui settings     │
-│  (settings open as a `--settings` subprocess)                  │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  openwritr.exe (tray process, winit event loop on the main thread) │
+│                                                                    │
+│  tray menu ── file picker ── decode (Symphonia) → 16 kHz mono      │
+│           └── meeting capture: mic (cpal) + loopback (WASAPI)      │
+│                     │ rolling 5 minute parts                       │
+│                     ▼                                              │
+│  ┌──────────────────────────── worker thread ─────────────────┐   │
+│  │ speaker diarisation (pyannote + WeSpeaker, CPU, optional)    │   │
+│  │        ↓ turns                                               │   │
+│  │ ASR in ≤30 s windows cut at quiet points                     │   │
+│  │   Parakeet TDT 0.6B v3: encoder on NPU (HTP) or CPU INT8     │   │
+│  │   Whisper Large v3 Turbo: encoder + decoder on NPU (QNN)     │   │
+│  │        ↓ text                                                │   │
+│  │ AI cleanup / notes (optional): Copilot, OpenAI compatible,   │   │
+│  │   or local model (GenieX `geniex serve` on the NPU)          │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                     │ transcript                                   │
+│                     ▼                                              │
+│  saved as .txt / .md · background repair of unfinished cleanup     │
+│                                                                    │
+│  status pill + meeting pill (own Win32 threads, GDI)               │
+│  subprocesses: --settings (egui), --transcript-window (egui)       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### The speech model
+### The speech engines
 
-NVIDIA **Parakeet TDT 0.6B v3** — a 600M-parameter Conformer encoder with a
-Token-and-Duration Transducer (TDT) decoder. State-of-the-art accuracy for
-its size, multilingual, with built-in punctuation and capitalization.
+| | Parakeet CPU | Parakeet NPU | Whisper NPU |
+|---|---|---|---|
+| Hardware | any x64 or ARM64 CPU | Snapdragon X Elite | Snapdragon X Elite |
+| Model | INT8 ONNX | INT8/INT16 QAIRT context binary (8 s window) | Qualcomm's compiled Large v3 Turbo |
+| Languages | 25 | 25 | about 100 |
+| Download | ~670 MB | ~650 MB more | ~2.0 GB |
 
-The pipeline has three ONNX stages:
-1. **Mel preprocessor** — turns raw audio into mel-spectrogram features (CPU,
-   tiny).
-2. **Encoder** — the heavy part (the 600M params). This is what runs on the
-   NPU.
-3. **TDT decoder** — an autoregressive loop that emits tokens (CPU,
-   lightweight).
+**Parakeet** (NVIDIA Parakeet TDT 0.6B v3) is a 600M parameter Conformer
+encoder with a Token and Duration Transducer decoder, with built-in
+punctuation and capitalisation. On the NPU the encoder runs as a fixed
+8 second window (its dynamic attention mask constant folded, quantised to
+INT8 weights / INT16 activations, compiled with Qualcomm AI Hub); longer audio
+runs in overlapping chunks whose features are stitched before decoding. The
+binary is loaded through ONNX Runtime's QNN execution provider via a thin
+direct FFI layer, because the high level Rust bindings crash on this model.
 
-### The two engines
-
-| | arm64 (Snapdragon) | x64 (Intel/AMD) |
-|---|---|---|
-| Encoder runs on | Hexagon NPU (HTP) | CPU |
-| Model format | INT8/INT16 QAIRT context binary | INT8 ONNX |
-| Speed | ~25–44× realtime | ~25× realtime |
-| Power draw | very low (NPU offload) | moderate (CPU) |
-
-The **NPU path** was the hard engineering. Parakeet's encoder uses a
-dynamic-shape attention mask the Hexagon backend can't evaluate, so the
-encoder is reshaped to a fixed 8-second window (its attention-mask subgraph
-constant-folded), quantized to INT8 weights / INT16 activations, and compiled
-to a Qualcomm AI Hub QNN context binary. At runtime that binary is loaded
-through ONNX Runtime's QNN execution provider via a thin direct-FFI layer
-(the high-level Rust ORT bindings crash on this particular model, so we call
-the C API directly). Audio longer than 8 seconds is run in overlapping
-chunks and the encoder features are stitched back together before decoding —
-so long-form dictation works without re-running the decoder per chunk.
-
-The **CPU path** is the standard ONNX Runtime CPU execution provider on the
-INT8 model — simpler, runs anywhere, no Qualcomm dependency.
+**Whisper** runs its encoder and its key/value cache decoder as precompiled
+QNN sessions in 30 second chunks, detecting the language once and reusing it.
+The decoder has room for 199 steps; a chunk that runs out (fast speech) or
+starts repeating itself is decoded again in two halves, and repetition loops
+are cut to one copy.
 
 ### Notable design decisions
 
-- **Global low-level keyboard hook**, not polling. Windows fakes key-release
-  events during focus changes (a popup, a UAC prompt, a system shortcut),
-  which would otherwise abort a recording mid-sentence. The LL hook sees only
-  real physical keystrokes, so recording survives focus steals.
-- **Capture stream rebuilt per recording.** Holding one WASAPI stream open
-  for the process lifetime led to a "dead mic after long idle" bug (Windows
-  silently invalidates idle capture streams). Building a fresh stream on each
-  press eliminates that and also picks up mic changes automatically.
-- **Settings UI as a subprocess.** The egui settings dialog is the same exe
-  relaunched with `--settings`, kept separate from the tray event loop so a
-  slow dialog spawn can't freeze the tray.
-- **Tray + overlay isolation.** The recording overlay runs on its own message
-  loop and shares only two atomics with the recorder, so it can't deadlock
-  the main app.
+* **Everything heavy is off the tray thread.** Decoding, diarisation,
+  transcription and cleanup run on worker threads; the tray loop only routes
+  events, so the menu stays responsive during a two hour job.
+* **Windows as subprocesses.** Settings, About and the transcript window are the
+  same exe relaunched with a flag, spawned from a background thread
+  (`CreateProcessW` on Windows ARM64 with Defender can block for seconds), so a
+  slow or crashing window can never stall meeting capture.
+* **Partition, never drop.** Speaker turns are turned into windows that cover
+  every sample of the recording, cut at the quietest point between turns, so
+  labelling can mislabel a word but never lose one.
+* **Cleanup never costs text.** Every AI result is validated against the
+  recognised text; failures fall back to the recognised text, and unfinished
+  sections are retried in the background and written back only if the file is
+  untouched.
+* **No clipboard, no keystrokes.** Results only ever go to files.
+* **Power.** The app and its GenieX server opt out of Windows power throttling,
+  so background jobs keep their speed with no window in front.
+* **Observable.** One log per app session and one per transcript, with the
+  build commit on the first line and a crash log.
 
 ## Privacy
 
-- **No telemetry, no analytics, no accounts.**
-- Audio is captured only while the hotkey is held, processed locally, and not
-  stored.
-- The only network access is (1) a one-time model download from Hugging Face
-  on first launch, and (2) the optional Enhance feature, which sends *text*
-  (never audio) to a provider you configure with your own credentials, and is
-  off by default.
-- Settings, models, and a local log live under `%LOCALAPPDATA%\OpenWritr\`
-  and never leave the machine.
+* **No telemetry, no analytics, no accounts.**
+* Audio is captured only while a meeting is being recorded (a paused meeting
+  releases the microphone), processed locally, and not stored; only the
+  transcript is saved.
+* Network access is limited to model downloads (Hugging Face, Qualcomm AI Hub
+  for the optional local model, the pinned GenieX installer) and, only if you
+  turn it on, AI cleanup and notes, which send transcript text to the provider
+  you configured with your own credentials.
+* Settings, models and logs live under `%LOCALAPPDATA%\OpenWritr\`; API keys
+  live in Windows Credential Manager. See [PRIVACY.md](../PRIVACY.md).
 
 ## Tech stack
 
-- **Language:** Rust
-- **UI:** winit + tray-icon + egui (settings) + Win32 (overlay)
-- **Audio:** cpal (WASAPI)
-- **Inference:** ONNX Runtime (CPU EP everywhere; QNN EP on arm64 for the NPU)
-- **Model:** NVIDIA Parakeet TDT 0.6B v3 (CC-BY-4.0); arm64 NPU build
-  compiled via Qualcomm AI Hub
-- **Distribution:** Microsoft Store (MSIX, both arches) + GitHub Releases
-  (installer + portable zip); CI builds on GitHub Actions
-- **License:** MIT (own code); bundled ONNX Runtime (MIT) and Qualcomm QNN
-  runtime (Qualcomm redistributable license) ship with their notices
+* **Language:** Rust
+* **UI:** winit + tray-icon, egui (settings and transcript window), Win32 + GDI
+  (pills)
+* **Audio:** cpal and WASAPI loopback (capture), Symphonia (file decoding)
+* **Inference:** ONNX Runtime (CPU everywhere, QNN on ARM64 for the NPU),
+  also used for the speaker diarisation models on the CPU
+* **AI cleanup:** GitHub Copilot, OpenAI compatible APIs, Qualcomm GenieX
+* **Distribution:** GitHub Releases (installer and portable zip per
+  architecture), built by GitHub Actions on Windows ARM64
+* **License:** MIT (own code); bundled ONNX Runtime (MIT) and Qualcomm QNN
+  runtime (Qualcomm redistributable licence) ship with their notices
 
 ## Platform support
 
-- **Windows 11** (22621+) on **ARM64** — full NPU acceleration on Snapdragon X.
-- **Windows 11** on **x64** — CPU inference on Intel/AMD.
-- Companion macOS app: [trsdn/OpenWritr](https://github.com/trsdn/OpenWritr)
-  (Apple Neural Engine via CoreML).
+* **Windows 11** on **ARM64**: all engines, NPU acceleration on Snapdragon X
+  Elite.
+* **Windows 11** on **x64**: Parakeet on the CPU.
 
 ## Links
 
-- Source: https://github.com/trsdn/openwritr-windows
-- NPU model: https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s
-- Base model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+* Source: https://github.com/raulhou/HouWritr
+* Original project: https://github.com/trsdn/openwritr-windows
+* Parakeet NPU model: https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s
+* Base model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+* Whisper NPU model: https://huggingface.co/qualcomm/Whisper-Large-V3-Turbo
