@@ -1258,7 +1258,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let mut document = legacy_document("only-copy");
-        document["max_record_seconds"] = Value::from(-1.0);
+        document["engine"] = Value::from("no_such_engine");
         atomic_write_json(&path, &document).unwrap();
         let store = FakeStore::default();
 
@@ -1275,7 +1275,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let mut document = legacy_document("only-copy");
-        document["max_record_seconds"] = Value::from(-1.0);
+        document["engine"] = Value::from("no_such_engine");
         let original = serde_json::to_vec_pretty(&document).unwrap();
         fs::write(&path, &original).unwrap();
         let store = FakeStore::default();
