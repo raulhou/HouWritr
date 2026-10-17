@@ -294,11 +294,11 @@ pub fn run_window() -> Result<()> {
             .with_inner_size([460.0, 360.0])
             .with_min_inner_size([380.0, 280.0])
             .with_resizable(true)
-            .with_title("OpenWritr — Transcribe file"),
+            .with_title("HouWritr — Transcribe file"),
         ..Default::default()
     };
     eframe::run_native(
-        "OpenWritr — Transcribe file",
+        "HouWritr — Transcribe file",
         options,
         Box::new(|cc| {
             settings_ui::apply_dark_theme(&cc.egui_ctx);
@@ -387,7 +387,7 @@ impl eframe::App for TranscriptWindow {
         self.drain();
         if !self.title_applied && !self.state.source_path.is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "OpenWritr — {}",
+                "HouWritr — {}",
                 self.state.title
             )));
             self.title_applied = true;
@@ -407,7 +407,7 @@ impl eframe::App for TranscriptWindow {
             } else if self.state.finished.is_some() {
                 ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
             } else if self.state.parent_gone {
-                settings_ui::inline_error(ui, "OpenWritr was closed before this finished.");
+                settings_ui::inline_error(ui, "HouWritr was closed before this finished.");
             } else {
                 ui.horizontal(|ui| {
                     ui.spinner();

@@ -60,11 +60,11 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
             .with_inner_size([640.0, 760.0])
             .with_min_inner_size([600.0, 640.0])
             .with_resizable(true)
-            .with_title("OpenWritr Settings"),
+            .with_title("HouWritr Settings"),
         ..Default::default()
     };
     eframe::run_native(
-        "OpenWritr Settings",
+        "HouWritr Settings",
         opts,
         Box::new(move |cc| {
             apply_dark_theme(&cc.egui_ctx);
@@ -430,7 +430,7 @@ impl SettingsApp {
             }
             Err(TryRecvError::Disconnected) => {
                 self.copilot_readiness = Some(CopilotReadiness::Failed(
-                    "GitHub CLI readiness check stopped unexpectedly".into(),
+                    "GitHub Copilot sign-in check stopped unexpectedly".into(),
                 ));
                 self.copilot_rx = None;
             }
@@ -580,17 +580,15 @@ impl SettingsApp {
         if self.settings.enhance.mode.is_enabled() {
             match self.settings.enhance.provider.as_str() {
                 "github_copilot" => match self.copilot_readiness.as_ref() {
-                    Some(CopilotReadiness::Ready) => {}
+                    Some(CopilotReadiness::Ready(_)) => {}
                     Some(CopilotReadiness::CliMissing) => {
-                        return Some("GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.".into())
+                        return Some(enhance::CopilotAuthError::CliMissing.to_string())
                     }
                     Some(CopilotReadiness::NotAuthenticated) => {
-                        return Some(
-                            "GitHub CLI is not authenticated. Run `gh auth login` first.".into(),
-                        )
+                        return Some(enhance::CopilotAuthError::NotAuthenticated.to_string())
                     }
                     Some(CopilotReadiness::Failed(error)) => return Some(error.clone()),
-                    None => return Some("Checking GitHub CLI authentication...".into()),
+                    None => return Some("Looking for your GitHub Copilot sign-in...".into()),
                 },
                 "openai_compatible" => {
                     if let CredentialStatus::Error(error) = &self.credential_status {
@@ -1115,7 +1113,7 @@ impl SettingsApp {
                 ui.label(
                     "1. Download both files below in your browser.\n\
                      2. Save them with exactly these names into the model folder.\n\
-                     3. Click \"Verify files\". OpenWritr checks each file's size and SHA-256 and \
+                     3. Click \"Verify files\". HouWritr checks each file's size and SHA-256 and \
                         rejects anything that does not match.",
                 );
                 if let Ok(details) = &details {
@@ -1261,7 +1259,7 @@ impl SettingsApp {
 
     fn render_enhancement(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("When should OpenWritr improve punctuation and wording?");
+            ui.label("When should HouWritr improve punctuation and wording?");
             info_button(
                 ui,
                 "Enhancement sends recognized transcript text, never recorded audio, to the selected provider.",
@@ -1358,25 +1356,27 @@ impl SettingsApp {
             match self.copilot_readiness.as_ref() {
                 None => status_label(
                     ui,
-                    "Checking GitHub CLI authentication...",
+                    "Looking for your GitHub Copilot sign-in...",
                     secondary_text(),
                 ),
-                Some(CopilotReadiness::Ready) => {
-                    status_label(ui, "GitHub CLI authentication is ready.", status_green())
-                }
+                Some(CopilotReadiness::Ready(source)) => status_label(
+                    ui,
+                    &format!("Signed in through {}.", source.describe()),
+                    status_green(),
+                ),
                 Some(CopilotReadiness::CliMissing) => status_label(
                     ui,
-                    "GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.",
+                    &enhance::CopilotAuthError::CliMissing.to_string(),
                     error_color(),
                 ),
                 Some(CopilotReadiness::NotAuthenticated) => status_label(
                     ui,
-                    "GitHub CLI is not authenticated. Run `gh auth login`.",
+                    &enhance::CopilotAuthError::NotAuthenticated.to_string(),
                     error_color(),
                 ),
                 Some(CopilotReadiness::Failed(error)) => status_label(ui, error, error_color()),
             }
-            if !matches!(self.copilot_readiness, Some(CopilotReadiness::Ready))
+            if !matches!(self.copilot_readiness, Some(CopilotReadiness::Ready(_)))
                 && ui.small_button("Retry").clicked()
             {
                 self.restart_copilot_probe();
@@ -1699,7 +1699,7 @@ impl SettingsApp {
     }
 
     fn render_startup(&mut self, ui: &mut egui::Ui) {
-        const LABEL: &str = "Start OpenWritr automatically when I sign in to Windows";
+        const LABEL: &str = "Start HouWritr automatically when I sign in to Windows";
         match self.autostart.state.clone() {
             Ok(AutostartState::DisabledByOs { reason }) => {
                 let mut checked = false;
@@ -1714,7 +1714,7 @@ impl SettingsApp {
                     let changed = ui.checkbox(&mut enabled, LABEL).changed();
                     info_button(
                         ui,
-                        "OpenWritr starts silently in the tray at sign-in — no window opens. This is OS state, not part of your settings file, so it is applied immediately.",
+                        "HouWritr starts silently in the tray at sign-in — no window opens. This is OS state, not part of your settings file, so it is applied immediately.",
                     );
                     if changed {
                         self.autostart.set_enabled(enabled);
@@ -1757,7 +1757,7 @@ impl SettingsApp {
     }
 
     fn render_about(&mut self, ui: &mut egui::Ui) {
-        ui.heading("About OpenWritr");
+        ui.heading("About HouWritr");
         ui.label("Local push-to-talk voice-to-text for Windows.");
         ui.add_space(4.0);
         ui.label(
@@ -1897,7 +1897,7 @@ impl eframe::App for SettingsApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.heading("OpenWritr");
+                    ui.heading("HouWritr");
                     ui.label(
                         egui::RichText::new("Local voice-to-text for Windows")
                             .color(secondary_text()),
@@ -1988,7 +1988,7 @@ impl eframe::App for SettingsApp {
                     section(
                         ui,
                         "Output and feedback",
-                        "Choose where completed text goes and what OpenWritr shows.",
+                        "Choose where completed text goes and what HouWritr shows.",
                         |ui| self.render_output(ui),
                     );
                     section(
@@ -2006,7 +2006,7 @@ impl eframe::App for SettingsApp {
                     section(
                         ui,
                         "Startup",
-                        "Control whether OpenWritr runs automatically when you sign in.",
+                        "Control whether HouWritr runs automatically when you sign in.",
                         |ui| self.render_startup(ui),
                     );
                     section(ui, "Advanced", "Recording safety limits.", |ui| {

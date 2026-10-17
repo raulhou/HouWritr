@@ -6,17 +6,17 @@
 ; The Cargo bin `installer_build` (cargo run --release --bin installer_build)
 ; runs this automatically as part of the release flow.
 
-#define AppName       "OpenWritr"
+#define AppName       "HouWritr"
 #ifndef AppVersion
 #define AppVersion    "0.6.1"
 #endif
-#define AppPublisher  "Torsten Mahr"
-#define AppURL        "https://github.com/trsdn/openwritr-windows"
+#define AppPublisher  "Wenxuan Hou"
+#define AppURL        "https://github.com/raulhou/HouWritr"
 #define AppExeName    "openwritr.exe"
 #define SrcDir        "..\target\stage\arm64"
 
 [Setup]
-AppId={{2A8F4D3E-7C61-4B9F-A52B-3D7E0F88D911}
+AppId={{8559D43A-78CF-471B-8612-EC7FF6C6D46E}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -26,7 +26,7 @@ AppUpdatesURL={#AppURL}/releases
 ; Per-user install — no UAC, no admin rights, no system-wide footprint.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-DefaultDirName={localappdata}\OpenWritr\app
+DefaultDirName={localappdata}\HouWritr\app
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=auto
 ArchitecturesAllowed=arm64

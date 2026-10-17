@@ -161,7 +161,7 @@ impl HttpArtifactSource {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(60 * 60))
-            .user_agent(concat!("OpenWritr/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("HouWritr/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build model download client")?;
         Ok(Self { client })

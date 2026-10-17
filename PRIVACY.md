@@ -1,13 +1,13 @@
-# OpenWritr Privacy Policy
+# HouWritr Privacy Policy
 
 *Last updated: July 2026*
 
-OpenWritr is a local-first push-to-talk voice-to-text tool. Audio capture and
+HouWritr is a local-first push-to-talk voice-to-text tool. Audio capture and
 speech recognition run **entirely on your device**.
 
 ## What we collect
 
-**Nothing.** OpenWritr has no telemetry, no analytics, no accounts, and no
+**Nothing.** HouWritr has no telemetry, no analytics, no accounts, and no
 servers operated by us.
 
 ## How your voice is processed
@@ -16,12 +16,12 @@ servers operated by us.
 - Transcription runs **locally on your device** (NVIDIA Parakeet model on
   your CPU or NPU). Your audio never leaves your machine.
 - The recognized text is pasted at your cursor or copied to the Windows
-  clipboard, depending on your Settings choice. OpenWritr does not keep a
+  clipboard, depending on your Settings choice. HouWritr does not keep a
   transcript history.
 
 ## Network access
 
-OpenWritr connects to the internet only for:
+HouWritr connects to the internet only for:
 
 1. **One-time model download** from Hugging Face (`huggingface.co`) on first
    launch — this fetches the speech-recognition model files. No personal

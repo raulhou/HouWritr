@@ -224,7 +224,7 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
         let hwnd = match CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             PCWSTR(class_name.as_ptr()),
-            w!("OpenWritr"),
+            w!("HouWritr"),
             WS_POPUP,
             x,
             y,

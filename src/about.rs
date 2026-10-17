@@ -13,17 +13,17 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub const PUBLISHER: &str = "Torsten Mahr";
 pub const COPYRIGHT: &str = "Copyright © 2026 Torsten Mahr and contributors.";
-pub const LICENSE_SUMMARY: &str = "OpenWritr is licensed under the MIT License.";
-pub const DISCLAIMER: &str = "OpenWritr is an independent open-source project and is not affiliated with NVIDIA, Qualcomm, or Microsoft.";
+pub const LICENSE_SUMMARY: &str = "HouWritr is licensed under the MIT License.";
+pub const DISCLAIMER: &str = "HouWritr is an independent open-source project and is not affiliated with NVIDIA, Qualcomm, or Microsoft.";
 
-pub const WEBSITE_URL: &str = "https://trsdn.github.io/openwritr-windows/";
-pub const STORE_URL: &str = "https://apps.microsoft.com/detail/9MSQWR701P2Q";
-pub const REPOSITORY_URL: &str = "https://github.com/trsdn/openwritr-windows";
-pub const REPORT_ISSUE_URL: &str = "https://github.com/trsdn/openwritr-windows/issues/new/choose";
-pub const ISSUES_URL: &str = "https://github.com/trsdn/openwritr-windows/issues";
-pub const RELEASES_URL: &str = "https://github.com/trsdn/openwritr-windows/releases/latest";
-pub const PRIVACY_URL: &str = "https://github.com/trsdn/openwritr-windows/blob/main/PRIVACY.md";
-pub const LICENSE_URL: &str = "https://github.com/trsdn/openwritr-windows/blob/main/LICENSE";
+/// The project HouWritr started from.
+pub const ORIGINAL_PROJECT_URL: &str = "https://github.com/trsdn/openwritr-windows";
+pub const REPOSITORY_URL: &str = "https://github.com/raulhou/HouWritr";
+pub const REPORT_ISSUE_URL: &str = "https://github.com/raulhou/HouWritr/issues/new/choose";
+pub const ISSUES_URL: &str = "https://github.com/raulhou/HouWritr/issues";
+pub const RELEASES_URL: &str = "https://github.com/raulhou/HouWritr/releases/latest";
+pub const PRIVACY_URL: &str = "https://github.com/raulhou/HouWritr/blob/main/PRIVACY.md";
+pub const LICENSE_URL: &str = "https://github.com/raulhou/HouWritr/blob/main/LICENSE";
 
 pub const PARAKEET_URL: &str = "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3";
 pub const PYANNOTE_SEGMENTATION_URL: &str = "https://huggingface.co/pyannote/segmentation-3.0";
@@ -41,14 +41,6 @@ pub struct OfficialLink {
 }
 
 pub const OFFICIAL_LINKS: &[OfficialLink] = &[
-    OfficialLink {
-        label: "Project website",
-        url: WEBSITE_URL,
-    },
-    OfficialLink {
-        label: "Microsoft Store",
-        url: STORE_URL,
-    },
     OfficialLink {
         label: "Source repository",
         url: REPOSITORY_URL,
@@ -80,6 +72,11 @@ pub struct Credit {
 
 pub const CREDITS: &[Credit] = &[
     Credit {
+        name: "OpenWritr for Windows (the project HouWritr started from)",
+        attribution: "trsdn · MIT",
+        url: ORIGINAL_PROJECT_URL,
+    },
+    Credit {
         name: "NVIDIA Parakeet TDT 0.6B v3",
         attribution: "NVIDIA · CC-BY-4.0",
         url: PARAKEET_URL,
@@ -91,7 +88,7 @@ pub const CREDITS: &[Credit] = &[
     },
     Credit {
         name: "OpenWritr Parakeet NPU build",
-        attribution: "Compiled through Qualcomm AI Hub · CC-BY-4.0",
+        attribution: "trsdn · compiled through Qualcomm AI Hub · CC-BY-4.0",
         url: PARAKEET_NPU_URL,
     },
     Credit {

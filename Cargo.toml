@@ -4,7 +4,7 @@ version = "0.6.1"
 edition = "2021"
 description = "Native push-to-talk voice-to-text for Windows"
 license = "MIT"
-repository = "https://github.com/trsdn/openwritr-windows"
+repository = "https://github.com/raulhou/HouWritr"
 rust-version = "1.85"
 build = "build.rs"
 
@@ -108,6 +108,7 @@ windows-future = "0.3"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
     "Win32_System_JobObjects",
