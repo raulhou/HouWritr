@@ -642,10 +642,35 @@ pub fn discover_models(base_url: &str) -> Result<Vec<String>> {
     Ok(parse_model_ids(&value))
 }
 
-/// Send one tiny chat request to a server on this PC and report how long the
-/// answer took. The first request to the built-in model includes loading it
-/// onto the NPU, so the timeout is generous.
-pub fn test_chat(base_url: &str, model: &str) -> Result<Duration> {
+/// What a test request measured.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestResult {
+    pub elapsed: Duration,
+    /// Reading speed, tokens per second, as reported by the server.
+    pub prompt_per_second: Option<f64>,
+    /// Writing speed, tokens per second, as reported by the server.
+    pub predicted_per_second: Option<f64>,
+}
+
+impl TestResult {
+    /// One line for Settings.
+    pub fn summary(&self) -> String {
+        let mut text = format!("Works: answered in {:.1} s", self.elapsed.as_secs_f32());
+        if let Some(rate) = self.prompt_per_second {
+            text.push_str(&format!(" · reads {rate:.0} tok/s"));
+        }
+        if let Some(rate) = self.predicted_per_second {
+            text.push_str(&format!(" · writes {rate:.1} tok/s"));
+        }
+        text.push('.');
+        text
+    }
+}
+
+/// Send one short chat request to a server on this PC and measure it. The
+/// first request to the built-in model includes loading it onto the NPU, so
+/// the timeout is generous; run the test twice to see the steady speed.
+pub fn test_chat(base_url: &str, model: &str) -> Result<TestResult> {
     let scope = EndpointScope::parse(base_url).map_err(|error| anyhow!(error.to_string()))?;
     if !scope.is_loopback() {
         bail!("only servers on this PC can be tested here");
@@ -662,8 +687,11 @@ pub fn test_chat(base_url: &str, model: &str) -> Result<Duration> {
         .post(scope.join("/chat/completions"))
         .json(&serde_json::json!({
             "model": model.trim(),
-            "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
-            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": "Write two short sentences about a quiet morning."
+            }],
+            "max_tokens": 48,
             "temperature": 0.0,
         }))
         .send()
@@ -679,7 +707,17 @@ pub fn test_chat(base_url: &str, model: &str) -> Result<Duration> {
     if !has_text {
         bail!("the answer had no text in the OpenAI chat format");
     }
-    Ok(started.elapsed())
+    Ok(TestResult {
+        elapsed: started.elapsed(),
+        prompt_per_second: value
+            .pointer("/timings/prompt_per_second")
+            .and_then(|rate| rate.as_f64())
+            .filter(|rate| *rate > 0.0),
+        predicted_per_second: value
+            .pointer("/timings/predicted_per_second")
+            .and_then(|rate| rate.as_f64())
+            .filter(|rate| *rate > 0.0),
+    })
 }
 
 fn parse_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -803,6 +841,24 @@ mod tests {
         });
         assert_eq!(parse_model_ids(&value), ["a", "b"]);
         assert!(parse_model_ids(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn test_summary_lists_the_speeds_the_server_reported() {
+        let full = TestResult {
+            elapsed: Duration::from_millis(2500),
+            prompt_per_second: Some(310.4),
+            predicted_per_second: Some(14.26),
+        };
+        assert_eq!(
+            full.summary(),
+            "Works: answered in 2.5 s · reads 310 tok/s · writes 14.3 tok/s."
+        );
+        let bare = TestResult {
+            elapsed: Duration::from_secs(1),
+            ..TestResult::default()
+        };
+        assert_eq!(bare.summary(), "Works: answered in 1.0 s.");
     }
 
     #[test]

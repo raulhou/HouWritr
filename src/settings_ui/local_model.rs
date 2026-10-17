@@ -607,11 +607,8 @@ fn run_local_job(
             Ok("Model removed.".into())
         }
         JobKind::Test => {
-            let took = local_llm::test_chat(base_url, model).map_err(fail)?;
-            Ok(format!(
-                "Works: the model answered in {:.1} s.",
-                took.as_secs_f32()
-            ))
+            let result = local_llm::test_chat(base_url, model).map_err(fail)?;
+            Ok(result.summary())
         }
         JobKind::Discover => {
             let models = local_llm::discover_models(base_url).map_err(fail)?;
