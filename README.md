@@ -285,7 +285,11 @@ Tray icon → right-click → **Settings**. All fields:
   press. In **Always** mode, additional Shift bypasses cleanup while held. The
   model picker provides advisory presets while preserving
   arbitrary provider-specific model or deployment IDs and legacy settings.
-  GitHub mode checks that `gh` is installed and authenticated. OpenAI-compatible
+  GitHub mode uses the account GitHub Copilot CLI is signed in with
+  (`winget install GitHub.Copilot`, then `copilot login`), found in the same
+  order the CLI uses: the `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`
+  variable, its Windows Credential Manager entry, its config file, and finally
+  the GitHub CLI (`gh auth login`). OpenAI-compatible
   mode requires a valid base URL, model ID, and API key. API keys are stored in
   Windows Credential Manager, not in the settings file. Cleanup prompts can be
   customized per exact provider, endpoint, and model target; transcript text
@@ -561,7 +565,7 @@ cargo test --bin cleanup_eval
 
 Live-provider mode is entirely opt-in (`--live`) and never required by tests
 or releases: it reads the same `settings.json` provider/model/base URL and
-the same credential storage the app uses (GitHub CLI token or Windows
+the same credential storage as `gh auth token` (the app itself also reads the Copilot CLI sign-in) or Windows
 Credential Manager), but never prints secrets, transcripts, prompts, or raw
 candidate text. Every report — offline or live — includes the model/
 provider, canonical endpoint scope, prompt-profile/validator/corpus

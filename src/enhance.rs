@@ -12,33 +12,23 @@ use crate::cleanup::{
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use std::io;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tracing::{info, warn};
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum CopilotAuthError {
-    #[error("GitHub CLI (gh) was not found. Install it with `winget install GitHub.cli`, then run `gh auth login`")]
-    CliMissing,
-    #[error("GitHub CLI is not authenticated; run `gh auth login`")]
-    NotAuthenticated,
-    #[error("GitHub CLI token lookup failed: {0}")]
-    CommandFailed(String),
-}
+pub use crate::copilot_auth::{CopilotAuthError, TokenSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopilotReadiness {
-    Ready,
+    /// Signed in; says where the sign-in was found.
+    Ready(TokenSource),
     CliMissing,
     NotAuthenticated,
     Failed(String),
 }
 
 pub fn github_copilot_readiness() -> CopilotReadiness {
-    match gh_token() {
-        Ok(_) => CopilotReadiness::Ready,
+    match crate::copilot_auth::copilot_token() {
+        Ok((_, source)) => CopilotReadiness::Ready(source),
         Err(CopilotAuthError::CliMissing) => CopilotReadiness::CliMissing,
         Err(CopilotAuthError::NotAuthenticated) => CopilotReadiness::NotAuthenticated,
         Err(error) => CopilotReadiness::Failed(error.to_string()),
@@ -341,8 +331,8 @@ fn request_content(
     // LM Studio, GenieX, ...) usually needs no key, so for those the key is
     // optional and a failed lookup just means "send none".
     let token = match provider {
-        EnhanceProvider::GithubCopilot => match gh_token() {
-            Ok(token) => Some(token),
+        EnhanceProvider::GithubCopilot => match crate::copilot_auth::copilot_token() {
+            Ok((token, _)) => Some(token),
             Err(error) => {
                 warn!(error = %error, "GitHub Copilot credential lookup failed");
                 return Err(FallbackReason::MissingCredential);
@@ -813,108 +803,9 @@ fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
     }
 }
 
-/// Places `gh.exe` can be, in the order to look: the PATH this process
-/// started with, then the usual install folders. A program started before
-/// `gh` was installed (or by Windows at sign-in) does not see the new PATH
-/// entry, so the installer's own folders are checked too.
-fn gh_candidates(
-    path_var: Option<&std::ffi::OsStr>,
-    local_app_data: Option<&std::path::Path>,
-    program_files: &[std::path::PathBuf],
-    user_profile: Option<&std::path::Path>,
-) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Some(path) = path_var {
-        out.extend(std::env::split_paths(path).map(|dir| dir.join("gh.exe")));
-    }
-    for dir in program_files {
-        out.push(dir.join("GitHub CLI").join("gh.exe"));
-    }
-    if let Some(dir) = local_app_data {
-        out.push(dir.join("Programs").join("GitHub CLI").join("gh.exe"));
-        out.push(
-            dir.join("Microsoft")
-                .join("WinGet")
-                .join("Links")
-                .join("gh.exe"),
-        );
-    }
-    if let Some(dir) = user_profile {
-        out.push(dir.join("scoop").join("shims").join("gh.exe"));
-    }
-    out
-}
-
-/// The GitHub CLI to run: the first existing candidate, else plain `gh`.
-fn locate_gh() -> std::path::PathBuf {
-    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
-    let program_files: Vec<_> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
-        .iter()
-        .filter_map(|name| var(name))
-        .collect();
-    let path = std::env::var_os("PATH");
-    gh_candidates(
-        path.as_deref(),
-        var("LOCALAPPDATA").as_deref(),
-        &program_files,
-        var("USERPROFILE").as_deref(),
-    )
-    .into_iter()
-    .find(|candidate| candidate.is_file())
-    .unwrap_or_else(|| "gh".into())
-}
-
-fn gh_token() -> std::result::Result<String, CopilotAuthError> {
-    // Cache the token for 10 minutes so we don't spawn `gh` on every call.
-    static CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-    {
-        let g = CACHE.lock();
-        if let Some((tok, t)) = g.as_ref() {
-            if t.elapsed() < Duration::from_secs(600) {
-                return Ok(tok.clone());
-            }
-        }
-    }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(locate_gh())
-        .args(["auth", "token"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => CopilotAuthError::CliMissing,
-            _ => CopilotAuthError::CommandFailed(error.to_string()),
-        })?;
-    if !out.status.success() {
-        warn!(status = ?out.status.code(), "`gh auth token` failed");
-        return parse_gh_token_output(false, &out.stdout);
-    }
-    let s = parse_gh_token_output(true, &out.stdout)?;
-    *CACHE.lock() = Some((s.clone(), Instant::now()));
-    Ok(s)
-}
-
-fn parse_gh_token_output(
-    success: bool,
-    stdout: &[u8],
-) -> std::result::Result<String, CopilotAuthError> {
-    if !success {
-        return Err(CopilotAuthError::NotAuthenticated);
-    }
-    let token = String::from_utf8_lossy(stdout).trim().to_string();
-    if token.is_empty() {
-        Err(CopilotAuthError::NotAuthenticated)
-    } else {
-        Ok(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        credential_binding_outcome, credential_target_unchanged, parse_gh_token_output,
-        CopilotAuthError,
-    };
+    use super::{credential_binding_outcome, credential_target_unchanged};
     use crate::cleanup::{EndpointScope, FallbackReason, PromptTarget};
 
     fn openai_target(base_url: &str, model: &str) -> PromptTarget {
@@ -1000,22 +891,6 @@ mod tests {
         // always allowed to proceed.
         assert_eq!(credential_binding_outcome(&frozen, None), Ok(()));
     }
-
-    #[test]
-    fn classifies_github_cli_token_results_without_exposing_tokens() {
-        assert_eq!(
-            parse_gh_token_output(false, b"").unwrap_err(),
-            CopilotAuthError::NotAuthenticated
-        );
-        assert_eq!(
-            parse_gh_token_output(true, b" \r\n").unwrap_err(),
-            CopilotAuthError::NotAuthenticated
-        );
-        assert_eq!(
-            parse_gh_token_output(true, b"secret-token\r\n").unwrap(),
-            "secret-token"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1026,37 +901,6 @@ mod long_form_tests {
         settings.enhance.base_url = base_url.into();
         settings.enhance.model = "some-model".into();
         settings
-    }
-
-    #[test]
-    fn gh_is_searched_on_path_then_in_the_usual_install_folders() {
-        use std::path::{Path, PathBuf};
-        let path = std::env::join_paths(["tools", "bin"]).unwrap();
-        let found = gh_candidates(
-            Some(&path),
-            Some(Path::new("local")),
-            &[PathBuf::from("programs")],
-            Some(Path::new("home")),
-        );
-        assert_eq!(
-            found,
-            [
-                Path::new("tools").join("gh.exe"),
-                Path::new("bin").join("gh.exe"),
-                Path::new("programs").join("GitHub CLI").join("gh.exe"),
-                Path::new("local")
-                    .join("Programs")
-                    .join("GitHub CLI")
-                    .join("gh.exe"),
-                Path::new("local")
-                    .join("Microsoft")
-                    .join("WinGet")
-                    .join("Links")
-                    .join("gh.exe"),
-                Path::new("home").join("scoop").join("shims").join("gh.exe"),
-            ]
-        );
-        assert!(gh_candidates(None, None, &[], None).is_empty());
     }
 
     #[test]
