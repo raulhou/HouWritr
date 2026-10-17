@@ -136,10 +136,15 @@ fn run_hook_thread() {
     };
     info!("LL keyboard hook installed");
 
-    // PeekMessage + a small sleep keeps the thread in a ready message state
-    // while also allowing the hotkey health monitor to request a controlled
-    // reinstall after repeated, observed key-transition mismatches.
-    use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+    // The thread sleeps until Windows has something for it: the hook calls
+    // arrive as messages and wake it at once. The wait also ends every
+    // REINSTALL_CHECK so the hotkey health monitor can still request a
+    // controlled reinstall after repeated, observed key-transition
+    // mismatches. (It used to wake every 2 ms, 500 times a second, all day.)
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MsgWaitForMultipleObjects, PeekMessageW, PM_REMOVE, QS_ALLINPUT,
+    };
+    const REINSTALL_CHECK: Duration = Duration::from_millis(250);
     unsafe {
         let mut msg = MSG::default();
         let mut current_hook = hook;
@@ -148,7 +153,12 @@ fn run_hook_thread() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let _ = MsgWaitForMultipleObjects(
+                None,
+                false,
+                REINSTALL_CHECK.as_millis() as u32,
+                QS_ALLINPUT,
+            );
 
             if REINSTALL_REQUESTED.swap(false, Ordering::AcqRel) {
                 match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kbd_proc), None, 0) {
