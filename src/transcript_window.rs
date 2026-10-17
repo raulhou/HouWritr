@@ -228,13 +228,33 @@ pub fn format_clock(total_seconds: u64) -> String {
 
 /// Word/char counts and a bounded preview for the `Done` message.
 pub fn summarize(text: &str) -> (usize, usize, String) {
-    let words = text.split_whitespace().count();
+    let words = word_count(text);
     let chars = text.chars().count();
     let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
     if chars > PREVIEW_CHARS {
         preview.push('…');
     }
     (words, chars, preview)
+}
+
+/// Words in `text`. Chinese and Japanese are written without spaces, so each
+/// of their characters counts as a word (the usual convention); other text
+/// counts runs between spaces.
+fn word_count(text: &str) -> usize {
+    let is_ideograph = |c: char| {
+        matches!(c,
+            '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
+            | '\u{3400}'..='\u{4DBF}' // CJK extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+        )
+    };
+    let ideographs = text.chars().filter(|&c| is_ideograph(c)).count();
+    let other_words = text
+        .split(|c: char| c.is_whitespace() || is_ideograph(c))
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count();
+    ideographs + other_words
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +657,9 @@ mod tests {
     fn summaries_count_words_and_bound_the_preview() {
         let (words, chars, preview) = summarize("one two  three");
         assert_eq!((words, chars), (3, 14));
+        // Chinese has no spaces: each character is a word.
+        assert_eq!(word_count("万物皆可虚拟资料。"), 8);
+        assert_eq!(word_count("AI+Skill 是新商机"), 5);
         assert_eq!(preview, "one two  three");
 
         let long = "x".repeat(PREVIEW_CHARS + 50);

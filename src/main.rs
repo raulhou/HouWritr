@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         return self_check::run();
     }
     if is_transcript_window_mode(arguments.iter()) {
-        let _log_guard = init_tracing()?;
+        let _log_guard = init_tracing(false)?;
         info!(
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     // Settings and About share one subprocess and single-instance boundary.
     if settings_mode || about_mode {
         let settings_instance = single_instance::SingleInstance::acquire_settings()?;
-        let _log_guard = init_tracing()?;
+        let _log_guard = init_tracing(false)?;
         info!(
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
@@ -75,7 +75,9 @@ fn main() -> Result<()> {
     }
 
     let tray_instance = single_instance::SingleInstance::acquire_tray()?;
-    let _log_guard = init_tracing()?;
+    // Only the one running tray process tidies old logs; the windows it
+    // opens write to the same file and must never delete it.
+    let _log_guard = init_tracing(tray_instance.is_some())?;
     let Some(_instance) = tray_instance else {
         info!("tray instance already running; exiting");
         return Ok(());
@@ -128,17 +130,23 @@ fn is_self_check_mode<T: AsRef<OsStr>>(args: impl IntoIterator<Item = T>) -> boo
     })
 }
 
-fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn init_tracing(prune: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = paths::log_dir();
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("create log directory {}", log_dir.display()))?;
-    diagnostics::prune_logs()?;
+    if prune {
+        diagnostics::prune_logs()?;
+    }
+    record_crashes(log_dir.clone());
 
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("openwritr")
         .filename_suffix("log")
-        .max_log_files(7)
+        // No `max_log_files`: the library's own pruning counts every
+        // `openwritr*.log` file, copies included, by creation time, and ran
+        // in every process; it deleted the log the tray was still writing.
+        // `diagnostics::prune_logs` does it safely instead.
         .build(&log_dir)
         .with_context(|| format!("initialize log appender in {}", log_dir.display()))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -162,6 +170,64 @@ fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
         .context("initialize tracing subscriber")?;
 
     Ok(guard)
+}
+
+/// Write every panic straight to `crash.log` in the log folder before the
+/// process aborts (release builds abort on panic). The normal log is written
+/// in the background, so its last lines, and the panic itself, were lost.
+fn record_crashes(log_dir: std::path::PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let thread = std::thread::current();
+        let report = format!(
+            "{} UTC pid {} thread {}: {}\n{}\n\n",
+            utc_now(),
+            std::process::id(),
+            thread.name().unwrap_or("unnamed"),
+            info,
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("crash.log"))
+        {
+            let _ = file.write_all(report.as_bytes());
+            let _ = file.flush();
+        }
+        error!("crash: {info}");
+        previous(info);
+    }));
+}
+
+/// The current UTC time as `YYYY-MM-DD hh:mm:ss`, without a date library.
+fn utc_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60
+    )
 }
 
 #[cfg(test)]
