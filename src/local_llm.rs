@@ -374,6 +374,54 @@ pub fn remove_model(cli: &Path, model: &str) -> Result<()> {
     Ok(())
 }
 
+/// Uninstall GenieX: remove its model, run the uninstaller its installer
+/// left next to `geniex.exe` (silently, for this user), and delete the files
+/// HouWritr kept for it. A GenieX installed some other way has no such
+/// uninstaller and is left to Windows Settings → Apps.
+pub fn uninstall_cli(cli: &Path) -> Result<()> {
+    shutdown();
+    if let Err(error) = remove_model(cli, DEFAULT_MODEL) {
+        warn!(error = %error, "could not remove the GenieX model before uninstalling");
+    }
+    let uninstaller = find_uninstaller(cli).ok_or_else(|| {
+        anyhow!(
+            "no GenieX uninstaller was found next to {}; remove GenieX in Windows Settings → Apps",
+            cli.display()
+        )
+    })?;
+    info!(uninstaller = %uninstaller.display(), "running the GenieX uninstaller");
+    let status =
+        hidden(Command::new(&uninstaller).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]))
+            .status()
+            .context("start the GenieX uninstaller")?;
+    if !status.success() {
+        bail!("the GenieX uninstaller exited with {status}");
+    }
+    let _ = std::fs::remove_dir_all(work_dir());
+    Ok(())
+}
+
+/// The Inno Setup uninstaller (`unins000.exe`, …) in the folder of
+/// `geniex.exe` or the folder above it.
+fn find_uninstaller(cli: &Path) -> Option<PathBuf> {
+    cli.ancestors().skip(1).take(2).find_map(|folder| {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(folder)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| is_uninstaller_name(path))
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    })
+}
+
+fn is_uninstaller_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())
+        .is_some_and(|name| name.starts_with("unins") && name.ends_with(".exe"))
+}
+
 /// Emit text split on `\r` and `\n` (progress bars redraw with `\r`).
 fn split_progress_lines(mut stream: Box<dyn Read + Send>, tx: &mpsc::Sender<String>) {
     let mut current = Vec::new();
@@ -974,6 +1022,19 @@ mod tests {
         assert!(platform_support_for(false, Some("arm64")).is_ok());
         assert!(platform_support_for(false, None).is_err());
         assert!(platform_support_for(false, Some("AMD64")).is_err());
+    }
+
+    #[test]
+    fn the_genie_uninstaller_is_found_next_to_the_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = temp.path().join("GenieX CLI");
+        std::fs::create_dir_all(&tool).unwrap();
+        let cli = tool.join("geniex.exe");
+        std::fs::write(&cli, b"").unwrap();
+        assert_eq!(find_uninstaller(&cli), None);
+        std::fs::write(tool.join("unins000.exe"), b"").unwrap();
+        std::fs::write(tool.join("unins000.dat"), b"").unwrap();
+        assert_eq!(find_uninstaller(&cli), Some(tool.join("unins000.exe")));
     }
 
     #[test]

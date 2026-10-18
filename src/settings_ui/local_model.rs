@@ -43,6 +43,7 @@ enum JobKind {
     Install,
     Pull,
     Remove,
+    Uninstall,
     Test,
     Discover,
 }
@@ -54,6 +55,7 @@ impl JobKind {
             JobKind::Install => "install GenieX",
             JobKind::Pull => "download model",
             JobKind::Remove => "remove model",
+            JobKind::Uninstall => "uninstall GenieX",
             JobKind::Test => "test model",
             JobKind::Discover => "find models",
         }
@@ -88,6 +90,8 @@ pub(super) struct LocalModelUi {
     job: Option<LocalJob>,
     outcome: Option<std::result::Result<String, String>>,
     discovered: Vec<String>,
+    /// "Uninstall GenieX" was clicked once; the next click confirms.
+    confirm_uninstall: bool,
 }
 
 impl LocalModelUi {
@@ -117,6 +121,7 @@ impl LocalModelUi {
             job: None,
             outcome: None,
             discovered: Vec::new(),
+            confirm_uninstall: false,
         }
     }
 }
@@ -332,6 +337,30 @@ impl SettingsApp {
                     self.local_model.outcome = None;
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                if self.local_model.confirm_uninstall {
+                    ui.label("Remove the model and uninstall GenieX?");
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Uninstall"))
+                        .clicked()
+                    {
+                        self.local_model.confirm_uninstall = false;
+                        self.start_local_job(JobKind::Uninstall);
+                    }
+                    if ui.button("Keep").clicked() {
+                        self.local_model.confirm_uninstall = false;
+                    }
+                } else if ui
+                    .add_enabled(!busy, egui::Button::new("Uninstall GenieX…"))
+                    .on_hover_text(
+                        "Removes the model and runs GenieX's own uninstaller for your user. \
+                         Cleanup with the built-in model stops working until it is installed again.",
+                    )
+                    .clicked()
+                {
+                    self.local_model.confirm_uninstall = true;
+                }
+            });
         }
         self.render_local_job_state(ui);
         ui.add_space(4.0);
@@ -510,6 +539,7 @@ impl SettingsApp {
                         JobKind::Install => "Starting download…".into(),
                         JobKind::Pull => "Starting download…".into(),
                         JobKind::Remove => "Removing…".into(),
+                        JobKind::Uninstall => "Uninstalling GenieX…".into(),
                         JobKind::Test => {
                             "Waiting for the model (the first answer loads it)…".into()
                         }
@@ -561,7 +591,10 @@ impl SettingsApp {
                     Err(message) => Some(Err(message)),
                 };
                 // Anything that changed what is installed is re-checked.
-                if matches!(kind, JobKind::Install | JobKind::Pull | JobKind::Remove) {
+                if matches!(
+                    kind,
+                    JobKind::Install | JobKind::Pull | JobKind::Remove | JobKind::Uninstall
+                ) {
                     self.local_model.status = None;
                 }
             }
@@ -626,6 +659,11 @@ fn run_local_job(
             local_llm::shutdown();
             local_llm::remove_model(&cli, DEFAULT_MODEL).map_err(fail)?;
             Ok("Model removed.".into())
+        }
+        JobKind::Uninstall => {
+            let cli = local_llm::locate_cli().ok_or("The GenieX tool is not installed.")?;
+            local_llm::uninstall_cli(&cli).map_err(fail)?;
+            Ok("GenieX and its model were removed.".into())
         }
         JobKind::Test => {
             let result = local_llm::test_chat(base_url, model).map_err(fail)?;

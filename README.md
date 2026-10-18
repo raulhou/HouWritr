@@ -180,8 +180,8 @@ labels. With a single speaker the transcript stays unlabelled; if the models
 cannot run you still get the transcript and a note saying so.
 
 The Speaker labels section also shows whether the models are installed, with
-**Download and install**, **Verify files** (sizes and SHA-256) and **Open
-model folder**, plus an *Install manually* list (names, sizes, hashes, links)
+**Download and install**, **Verify files** (sizes and SHA-256), **Open model
+folder** and **Remove models**, plus an *Install manually* list (names, sizes, hashes, links)
 for machines without direct internet access.
 
 ## AI cleanup and meeting notes
@@ -228,7 +228,10 @@ meetings.
   (`winget install GitHub.Copilot`, then `copilot login`), found in the order
   the CLI uses: the `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`
   variable, its Windows Credential Manager entry, its config file, and finally
-  the GitHub CLI (`gh auth login`). If Copilot refuses the chosen model for
+  the GitHub CLI (`gh auth login`). The model list in Settings comes from
+  Copilot for your account (**Refresh** asks again); Copilot Free has no
+  fixed list, as GitHub offers it models through automatic selection only.
+  If Copilot refuses the chosen model for
   your account, HouWritr asks Copilot which models are on offer and tries the
   closest few under both the Copilot CLI and VS Code identities, then keeps
   using the one that worked for the rest of the session. The log shows each
@@ -245,7 +248,10 @@ meetings.
     your user only), then **Download model** (several GB, resumable), then
     **Test model**. HouWritr starts `geniex serve` on a private port (18651)
     only when needed and stops it as soon as a transcript is finished, after
-    5 idle minutes, or when it stops answering or slows down sharply.
+    5 idle minutes, or when it stops answering or slows down sharply. While it
+    runs, an NPU speech engine is unloaded to give it the NPU, and loaded
+    again for the next transcription. **Remove model** deletes the model;
+    **Uninstall GenieX…** removes the model and runs GenieX's own uninstaller.
   * *Another local server*: any OpenAI compatible server on `localhost`
     (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
     models**, **Test connection** and a setup guide are in Settings.
@@ -276,12 +282,14 @@ Tray icon → right click → **Settings**:
 * **Transcription**: Parakeet CPU INT8 (default), Parakeet NPU, or Whisper
   Large v3 Turbo NPU, each with hardware availability, download size and cache
   status. NPU engines are shown but disabled unless the ARM64 build runs on a
-  Snapdragon X Elite.
+  Snapdragon X Elite. **Remove model files** deletes a downloaded engine you
+  are not using (it downloads again if you select it later).
 * **Output and feedback**: save transcripts as Markdown (`.md` with a title,
   details line and paragraphs; added by HouWritr, not the AI) or plain text;
   show the status pill; show the meeting recording indicator; and what to do
   about meeting notes.
-* **Speaker labels**: on or off, model status and management (see above).
+* **Speaker labels**: on or off, model status and management, and **Remove
+  models** (see above).
 * **Text enhancement**: **Off** or **On**, the provider, model and prompt.
 * **Startup**: start HouWritr when you sign in.
 * **About, credits & support**: version, architecture, source, issues,
