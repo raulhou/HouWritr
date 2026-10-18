@@ -548,7 +548,7 @@ fn is_managed_target(target: &PromptTarget) -> bool {
 }
 
 /// Whether the configured cleanup provider is the built-in model on the NPU.
-fn uses_managed_model(settings: &Settings) -> bool {
+pub fn uses_managed_model(settings: &Settings) -> bool {
     settings
         .prompt_target()
         .map(|target| is_managed_target(&target))
@@ -1420,8 +1420,12 @@ fn clean_slices(
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
         if !tripped && index + 1 < total && give_up() {
+            // Not retried in the background either: a model this slow was
+            // just as slow on every retry, and each one held the NPU for
+            // minutes.
             tripped = true;
-            warn!("cleanup is too slow to finish; the remaining slices are left for later");
+            rejected = true;
+            warn!("cleanup is too slow on this PC; the remaining slices keep their text and are not retried");
         }
     }
 
@@ -1997,7 +2001,7 @@ mod long_form_tests {
     }
 
     #[test]
-    fn a_model_that_keeps_writing_slowly_leaves_the_rest_for_later() {
+    fn a_model_that_keeps_writing_slowly_stops_without_retries() {
         let mut calls = 0;
         let result = clean_slices(
             slices(6),
@@ -2013,8 +2017,8 @@ mod long_form_tests {
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(result.report.cleaned, 1);
-        assert_eq!(result.report.unreachable, 5);
-        assert!(result.report.needs_retry());
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
     }
 
     #[test]
