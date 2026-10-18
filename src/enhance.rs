@@ -753,6 +753,12 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// How many requests cleaning up `text` takes, for progress across several
+/// texts.
+pub fn cleanup_slice_count(text: &str, settings: &Settings) -> usize {
+    split_for_cleanup(text, cleanup_slice_chars(settings, text)).len()
+}
+
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
     // The small-context limit is the NPU model's; on the CPU GenieX runs a
     // 4,096-token context like any other local server.

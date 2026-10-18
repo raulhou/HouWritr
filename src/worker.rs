@@ -1016,8 +1016,19 @@ fn worker_main(
                 // cleanup can be redone later.
                 let raw_text = text;
                 let mut cleanup_report: Option<enhance::CleanupReport> = None;
+                // A model on this PC cleans a meeting once, after Stop: loading
+                // it for every five-minute part would cost more energy than
+                // the cleanup itself, and it would compete with the call for
+                // the CPU. Hosted providers still clean each part as it comes.
+                let deferred = job.config.session.is_some()
+                    && job.config.should_enhance()
+                    && enhance::uses_local_model(&job.config.settings);
+                if deferred && !transcription_failed {
+                    cleanup_report = Some(DEFERRED_CLEANUP);
+                }
                 let (final_text, enhancement_warning) = if job.config.should_enhance()
                     && !transcription_failed
+                    && !deferred
                 {
                     let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
                     info!("enhancement requested");
@@ -1070,9 +1081,30 @@ fn worker_main(
                         state.note_part(&diarization, &enhancement_warning);
                         if part.last {
                             let mut state = sessions.remove(&part.id).unwrap_or_default();
-                            // A second chance for parts whose cleanup could not
-                            // reach the provider while the meeting was running.
-                            if job.config.should_enhance() {
+                            let mut own = own;
+                            if deferred {
+                                let _ =
+                                    event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
+                                info!(parts = state.parts.len() + 1, "cleaning up the meeting");
+                                state.parts.push(own);
+                                clean_deferred_parts(
+                                    &mut state.parts,
+                                    &job.config.settings,
+                                    |raw, progress| {
+                                        clean_transcript(
+                                            raw,
+                                            &job.config.settings,
+                                            &mut gate,
+                                            &interrupted_now,
+                                            progress,
+                                        )
+                                    },
+                                    send_cleaning_progress,
+                                );
+                                own = state.parts.pop().expect("the last part was just added");
+                            } else if job.config.should_enhance() {
+                                // A second chance for parts whose cleanup could
+                                // not reach the provider while the meeting ran.
                                 retry_incomplete_parts(
                                     &mut state.parts,
                                     RETRY_BUDGET,
@@ -1638,6 +1670,51 @@ fn clean_transcript(
 /// How long the second pass at Stop may spend on parts whose cleanup failed
 /// during the meeting.
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The cleanup report of a meeting part whose cleanup waits for the end of
+/// the meeting (a model on this PC). It counts as not yet cleaned, so if the
+/// end never gets to it, the background retry picks it up.
+const DEFERRED_CLEANUP: enhance::CleanupReport = enhance::CleanupReport {
+    total: 1,
+    cleaned: 0,
+    unreachable: 1,
+};
+
+/// Clean up, in order, every part whose cleanup was left for the end of the
+/// meeting ([`DEFERRED_CLEANUP`]), reporting progress as one count of
+/// requests over all of them. Stops when interrupted; what is left keeps its
+/// recognised text and is retried later.
+fn clean_deferred_parts(
+    parts: &mut [PartText],
+    settings: &Settings,
+    mut clean: impl FnMut(&str, &mut dyn FnMut(usize, usize)) -> Option<CleanedText>,
+    mut progress: impl FnMut(usize, usize),
+) {
+    let todo: Vec<usize> = (0..parts.len())
+        .filter(|&index| parts[index].report == DEFERRED_CLEANUP)
+        .collect();
+    let sizes: Vec<usize> = todo
+        .iter()
+        .map(|&index| {
+            enhance::cleanup_slice_count(&strip_timestamps(&parts[index].raw).0, settings)
+        })
+        .collect();
+    let total: usize = sizes.iter().sum();
+    progress(0, total);
+    let mut base = 0;
+    for (index, size) in todo.into_iter().zip(sizes) {
+        let cleaned = clean(&parts[index].raw, &mut |done, _| {
+            progress(base + done.min(size), total)
+        });
+        let Some(cleaned) = cleaned else {
+            break;
+        };
+        parts[index].text = cleaned.text;
+        parts[index].report = cleaned.report;
+        base += size;
+        progress(base, total);
+    }
+}
 
 /// One retry of a part's cleanup.
 enum RetryAttempt {
@@ -3269,6 +3346,54 @@ mod tests {
             1
         );
         assert!(plan_long_form_windows(&[], 16_000).is_empty());
+    }
+
+    #[test]
+    fn deferred_parts_are_cleaned_in_order_with_one_progress_count() {
+        let settings = Settings::default();
+        let pending = |raw: &str| PartText {
+            raw: raw.into(),
+            text: raw.into(),
+            report: DEFERRED_CLEANUP,
+        };
+        let mut parts = vec![
+            pending("one"),
+            PartText::plain("lost part".into()),
+            pending("two"),
+        ];
+        let mut seen = Vec::new();
+        let mut steps = Vec::new();
+        clean_deferred_parts(
+            &mut parts,
+            &settings,
+            |raw, progress| {
+                seen.push(raw.to_string());
+                progress(1, 1);
+                Some(CleanedText {
+                    text: raw.to_uppercase(),
+                    warning: None,
+                    report: enhance::CleanupReport {
+                        total: 1,
+                        cleaned: 1,
+                        unreachable: 0,
+                    },
+                })
+            },
+            |done, total| steps.push((done, total)),
+        );
+        assert_eq!(seen, ["one", "two"]);
+        assert_eq!(parts[0].text, "ONE");
+        assert_eq!(parts[1].text, "lost part");
+        assert_eq!(parts[2].text, "TWO");
+        assert!(!parts[2].report.needs_retry());
+        assert_eq!(steps.first(), Some(&(0, 2)));
+        assert_eq!(steps.last(), Some(&(2, 2)));
+
+        // Interrupted: the rest keeps its text and stays marked for a retry.
+        let mut parts = vec![pending("one"), pending("two")];
+        clean_deferred_parts(&mut parts, &settings, |_, _| None, |_, _| {});
+        assert_eq!(parts[0].text, "one");
+        assert!(parts[1].report.needs_retry());
     }
 
     #[test]

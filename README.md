@@ -272,6 +272,12 @@ meetings.
     (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
     models**, **Test connection** and a setup guide are in Settings.
 
+  With a model on this PC, a meeting is cleaned up once, after you press
+  Stop: while it runs, its parts are only transcribed. The model then loads
+  once instead of every five minutes, and stays off the CPU during the call.
+  Hosted providers clean each part as it comes, so their result is ready at
+  Stop.
+
   Local models are slower and weaker than hosted ones, so they get smaller
   slices, longer waits, and `<think>…</think>` blocks removed from replies.
   The same integrity checks apply. GenieX is a Qualcomm developer preview.
