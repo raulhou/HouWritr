@@ -693,11 +693,10 @@ pub fn cleanup_engine_label(settings: &Settings) -> String {
         Ok(target) => match target.endpoint() {
             Some(endpoint) if crate::local_llm::is_managed(endpoint) => {
                 let name = name.split(':').next().unwrap_or(name);
-                if crate::local_llm::runs_on_npu(model) {
-                    format!("{name} · this PC (NPU)")
-                } else {
-                    format!("{name} · this PC (CPU)")
-                }
+                format!(
+                    "{name} · this PC ({})",
+                    crate::local_llm::runtime(model).place()
+                )
             }
             Some(endpoint) if endpoint.is_loopback() => format!("{name} · this PC"),
             Some(endpoint) => format!("{name} · {}", endpoint.host()),
@@ -762,7 +761,8 @@ pub fn cleanup_slice_count(text: &str, settings: &Settings) -> usize {
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
     // The small-context limit is the NPU model's; on the CPU GenieX runs a
     // 4,096-token context like any other local server.
-    if uses_managed_model(settings) && crate::local_llm::runs_on_npu(&settings.enhance.model) {
+    if uses_managed_model(settings) && crate::local_llm::runs_on_npu_bundle(&settings.enhance.model)
+    {
         scaled_for_script(MANAGED_CLEANUP_CHARS, text)
     } else if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)

@@ -328,7 +328,7 @@ impl SettingsApp {
                 .and_then(|status| status.model_installed);
             ui.horizontal_wrapped(|ui| {
                 ui.label("Download");
-                ui.monospace(selected.id);
+                ui.monospace(selected.name);
                 match installed {
                     Some(true) => status_label(ui, "Downloaded", status_green()),
                     Some(false) => status_label(ui, "Not downloaded", warning_color()),
@@ -662,7 +662,8 @@ fn run_local_job(
         JobKind::Check => {
             let cli = local_llm::locate_cli();
             let (model_installed, error) = match &cli {
-                Some(path) => match local_llm::model_installed(path, model) {
+                Some(path) => match local_llm::model_installed(path, local_llm::geniex_name(model))
+                {
                     Ok(installed) => (Some(installed), None),
                     Err(error) => (None, Some(format!("Could not list models: {error:#}"))),
                 },
@@ -704,7 +705,7 @@ fn run_local_job(
         JobKind::Remove => {
             let cli = local_llm::locate_cli().ok_or("The GenieX tool is not installed.")?;
             local_llm::shutdown();
-            local_llm::remove_model(&cli, model).map_err(fail)?;
+            local_llm::remove_model(&cli, local_llm::geniex_name(model)).map_err(fail)?;
             Ok("Model removed.".into())
         }
         JobKind::Uninstall => {

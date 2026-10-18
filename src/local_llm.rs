@@ -40,50 +40,113 @@ pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
 /// Qualcomm AI Hub bundle run on the NPU (4B instruct, no reasoning prefix).
 pub const DEFAULT_MODEL: &str = "ai-hub-models/Qwen3-4B-Instruct-2507";
 
+/// Where GenieX runs a built-in model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    /// A Qualcomm AI Hub bundle on the NPU (GenieX's QAIRT runtime, its
+    /// default). Small context windows.
+    NpuBundle,
+    /// A GGUF file on the processor (GenieX's llama.cpp runtime).
+    Cpu,
+    /// A GGUF file on the NPU through llama.cpp's Hexagon backend: another
+    /// way onto the NPU than the bundle.
+    NpuLlama,
+    /// A GGUF file split between the NPU and the CPU by llama.cpp, which
+    /// GenieX calls the fast path on Snapdragon.
+    Hybrid,
+}
+
+impl Runtime {
+    /// For the transcript window and the log.
+    pub fn place(self) -> &'static str {
+        match self {
+            Runtime::NpuBundle => "NPU",
+            Runtime::Cpu => "CPU",
+            Runtime::NpuLlama => "NPU, llama.cpp",
+            Runtime::Hybrid => "NPU + CPU",
+        }
+    }
+
+    /// GenieX's `compute` and `ngl` request fields (none for the bundle).
+    fn compute(self) -> Option<(&'static str, i32)> {
+        match self {
+            Runtime::NpuBundle => None,
+            Runtime::Cpu => Some(("cpu", 0)),
+            Runtime::NpuLlama => Some(("npu", -1)),
+            Runtime::Hybrid => Some(("hybrid", -1)),
+        }
+    }
+}
+
 /// A model HouWritr can download and run through GenieX by itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltInModel {
-    /// The name GenieX downloads and serves it under (`name[:precision]`).
+    /// What the settings file stores; unique per choice.
     pub id: &'static str,
+    /// The name GenieX downloads and serves it under (`name[:precision]`).
+    /// Several choices can share one file and differ only in `runtime`.
+    pub name: &'static str,
     /// Shown in Settings.
     pub label: &'static str,
     /// One line for Settings: size and what to expect.
     pub detail: &'static str,
-    /// Run on the CPU (llama.cpp in GenieX) instead of the NPU.
-    pub cpu: bool,
+    pub runtime: Runtime,
     /// Download size in bytes, when known: GenieX's own total can be far too
     /// small (it sizes its bar from the first file it sees).
     pub download_bytes: Option<u64>,
 }
 
-/// The models offered in Settings. The CPU ones are GGUF files from Hugging
-/// Face that GenieX runs with its llama.cpp runtime: on PCs where the NPU
-/// model writes only about one token a second, the CPU is many times faster.
+const QWEN3_4B_GGUF: &str = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0";
+const QWEN3_4B_GGUF_BYTES: u64 = 2_375_773_280;
+
+/// The models offered in Settings. Besides Qualcomm's NPU bundle, GenieX runs
+/// GGUF files from Hugging Face with its llama.cpp runtime, on the CPU, on
+/// the NPU, or on both: on PCs where the bundle writes only about one token
+/// a second, these are many times faster.
 pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
     BuiltInModel {
         id: DEFAULT_MODEL,
-        label: "Qwen3 4B on the NPU",
+        name: DEFAULT_MODEL,
+        label: "Qwen3 4B on the NPU (Qualcomm bundle)",
         detail: "About 2.5 GB from Qualcomm AI Hub. Light on the CPU; on some PCs it writes very slowly.",
-        cpu: false,
+        runtime: Runtime::NpuBundle,
         download_bytes: None,
     },
     BuiltInModel {
-        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0",
+        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu",
+        name: QWEN3_4B_GGUF,
+        label: "Qwen3 4B on the NPU (llama.cpp)",
+        detail: "About 2.4 GB from Hugging Face, the same file as the CPU choice. Runs on the NPU through llama.cpp instead of Qualcomm's bundle.",
+        runtime: Runtime::NpuLlama,
+        download_bytes: Some(QWEN3_4B_GGUF_BYTES),
+    },
+    BuiltInModel {
+        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid",
+        name: QWEN3_4B_GGUF,
+        label: "Qwen3 4B on the NPU and CPU",
+        detail: "The same file as the CPU choice, split between the NPU and the processor by llama.cpp.",
+        runtime: Runtime::Hybrid,
+        download_bytes: Some(QWEN3_4B_GGUF_BYTES),
+    },
+    BuiltInModel {
+        id: QWEN3_4B_GGUF,
+        name: QWEN3_4B_GGUF,
         label: "Qwen3 4B on the CPU",
         detail: "About 2.4 GB from Hugging Face. The same model on the processor; keeps the CPU busy while it cleans up.",
-        cpu: true,
-        download_bytes: Some(2_375_773_280),
+        runtime: Runtime::Cpu,
+        download_bytes: Some(QWEN3_4B_GGUF_BYTES),
     },
     BuiltInModel {
         id: "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0",
+        name: "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0",
         label: "Qwen2.5 7B on the CPU",
         detail: "About 4.4 GB from Hugging Face. Larger and more careful, about half as fast; needs 16 GB of memory.",
-        cpu: true,
+        runtime: Runtime::Cpu,
         download_bytes: Some(4_444_121_792),
     },
 ];
 
-/// The built-in model `model` names, if it is one.
+/// The built-in model the setting `model` names, if it is one.
 pub fn built_in(model: &str) -> Option<&'static BuiltInModel> {
     let model = model.trim();
     BUILT_IN_MODELS
@@ -91,31 +154,43 @@ pub fn built_in(model: &str) -> Option<&'static BuiltInModel> {
         .find(|known| known.id.eq_ignore_ascii_case(model))
 }
 
-/// Whether the built-in model `model` runs on the NPU (anything unknown is
-/// treated as the NPU model, which is what the managed server ran before).
-pub fn runs_on_npu(model: &str) -> bool {
-    built_in(model).is_none_or(|known| !known.cpu)
+/// The name GenieX knows the model of setting `model` by.
+pub fn geniex_name(model: &str) -> &str {
+    built_in(model).map_or(model.trim(), |known| known.name)
 }
 
-/// Add what GenieX needs to run `model` where it should to a chat request.
-/// The NPU model needs nothing: the NPU is GenieX's default.
+/// Where the model of setting `model` runs (anything unknown is treated as
+/// the NPU bundle, which is what the managed server ran before).
+pub fn runtime(model: &str) -> Runtime {
+    built_in(model).map_or(Runtime::NpuBundle, |known| known.runtime)
+}
+
+/// Whether `model` is the NPU bundle, with its small context windows.
+pub fn runs_on_npu_bundle(model: &str) -> bool {
+    runtime(model) == Runtime::NpuBundle
+}
+
+/// Make a chat request for setting `model` one GenieX runs where it should:
+/// the model's GenieX name, and for llama.cpp models the compute unit. The
+/// NPU bundle needs nothing more: the NPU is GenieX's default.
 pub fn add_request_options(body: &mut serde_json::Value, model: &str) {
-    if runs_on_npu(model) {
+    let Some(body) = body.as_object_mut() else {
         return;
-    }
-    if let Some(body) = body.as_object_mut() {
-        body.insert("compute".into(), serde_json::json!("cpu"));
-        body.insert("ngl".into(), serde_json::json!(0));
+    };
+    body.insert("model".into(), serde_json::json!(geniex_name(model)));
+    if let Some((compute, layers)) = runtime(model).compute() {
+        body.insert("compute".into(), serde_json::json!(compute));
+        body.insert("ngl".into(), serde_json::json!(layers));
         // GenieX asks models to think first unless told otherwise; these
         // instruct models do not, and must not start to.
         body.insert("enable_think".into(), serde_json::json!(false));
     }
 }
 
-/// The arguments `geniex pull` needs for `model`, without prompts.
+/// The arguments `geniex pull` needs for setting `model`, without prompts.
 fn pull_arguments(model: &str) -> Vec<&str> {
-    let mut arguments = vec!["pull", model.trim()];
-    if !runs_on_npu(model) {
+    let mut arguments = vec!["pull", geniex_name(model)];
+    if !runs_on_npu_bundle(model) {
         // A Hugging Face download asks whether the model reads images.
         arguments.extend(["--model-type", "llm"]);
     }
@@ -532,10 +607,13 @@ pub fn remove_model(cli: &Path, model: &str) -> Result<()> {
 /// uninstaller and is left to Windows Settings → Apps.
 pub fn uninstall_cli(cli: &Path) -> Result<()> {
     shutdown();
-    for model in BUILT_IN_MODELS {
-        if model_installed(cli, model.id).unwrap_or(true) {
-            if let Err(error) = remove_model(cli, model.id) {
-                warn!(error = %error, model = model.id, "could not remove a GenieX model before uninstalling");
+    let mut names: Vec<&str> = BUILT_IN_MODELS.iter().map(|model| model.name).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        if model_installed(cli, name).unwrap_or(true) {
+            if let Err(error) = remove_model(cli, name) {
+                warn!(error = %error, model = name, "could not remove a GenieX model before uninstalling");
             }
         }
     }
@@ -842,7 +920,7 @@ pub fn ensure_running(
         return Ok(());
     };
     if !server.model_loaded || previous_use.elapsed() >= MODEL_RESIDENT {
-        let place = if runs_on_npu(model) { "NPU" } else { "CPU" };
+        let place = runtime(model).place();
         info!(model, place, "loading the local model");
         let started = Instant::now();
         match load_model(model) {
@@ -1345,30 +1423,47 @@ mod tests {
     }
 
     #[test]
-    fn cpu_models_are_asked_to_run_on_the_cpu() {
-        let cpu = BUILT_IN_MODELS.iter().find(|model| model.cpu).unwrap();
-        assert!(!runs_on_npu(cpu.id));
-        assert!(runs_on_npu(DEFAULT_MODEL));
-        assert!(runs_on_npu("something-else"));
-        let mut body = serde_json::json!({"model": cpu.id});
-        add_request_options(&mut body, cpu.id);
+    fn each_choice_is_asked_to_run_where_it_should() {
+        let mut body = serde_json::json!({"model": "x"});
+        add_request_options(&mut body, QWEN3_4B_GGUF);
+        assert_eq!(body["model"], QWEN3_4B_GGUF);
         assert_eq!(body["compute"], "cpu");
         assert_eq!(body["ngl"], 0);
         assert_eq!(body["enable_think"], false);
+        // The NPU choices share the CPU file and send another compute unit.
+        let mut body = serde_json::json!({"model": "x"});
+        add_request_options(&mut body, "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu");
+        assert_eq!(body["model"], QWEN3_4B_GGUF);
+        assert_eq!(body["compute"], "npu");
+        assert_eq!(body["ngl"], -1);
+        let mut body = serde_json::json!({"model": "x"});
+        add_request_options(&mut body, "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid");
+        assert_eq!(body["compute"], "hybrid");
+        // The bundle: GenieX's default, nothing added.
         let mut npu = serde_json::json!({"model": DEFAULT_MODEL});
         add_request_options(&mut npu, DEFAULT_MODEL);
+        assert_eq!(npu["model"], DEFAULT_MODEL);
         assert!(npu.get("compute").is_none());
+        assert!(runs_on_npu_bundle("something-else"));
+        // Every choice is unique; every file is a GGUF download or the bundle.
+        let mut ids: Vec<&str> = BUILT_IN_MODELS.iter().map(|model| model.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), BUILT_IN_MODELS.len());
     }
 
     #[test]
     fn downloads_never_wait_for_an_answer() {
         assert_eq!(pull_arguments(DEFAULT_MODEL), ["pull", DEFAULT_MODEL]);
-        for model in BUILT_IN_MODELS.iter().filter(|model| model.cpu) {
+        for model in BUILT_IN_MODELS
+            .iter()
+            .filter(|model| model.runtime != Runtime::NpuBundle)
+        {
             // A precision and a model type, or GenieX would ask for them.
-            assert!(model.id.ends_with(":Q4_0"));
+            assert!(model.name.ends_with(":Q4_0"));
             assert_eq!(
                 pull_arguments(model.id),
-                ["pull", model.id, "--model-type", "llm"]
+                ["pull", model.name, "--model-type", "llm"]
             );
         }
     }
@@ -1376,13 +1471,19 @@ mod tests {
     #[test]
     fn built_in_models_are_found_by_name_and_listed_apart() {
         assert_eq!(
-            built_in(" unsloth/qwen3-4b-instruct-2507-gguf:q4_0 ").map(|model| model.cpu),
-            Some(true)
+            built_in(" unsloth/qwen3-4b-instruct-2507-gguf:q4_0 ").map(|model| model.runtime),
+            Some(Runtime::Cpu)
         );
         let listing = r#"[{"name":"unsloth/Qwen3-4B-Instruct-2507-GGUF","precisions":["Q4_0"]}]"#;
-        assert!(lists_model(listing, BUILT_IN_MODELS[1].id));
+        assert!(lists_model(
+            listing,
+            geniex_name("unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu")
+        ));
         assert!(!lists_model(listing, DEFAULT_MODEL));
-        assert!(!lists_model(listing, BUILT_IN_MODELS[2].id));
+        assert!(!lists_model(
+            listing,
+            "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0"
+        ));
     }
 
     #[test]

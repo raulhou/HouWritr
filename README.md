@@ -252,6 +252,10 @@ meetings.
     * *Qwen3 4B on the NPU* (`ai-hub-models/Qwen3-4B-Instruct-2507`, about
       2.5 GB from Qualcomm AI Hub). Light on the CPU, but on some PCs it
       writes only about one token a second, too slow for cleanup.
+    * *Qwen3 4B on the NPU (llama.cpp)* and *Qwen3 4B on the NPU and CPU*:
+      the GGUF file below, run on the NPU through llama.cpp's Hexagon
+      backend instead of Qualcomm's bundle, or split between the NPU and the
+      processor. Worth trying where the bundle is slow.
     * *Qwen3 4B on the CPU* (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
       about 2.4 GB from Hugging Face). The same model through GenieX's
       llama.cpp runtime on the processor.
