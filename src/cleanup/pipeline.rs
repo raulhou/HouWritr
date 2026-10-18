@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::adapter::{self, ChatRequestOptions};
 use super::catalog;
-use super::integrity::{self, ValidatorError};
+use super::integrity::{self, ValidatorError, ViolationKind};
 use super::normalize;
 use super::outcome::{EnhanceOutcome, FallbackReason};
 use super::prompt::{PromptTarget, Transcript};
@@ -110,10 +110,29 @@ pub fn finalize(source: &str, raw_content: &str) -> EnhanceOutcome {
         Err(ValidatorError::InputTooLarge) => {
             EnhanceOutcome::raw_fallback(source, FallbackReason::ValidatorError)
         }
-        Ok(report) if report.is_rejected() => EnhanceOutcome::raw_fallback(
-            source,
-            FallbackReason::IntegrityRejected(report.error_kinds()),
-        ),
+        Ok(report) if report.is_rejected() => {
+            let kinds = report.error_kinds();
+            if kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    ViolationKind::FactualDigitChanged | ViolationKind::SpeakerLabelsChanged
+                )
+            }) {
+                // Counts only: why numbers were judged changed, without them.
+                let changes = integrity::number_changes(source, &normalized);
+                tracing::info!(
+                    ?kinds,
+                    lost = changes.lost,
+                    gained = changes.gained,
+                    labels_before = changes.speaker_labels_source,
+                    labels_after = changes.speaker_labels_candidate,
+                    chinese_numerals_before = changes.chinese_numerals_source,
+                    chinese_numerals_after = changes.chinese_numerals_candidate,
+                    "cleaned text changed numbers or speaker labels"
+                );
+            }
+            EnhanceOutcome::raw_fallback(source, FallbackReason::IntegrityRejected(kinds))
+        }
         Ok(report) => EnhanceOutcome::enhanced(normalized, report.warning_kinds()),
     }
 }

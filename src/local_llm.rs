@@ -614,6 +614,15 @@ pub fn ensure_running(
 
     let running = match server.child.as_mut().map(Child::try_wait) {
         Some(Ok(None)) => true,
+        Some(Ok(Some(status))) => {
+            warn!(%status, "local model server exited; restarting");
+            server.child = None;
+            server.model_loaded = false;
+            server.loaded_model = None;
+            server.was_fast = false;
+            server.slow_answers = 0;
+            false
+        }
         Some(_) => {
             warn!("local model server exited; restarting");
             server.child = None;
@@ -855,6 +864,34 @@ fn stop_locked(server: &mut Server) {
     server.loaded_model = None;
     server.was_fast = false;
     server.slow_answers = 0;
+}
+
+/// After a request to the server failed without timing out: whether the
+/// server HouWritr started has exited (waiting up to two seconds for a
+/// process that is going down). Its exit status is logged, and the next
+/// request starts a new server.
+pub fn server_exited() -> bool {
+    let Some(mut server) = SERVER.try_lock_for(Duration::from_secs(2)) else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        let Some(child) = server.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                warn!(%status, "the local model server stopped by itself");
+                server.child = None;
+                stop_locked(&mut server);
+                return true;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Stop the server OpenWritr started, now, so the NPU and its memory go back

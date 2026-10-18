@@ -911,6 +911,30 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
+    // GenieX can crash between requests (seen on the CPU runtime): the next
+    // request then fails at once. Start it again and send this slice once
+    // more, instead of losing it and, after three, the rest of the job.
+    if managed
+        && result.as_ref().is_err_and(|error| !error.is_timeout())
+        && crate::local_llm::server_exited()
+    {
+        if let Some(endpoint) = prepared.target.endpoint() {
+            match crate::local_llm::ensure_running(endpoint, Some(&configured)) {
+                Ok(()) => {
+                    info!("sending the cleanup request again to the restarted local model");
+                    result = match send_cancellable(build(&body, &route), false) {
+                        Ok(result) => result,
+                        Err(why) => {
+                            info!(waited = ?sent.elapsed(), "cleanup request {why}");
+                            crate::local_llm::release("the cleanup request was abandoned");
+                            return Err(FallbackReason::RequestFailed);
+                        }
+                    };
+                }
+                Err(error) => warn!(error = %error, "the local model could not be started again"),
+            }
+        }
+    }
     // Copilot offers each account only some models, and which depends on the
     // app identity the request names. When the model is refused, ask what is
     // offered under each identity and try the closest few.
