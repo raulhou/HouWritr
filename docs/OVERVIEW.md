@@ -133,9 +133,10 @@ are cut to one copy.
   untouched.
 * **No clipboard, no keystrokes.** Results only ever go to files.
 * **Power.** With nothing to do, HouWritr holds no model: the speech engine
-  leaves the NPU after 3 idle minutes (never during a meeting) and loads again
-  in a few seconds for the next job, and the GenieX server stops after a
-  transcript. While working, the app and its GenieX server opt out of Windows
+  leaves the NPU as soon as no work is waiting (also between the parts of a
+  meeting) and loads again in about two seconds for the next job, and the
+  GenieX server is started for each job's cleanup and stopped when that job
+  ends. While working, the app and its GenieX server opt out of Windows
   power throttling, so background jobs keep their speed with no window in
   front.
 * **Text size.** The Settings and transcript windows follow Windows' display

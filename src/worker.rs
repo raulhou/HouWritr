@@ -8,10 +8,10 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,11 +266,6 @@ struct Job {
     config: JobConfig,
 }
 
-/// A loaded speech engine with nothing to do is unloaded after this long, so
-/// an idle HouWritr holds no NPU memory and costs no power. The next job
-/// loads it again (a few seconds). Never during a meeting.
-const ENGINE_IDLE_UNLOAD: Duration = Duration::from_secs(3 * 60);
-
 enum Command {
     Load {
         generation: u64,
@@ -338,10 +333,12 @@ pub struct Worker {
 
 impl Worker {
     pub fn spawn() -> Result<Self> {
-        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?))
+        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?), true)
     }
 
-    fn spawn_with_loader(loader: Box<dyn EngineLoader>) -> Result<Self> {
+    /// `unload_when_idle`: drop the speech engine whenever no work is
+    /// waiting (the app); tests that count loads keep it.
+    fn spawn_with_loader(loader: Box<dyn EngineLoader>, unload_when_idle: bool) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let latest_generation = Arc::new(AtomicU64::new(0));
@@ -361,6 +358,7 @@ impl Worker {
             .spawn(move || {
                 worker_main(
                     loader,
+                    unload_when_idle,
                     command_rx,
                     event_tx,
                     worker_generation,
@@ -662,6 +660,7 @@ impl JobEventTracker {
 
 fn worker_main(
     mut loader: Box<dyn EngineLoader>,
+    unload_when_idle: bool,
     command_rx: Receiver<Command>,
     event_tx: Sender<WorkerEvent>,
     latest_generation: Arc<AtomicU64>,
@@ -682,20 +681,22 @@ fn worker_main(
     // Whether the AI provider answered recently (see `CleanupGate`).
     let mut gate = CleanupGate::default();
     loop {
-        // Idle with an engine loaded and no meeting going: wait only so long.
-        let command = if engine.is_some() && sessions.is_empty() {
-            match command_rx.recv_timeout(ENGINE_IDLE_UNLOAD) {
+        // The speech engine is held only while there is work: once nothing
+        // is waiting it leaves the NPU (also between the parts of a meeting
+        // and right after the check at startup), and the next job loads it
+        // again, which takes about two seconds.
+        let command = if unload_when_idle && engine.is_some() {
+            match command_rx.try_recv() {
                 Ok(command) => command,
-                Err(RecvTimeoutError::Timeout) => {
+                Err(TryRecvError::Empty) => {
                     engine = None;
                     info!(
                         engine = engine_name.as_deref().unwrap_or_default(),
-                        idle = ?ENGINE_IDLE_UNLOAD,
-                        "speech engine unloaded while idle; the next job loads it again"
+                        "speech engine unloaded; the next job loads it again"
                     );
                     continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         } else {
             match command_rx.recv() {
@@ -1245,14 +1246,12 @@ fn recording_kind(config: &JobConfig) -> crate::log_files::RecordingKind {
     }
 }
 
-/// Whether the local text model is unloaded right after this job: imported
-/// files, finished meetings and background cleanup retries that used AI
-/// cleanup or notes. A meeting keeps it between its parts (it is released
-/// after a few idle minutes).
+/// Whether the local text model is stopped right after this job: every job
+/// that may have used it (AI cleanup, notes, a background retry), each
+/// meeting part included. It is started again only when the next job needs
+/// it, so it never sits idle in memory.
 fn releases_local_model(config: &JobConfig) -> bool {
-    config.long_form
-        && config.session.map_or(true, |part| part.last)
-        && (config.should_enhance() || config.notes)
+    config.rerun.is_some() || config.should_enhance() || config.notes
 }
 
 /// Longest window handed to the engine in one call for long-form audio.
@@ -1947,6 +1946,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        worker_with(failed, slow_engine, false)
+    }
+
+    fn worker_with(
+        failed: &[&str],
+        slow_engine: Option<&str>,
+        unload_when_idle: bool,
+    ) -> (
+        Worker,
+        Arc<Mutex<Vec<i32>>>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
         let max_active = Arc::new(AtomicUsize::new(0));
@@ -1959,7 +1971,7 @@ mod tests {
             max_active: max_active.clone(),
         };
         (
-            Worker::spawn_with_loader(Box::new(loader)).unwrap(),
+            Worker::spawn_with_loader(Box::new(loader), unload_when_idle).unwrap(),
             calls,
             max_active,
             loads,
@@ -2999,6 +3011,28 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_engine_is_unloaded_and_loaded_again_for_the_next_job() {
+        let (mut worker, calls, _, loads) = worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        let job = worker
+            .enqueue(
+                vec![3.0],
+                16_000,
+                job_config(Settings::default(), RecordingIntent::Raw),
+            )
+            .unwrap();
+        wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        assert_eq!(&*calls.lock(), &[3]);
+        assert_eq!(&*loads.lock(), &["ready", "ready"]);
+    }
+
+    #[test]
     fn wait_shutdown_skips_a_queued_engine_load() {
         let (mut worker, calls, _, loads) = worker(&[], None);
         worker.load("ready".into()).unwrap();
@@ -3238,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn local_text_model_is_released_after_transcripts_only() {
+    fn local_text_model_is_released_after_every_job_that_used_it() {
         let mut settings = Settings::default();
         settings.enhance.mode = crate::settings::EnhanceMode::Always;
 
@@ -3254,7 +3288,7 @@ mod tests {
             offset_samples: 0,
             last,
         };
-        assert!(!releases_local_model(&JobConfig::meeting_part(
+        assert!(releases_local_model(&JobConfig::meeting_part(
             settings.clone(),
             part(false),
             false
@@ -3264,11 +3298,6 @@ mod tests {
             part(true),
             false
         )));
-        assert!(!releases_local_model(&JobConfig::new(
-            settings.clone(),
-            RecordingIntent::Enhance
-        )));
-
         let mut off = settings.clone();
         off.enhance.mode = crate::settings::EnhanceMode::Never;
         assert!(!releases_local_model(&JobConfig::long_form(off.clone())));

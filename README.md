@@ -259,9 +259,10 @@ meetings.
       about 4.4 GB). Larger and more careful, about half as fast; needs
       16 GB of memory.
 
-    HouWritr starts `geniex serve` on a private port (18651) only when
-    needed and stops it as soon as a transcript is finished, after 5 idle
-    minutes, or when it stops answering or slows down sharply. If a model
+    HouWritr starts `geniex serve` on a private port (18651) only when a
+    job needs it and stops it as soon as that job is finished (each meeting
+    part, each background retry and each test in Settings included), or
+    when it stops answering or slows down sharply. If a model
     writes too slowly to be useful (a slice takes over two minutes), cleanup
     stops and the rest of the transcript stays as recognised, without
     background retries. **Remove model** deletes the selected model;

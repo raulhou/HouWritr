@@ -713,11 +713,15 @@ fn run_local_job(
             Ok("GenieX and its model were removed.".into())
         }
         JobKind::Test => {
-            let result = local_llm::test_chat(base_url, model).map_err(fail)?;
-            Ok(result.summary())
+            let result = local_llm::test_chat(base_url, model);
+            // A server HouWritr started for the test stops right away.
+            local_llm::release("the test is finished");
+            Ok(result.map_err(fail)?.summary())
         }
         JobKind::Discover => {
-            let models = local_llm::discover_models(base_url).map_err(fail)?;
+            let models = local_llm::discover_models(base_url);
+            local_llm::release("the models were listed");
+            let models = models.map_err(fail)?;
             let message = if models.is_empty() {
                 "The server answered but lists no models.".to_string()
             } else {
