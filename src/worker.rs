@@ -668,11 +668,6 @@ fn worker_main(
     let mut engine: Option<Box<dyn Engine>> = None;
     let mut engine_generation: Option<u64> = None;
     let mut engine_cancellation: Option<CancellationToken> = None;
-    // The NPU engine loaded for `engine_generation`, and whether it was
-    // unloaded to give the NPU to the built-in text model (see
-    // `park_npu_engine`).
-    let mut engine_name: Option<String> = None;
-    let mut engine_parked = false;
     // Rolling meeting transcriptions in progress. Jobs run one at a time on
     // this thread, so the map needs no locking.
     let mut sessions: HashMap<u64, SessionState> = HashMap::new();
@@ -682,7 +677,7 @@ fn worker_main(
         match command {
             Command::Load {
                 generation,
-                engine: engine_name_requested,
+                engine: engine_name,
                 cancellation,
             } => {
                 {
@@ -702,21 +697,18 @@ fn worker_main(
                 engine = None;
                 engine_generation = None;
                 engine_cancellation = None;
-                engine_name = None;
-                engine_parked = false;
                 let _ = event_tx.send(WorkerEvent::EngineLoading {
                     generation,
-                    engine: engine_name_requested.clone(),
+                    engine: engine_name.clone(),
                 });
                 let mut emit_model_state = |state| {
                     let _ = event_tx.send(WorkerEvent::ModelState {
                         generation,
-                        engine: engine_name_requested.clone(),
+                        engine: engine_name.clone(),
                         state,
                     });
                 };
-                let loaded =
-                    loader.load(&engine_name_requested, &cancellation, &mut emit_model_state);
+                let loaded = loader.load(&engine_name, &cancellation, &mut emit_model_state);
                 let _transition = transition_gate.lock();
                 if cancellation.is_cancelled()
                     || !should_process_load(
@@ -734,12 +726,11 @@ fn worker_main(
                     Ok(loaded_engine) => {
                         let label = loaded_engine.label().to_string();
                         engine = Some(loaded_engine);
-                        engine_name = Some(engine_name_requested.clone());
                         engine_generation = Some(generation);
                         engine_cancellation = Some(cancellation.clone());
                         let _ = event_tx.send(WorkerEvent::EngineReady {
                             generation,
-                            engine: engine_name_requested.clone(),
+                            engine: engine_name,
                             label,
                         });
                     }
@@ -748,7 +739,7 @@ fn worker_main(
                         engine_cancellation = None;
                         let _ = event_tx.send(WorkerEvent::EngineFailed {
                             generation,
-                            engine: engine_name_requested.clone(),
+                            engine: engine_name,
                             error: error.to_string(),
                         });
                     }
@@ -822,36 +813,8 @@ fn worker_main(
                     }
                 }
                 if let Some(rerun) = job.config.rerun.clone() {
-                    park_npu_engine(
-                        &mut engine,
-                        engine_name.as_deref(),
-                        &mut engine_parked,
-                        &job.config.settings,
-                    );
                     run_rerun(&job, rerun, &mut gate, &event_tx, &discard_requested);
                     continue;
-                }
-                if engine_parked {
-                    // The text model is done with the NPU for now: stop it
-                    // first so the speech engine has the room it needs.
-                    crate::local_llm::release("the speech engine needs the NPU again");
-                    let name = engine_name.clone().unwrap_or_default();
-                    let cancellation = engine_cancellation.clone().unwrap_or_default();
-                    match loader.load(&name, &cancellation, &mut |_| {}) {
-                        Ok(reloaded) => {
-                            info!(engine = %name, "speech engine loaded again");
-                            engine = Some(reloaded);
-                            engine_parked = false;
-                        }
-                        Err(error) => {
-                            warn!(error = %error, engine = %name, "speech engine could not be loaded again");
-                            let _ = event_tx.send(WorkerEvent::JobFailed {
-                                id: job.id,
-                                error: format!("could not load the speech engine again: {error}"),
-                            });
-                            continue;
-                        }
-                    }
                 }
                 let active_engine = engine
                     .as_mut()
@@ -984,14 +947,6 @@ fn worker_main(
                     }
                 }
 
-                if (job.config.should_enhance() || job.config.notes) && !transcription_failed {
-                    park_npu_engine(
-                        &mut engine,
-                        engine_name.as_deref(),
-                        &mut engine_parked,
-                        &job.config.settings,
-                    );
-                }
                 let interrupted_now = || {
                     interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
                         .is_some()
@@ -1219,30 +1174,6 @@ impl Drop for ReleaseLocalModel {
         if self.0 {
             crate::local_llm::release("the transcript is finished");
         }
-    }
-}
-
-/// Unload an NPU speech engine before the built-in text model (GenieX on the
-/// NPU) runs. Both together do not fit: GenieX could not map its model
-/// ("Failed to map buffer", "Context create from binary failed") and wrote
-/// under one token a second. The engine is loaded again before the next job
-/// that needs it.
-fn park_npu_engine(
-    engine: &mut Option<Box<dyn Engine>>,
-    engine_name: Option<&str>,
-    parked: &mut bool,
-    settings: &Settings,
-) {
-    let on_npu = engine_name.is_some_and(|name| name.ends_with("_npu"));
-    if !on_npu || !enhance::uses_managed_model(settings) {
-        return;
-    }
-    if engine.take().is_some() {
-        *parked = true;
-        info!(
-            engine = engine_name.unwrap_or_default(),
-            "speech engine unloaded so the local text model can use the NPU"
-        );
     }
 }
 

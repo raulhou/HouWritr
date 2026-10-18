@@ -796,6 +796,7 @@ pub fn note_writing_speed(tokens_per_second: f64) {
     if tokens_per_second >= SLOW_WRITING_TOKENS_PER_SECOND {
         server.was_fast = true;
         server.slow_answers = 0;
+        forget_timeout();
         return;
     }
     server.slow_answers += 1;
@@ -821,9 +822,27 @@ const SLOW_ANSWERS_TO_GIVE_UP: u32 = 2;
 /// Whether the built-in model has kept writing slowly (a long cleanup then
 /// stops instead of grinding on).
 pub fn keeps_writing_slowly() -> bool {
-    SERVER
-        .try_lock_for(Duration::from_secs(2))
-        .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
+    TIMED_OUT.load(Ordering::Relaxed)
+        || SERVER
+            .try_lock_for(Duration::from_secs(2))
+            .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
+}
+
+/// Set when the built-in model let a cleanup request time out. Kept apart
+/// from the server state, which stopping the server (as a timeout does)
+/// clears: a slice of a few hundred characters that takes over two minutes
+/// means the model writes at about one token a second, so the rest of the
+/// transcript would take hours.
+static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// The built-in model did not answer a request in time.
+pub fn note_timeout() {
+    TIMED_OUT.store(true, Ordering::Relaxed);
+}
+
+/// A new cleanup starts: give the model another chance.
+pub fn forget_timeout() {
+    TIMED_OUT.store(false, Ordering::Relaxed);
 }
 
 /// Stop the server (called when OpenWritr exits or the model is removed).

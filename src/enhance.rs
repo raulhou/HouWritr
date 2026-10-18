@@ -957,6 +957,7 @@ fn request_content(
                 // The server keeps writing the reply nobody waits for, and
                 // every later request would queue behind it.
                 crate::local_llm::release("the local model did not answer in time");
+                crate::local_llm::note_timeout();
             }
             return Err(FallbackReason::RequestFailed);
         }
@@ -1126,6 +1127,9 @@ pub fn enhance_long_form(
         "long-form cleanup started"
     );
     let managed = uses_managed_model(settings);
+    if managed {
+        crate::local_llm::forget_timeout();
+    }
     // Whisper sometimes drifts into Traditional characters in a Simplified
     // recording (or the other way round); each slice is told the script of
     // the whole transcript.
@@ -1522,12 +1526,13 @@ fn clean_slices(
         }
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
-        if !tripped && index + 1 < total && give_up() {
+        if !tripped && give_up() {
             // Not retried in the background either: a model this slow was
             // just as slow on every retry, and each one held the NPU for
-            // minutes.
+            // minutes. That includes slices that already timed out.
             tripped = true;
             rejected = true;
+            report.unreachable = 0;
             warn!("cleanup is too slow on this PC; the remaining slices keep their text and are not retried");
         }
     }
@@ -2279,6 +2284,31 @@ mod long_form_tests {
         assert_eq!(chinese_script("Hello there, nothing Chinese here."), None);
         let mostly = format!("{}{}", simplified.repeat(5), "這個");
         assert_eq!(chinese_script(&mostly), Some(ChineseScript::Simplified));
+    }
+
+    #[test]
+    fn a_local_model_that_timed_out_stops_without_retries() {
+        // The built-in model let the first slice time out: the slice keeps
+        // its text and nothing is retried later, that one included.
+        let timed_out = std::cell::Cell::new(false);
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(6),
+            &[],
+            |_| {
+                calls += 1;
+                timed_out.set(true);
+                failed(FallbackReason::RequestFailed)
+            },
+            &|| timed_out.get(),
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.report.cleaned, 0);
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
     }
 
     #[test]

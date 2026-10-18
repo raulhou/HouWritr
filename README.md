@@ -248,9 +248,10 @@ meetings.
     your user only), then **Download model** (several GB, resumable), then
     **Test model**. HouWritr starts `geniex serve` on a private port (18651)
     only when needed and stops it as soon as a transcript is finished, after
-    5 idle minutes, or when it stops answering or slows down sharply. While it
-    runs, an NPU speech engine is unloaded to give it the NPU, and loaded
-    again for the next transcription. **Remove model** deletes the model;
+    5 idle minutes, or when it stops answering or slows down sharply. If it
+    writes too slowly to be useful (a slice takes over two minutes), cleanup
+    stops and the rest of the transcript stays as recognised, without
+    background retries. **Remove model** deletes the model;
     **Uninstall GenieX…** removes the model and runs GenieX's own uninstaller.
   * *Another local server*: any OpenAI compatible server on `localhost`
     (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
