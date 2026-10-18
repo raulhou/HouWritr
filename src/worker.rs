@@ -8,10 +8,10 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +265,11 @@ struct Job {
     sample_rate: u32,
     config: JobConfig,
 }
+
+/// A loaded speech engine with nothing to do is unloaded after this long, so
+/// an idle HouWritr holds no NPU memory and costs no power. The next job
+/// loads it again (a few seconds). Never during a meeting.
+const ENGINE_IDLE_UNLOAD: Duration = Duration::from_secs(3 * 60);
 
 enum Command {
     Load {
@@ -668,16 +673,40 @@ fn worker_main(
     let mut engine: Option<Box<dyn Engine>> = None;
     let mut engine_generation: Option<u64> = None;
     let mut engine_cancellation: Option<CancellationToken> = None;
+    // The engine `engine_generation` names; `engine` is None while it is
+    // unloaded for idleness and loaded again by the next job.
+    let mut engine_name: Option<String> = None;
     // Rolling meeting transcriptions in progress. Jobs run one at a time on
     // this thread, so the map needs no locking.
     let mut sessions: HashMap<u64, SessionState> = HashMap::new();
     // Whether the AI provider answered recently (see `CleanupGate`).
     let mut gate = CleanupGate::default();
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        // Idle with an engine loaded and no meeting going: wait only so long.
+        let command = if engine.is_some() && sessions.is_empty() {
+            match command_rx.recv_timeout(ENGINE_IDLE_UNLOAD) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => {
+                    engine = None;
+                    info!(
+                        engine = engine_name.as_deref().unwrap_or_default(),
+                        idle = ?ENGINE_IDLE_UNLOAD,
+                        "speech engine unloaded while idle; the next job loads it again"
+                    );
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        };
         match command {
             Command::Load {
                 generation,
-                engine: engine_name,
+                engine: requested,
                 cancellation,
             } => {
                 {
@@ -697,18 +726,19 @@ fn worker_main(
                 engine = None;
                 engine_generation = None;
                 engine_cancellation = None;
+                engine_name = None;
                 let _ = event_tx.send(WorkerEvent::EngineLoading {
                     generation,
-                    engine: engine_name.clone(),
+                    engine: requested.clone(),
                 });
                 let mut emit_model_state = |state| {
                     let _ = event_tx.send(WorkerEvent::ModelState {
                         generation,
-                        engine: engine_name.clone(),
+                        engine: requested.clone(),
                         state,
                     });
                 };
-                let loaded = loader.load(&engine_name, &cancellation, &mut emit_model_state);
+                let loaded = loader.load(&requested, &cancellation, &mut emit_model_state);
                 let _transition = transition_gate.lock();
                 if cancellation.is_cancelled()
                     || !should_process_load(
@@ -727,10 +757,11 @@ fn worker_main(
                         let label = loaded_engine.label().to_string();
                         engine = Some(loaded_engine);
                         engine_generation = Some(generation);
+                        engine_name = Some(requested.clone());
                         engine_cancellation = Some(cancellation.clone());
                         let _ = event_tx.send(WorkerEvent::EngineReady {
                             generation,
-                            engine: engine_name,
+                            engine: requested,
                             label,
                         });
                     }
@@ -739,7 +770,7 @@ fn worker_main(
                         engine_cancellation = None;
                         let _ = event_tx.send(WorkerEvent::EngineFailed {
                             generation,
-                            engine: engine_name,
+                            engine: requested,
                             error: error.to_string(),
                         });
                     }
@@ -815,6 +846,26 @@ fn worker_main(
                 if let Some(rerun) = job.config.rerun.clone() {
                     run_rerun(&job, rerun, &mut gate, &event_tx, &discard_requested);
                     continue;
+                }
+                if engine.is_none() {
+                    // Unloaded while idle: load it again for this job.
+                    let name = engine_name.clone().unwrap_or_default();
+                    let cancellation = engine_cancellation.clone().unwrap_or_default();
+                    let loading = Instant::now();
+                    match loader.load(&name, &cancellation, &mut |_| {}) {
+                        Ok(loaded) => {
+                            info!(engine = %name, took = ?loading.elapsed(), "speech engine loaded again");
+                            engine = Some(loaded);
+                        }
+                        Err(error) => {
+                            warn!(error = %error, engine = %name, "speech engine could not be loaded again");
+                            let _ = event_tx.send(WorkerEvent::JobFailed {
+                                id: job.id,
+                                error: format!("could not load the speech engine: {error}"),
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let active_engine = engine
                     .as_mut()

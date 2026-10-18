@@ -508,18 +508,25 @@ impl SettingsApp {
         let mut cancel = false;
         if let Some(job) = &self.local_model.job {
             ui.add_space(4.0);
+            // One bar that says it all (percentage, size, speed, time left);
+            // a spinner and the text while the amount is unknown.
             match job.fraction {
                 Some(fraction) => {
-                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                    let text = if job.text.is_empty() {
+                        format!("{:.0}%", fraction * 100.0)
+                    } else {
+                        job.text.clone()
+                    };
+                    ui.add(egui::ProgressBar::new(fraction).text(text));
                 }
                 None => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.spinner();
+                        if !job.text.is_empty() {
+                            status_label(ui, &job.text, secondary_text());
+                        }
                     });
                 }
-            }
-            if !job.text.is_empty() {
-                status_label(ui, &job.text, secondary_text());
             }
             if matches!(job.kind, JobKind::Install | JobKind::Pull)
                 && ui.small_button("Cancel").clicked()

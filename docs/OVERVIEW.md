@@ -132,8 +132,14 @@ are cut to one copy.
   sections are retried in the background and written back only if the file is
   untouched.
 * **No clipboard, no keystrokes.** Results only ever go to files.
-* **Power.** The app and its GenieX server opt out of Windows power throttling,
-  so background jobs keep their speed with no window in front.
+* **Power.** With nothing to do, HouWritr holds no model: the speech engine
+  leaves the NPU after 3 idle minutes (never during a meeting) and loads again
+  in a few seconds for the next job, and the GenieX server stops after a
+  transcript. While working, the app and its GenieX server opt out of Windows
+  power throttling, so background jobs keep their speed with no window in
+  front.
+* **Text size.** The Settings and transcript windows follow Windows' display
+  scale and its Accessibility → Text size setting.
 * **Observable.** One log per app session and one per transcript, with the
   build commit on the first line and a crash log.
 

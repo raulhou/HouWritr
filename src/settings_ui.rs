@@ -57,8 +57,8 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
     let copilot_rx = start_copilot_probe();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 760.0])
-            .with_min_inner_size([600.0, 640.0])
+            .with_inner_size(scaled_size([640.0, 760.0]))
+            .with_min_inner_size(scaled_size([600.0, 640.0]))
             .with_resizable(true)
             .with_title("HouWritr Settings"),
         ..Default::default()
@@ -138,7 +138,49 @@ fn install_cjk_fallback_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Windows' own "Text size" setting (Settings → Accessibility → Text size)
+/// as a factor, 1.0 to 2.25. The display scale (Settings → Display → Scale)
+/// is applied by the window library already; this one is not.
+pub(crate) fn system_text_scale() -> f32 {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+    let mut value = 0_u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Accessibility"),
+            w!("TextScaleFactor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    text_scale_from(read.is_ok().then_some(value))
+}
+
+/// The percentage Windows stores (100 to 225), as a factor; 1.0 when unset
+/// or out of range.
+fn text_scale_from(percent: Option<u32>) -> f32 {
+    match percent {
+        Some(percent @ 100..=225) => percent as f32 / 100.0,
+        _ => 1.0,
+    }
+}
+
+/// A window size in points, grown with the Windows text size so the larger
+/// text still fits.
+pub(crate) fn scaled_size(size: [f32; 2]) -> [f32; 2] {
+    let scale = system_text_scale();
+    [size[0] * scale, size[1] * scale]
+}
+
 pub(crate) fn apply_dark_theme(ctx: &egui::Context) {
+    // Follow Windows' text size: everything grows with it, as in Windows'
+    // own windows.
+    ctx.set_zoom_factor(system_text_scale());
     use egui::{Color32, FontFamily, FontId, Stroke, Style, Visuals};
     install_cjk_fallback_font(ctx);
     let mut style = Style::default();
@@ -2284,6 +2326,16 @@ fn insecure_remote_http(base_url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_text_size_becomes_a_zoom_factor() {
+        assert_eq!(text_scale_from(None), 1.0);
+        assert_eq!(text_scale_from(Some(100)), 1.0);
+        assert_eq!(text_scale_from(Some(150)), 1.5);
+        assert_eq!(text_scale_from(Some(225)), 2.25);
+        assert_eq!(text_scale_from(Some(40)), 1.0);
+        assert_eq!(text_scale_from(Some(900)), 1.0);
+    }
+
     #[test]
     fn cjk_font_candidates_live_in_the_windows_fonts_folder_best_first() {
         let found = cjk_font_candidates(std::path::Path::new("win"));

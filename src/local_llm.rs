@@ -51,6 +51,9 @@ pub struct BuiltInModel {
     pub detail: &'static str,
     /// Run on the CPU (llama.cpp in GenieX) instead of the NPU.
     pub cpu: bool,
+    /// Download size in bytes, when known: GenieX's own total can be far too
+    /// small (it sizes its bar from the first file it sees).
+    pub download_bytes: Option<u64>,
 }
 
 /// The models offered in Settings. The CPU ones are GGUF files from Hugging
@@ -62,18 +65,21 @@ pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
         label: "Qwen3 4B on the NPU",
         detail: "About 2.5 GB from Qualcomm AI Hub. Light on the CPU; on some PCs it writes very slowly.",
         cpu: false,
+        download_bytes: None,
     },
     BuiltInModel {
         id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0",
         label: "Qwen3 4B on the CPU",
         detail: "About 2.4 GB from Hugging Face. The same model on the processor; keeps the CPU busy while it cleans up.",
         cpu: true,
+        download_bytes: Some(2_375_773_280),
     },
     BuiltInModel {
         id: "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0",
         label: "Qwen2.5 7B on the CPU",
         detail: "About 4.4 GB from Hugging Face. Larger and more careful, about half as fast; needs 16 GB of memory.",
         cpu: true,
+        download_bytes: Some(4_444_121_792),
     },
 ];
 
@@ -364,15 +370,79 @@ fn lists_model(listing: &str, model: &str) -> bool {
     }
 }
 
-/// Download `model` with `geniex pull`. `progress` gets a percentage when the
-/// tool prints one, plus the latest status line. Cancelling keeps what was
-/// downloaded so far (GenieX resumes).
+/// Download attempts before a download is reported as failed.
+const PULL_ATTEMPTS: usize = 5;
+/// Seconds to wait before attempt 2, 3, … (a dropped connection often needs
+/// a moment).
+const PULL_RETRY_WAITS: [u64; PULL_ATTEMPTS - 1] = [5, 15, 30, 60];
+
+/// Download `model` with `geniex pull`. `progress` gets the fraction done
+/// (when it is known) and one line saying how far the download is. A
+/// download that stops is resumed by itself (GenieX keeps what it has) up to
+/// [`PULL_ATTEMPTS`] times; cancelling keeps what was downloaded so far.
 pub fn pull_model(
     cli: &Path,
     model: &str,
     progress: &mut dyn FnMut(Option<f32>, &str),
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        let error = match pull_once(cli, model, progress, cancel) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if attempt >= PULL_ATTEMPTS || !worth_retrying(&error) {
+            return Err(error);
+        }
+        let wait = PULL_RETRY_WAITS[attempt - 1];
+        attempt += 1;
+        warn!(error = %format!("{error:#}"), attempt, "model download stopped; resuming");
+        for left in (1..=wait).rev() {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
+            progress(
+                None,
+                &format!(
+                    "The download stopped; resuming in {left} s (attempt {attempt} of {PULL_ATTEMPTS})…"
+                ),
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Whether trying a failed download again could help: not when it was
+/// cancelled, or failed for a reason a retry does not change.
+fn worth_retrying(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    const FINAL: &[&str] = &[
+        "cancelled",
+        "start geniex pull",
+        "no precision",
+        "not found",
+        "404",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "gated",
+        "no space",
+        "not enough space",
+        "disk full",
+        "unknown model type",
+    ];
+    !FINAL.iter().any(|word| text.contains(word))
+}
+
+fn pull_once(
+    cli: &Path,
+    model: &str,
+    progress: &mut dyn FnMut(Option<f32>, &str),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let expected = built_in(model).and_then(|known| known.download_bytes);
     let mut child = hidden(
         Command::new(cli)
             .args(pull_arguments(model))
@@ -415,8 +485,14 @@ pub fn pull_model(
                 let clean = strip_ansi(&line);
                 let clean = clean.trim();
                 if !clean.is_empty() {
-                    progress(parse_percent(clean), clean);
-                    if parse_percent(clean).is_none() {
+                    match parse_pull_progress(clean) {
+                        Some(bar) => {
+                            let (fraction, text) = describe_pull(&bar, expected);
+                            progress(fraction, &text);
+                        }
+                        None => progress(None, clean),
+                    }
+                    if parse_pull_progress(clean).is_none() {
                         info!("geniex pull: {clean}");
                         recent.push_back(clean.to_string());
                         if recent.len() > 4 {
@@ -541,17 +617,113 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// The last `NN%` / `NN.N%` figure in a progress line.
-fn parse_percent(line: &str) -> Option<f32> {
-    let end = line.rfind('%')?;
-    let head = &line[..end];
-    let start = head
-        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map_or(0, |index| index + 1);
-    head[start..]
-        .parse::<f32>()
-        .ok()
-        .filter(|value| (0.0..=100.0).contains(value))
+/// One redraw of GenieX's download bar, e.g.
+/// `downloading  45% |████      | (1.1/2.4 GB, 25 MB/s) [40s:52s]`.
+/// Only the bytes downloaded and the speed are trusted: GenieX sizes the bar
+/// (its percentage, total and time left) from the first file it sees, so it
+/// can read 100% early on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PullProgress {
+    downloaded: f64,
+    /// Bytes a second.
+    rate: Option<f64>,
+    /// GenieX's total, which may be too small.
+    total: Option<f64>,
+}
+
+fn parse_pull_progress(line: &str) -> Option<PullProgress> {
+    let line = line.trim();
+    if !line.starts_with("downloading") {
+        return None;
+    }
+    let open = line.find('(')?;
+    let close = open + line[open..].find(')')?;
+    let mut parts = line[open + 1..close].split(", ");
+    let amount = parts.next()?;
+    let (current, total) = match amount.split_once('/') {
+        Some((current, total)) => (current.trim(), Some(total.trim())),
+        None => (amount.trim(), None),
+    };
+    let total_unit = total.and_then(|total| total.rsplit_once(' ').map(|(_, unit)| unit));
+    let downloaded =
+        parse_bytes(current).or_else(|| parse_bytes(&format!("{current} {}", total_unit?)))?;
+    let rate = parts.find_map(|part| part.trim().strip_suffix("/s").and_then(parse_bytes));
+    Some(PullProgress {
+        downloaded,
+        rate,
+        total: total.and_then(parse_bytes),
+    })
+}
+
+/// `2.4 GB`, `512 MB`, `1.5 GiB`, ` 7 B` as bytes.
+fn parse_bytes(text: &str) -> Option<f64> {
+    let (number, unit) = text.trim().rsplit_once(' ')?;
+    let value: f64 = number.trim().parse().ok()?;
+    let scale = match unit {
+        "B" => 1.0,
+        "kB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(value * scale)
+}
+
+/// The fraction done and one line for Settings, e.g.
+/// `45% · 1.1 of 2.4 GB · 25.0 MB/s · about 1 min left`.
+fn describe_pull(bar: &PullProgress, expected: Option<u64>) -> (Option<f32>, String) {
+    let total = expected
+        .map(|bytes| bytes as f64)
+        .or(bar.total.filter(|total| *total > bar.downloaded));
+    // Never "done" before GenieX says so: the size can be a little off.
+    let fraction = total.map(|total| (bar.downloaded / total).clamp(0.0, 0.99) as f32);
+    let mut parts = Vec::new();
+    if let Some(fraction) = fraction {
+        parts.push(format!("{:.0}%", fraction * 100.0));
+    }
+    parts.push(match total {
+        Some(total) => format!("{} of {}", human_bytes(bar.downloaded), human_bytes(total)),
+        None => format!("{} downloaded", human_bytes(bar.downloaded)),
+    });
+    if let Some(rate) = bar.rate.filter(|rate| *rate > 0.0) {
+        parts.push(format!("{}/s", human_bytes(rate)));
+        if let Some(total) = total {
+            let seconds = ((total - bar.downloaded).max(0.0) / rate).round() as u64;
+            parts.push(time_left(seconds));
+        }
+    }
+    (fraction, parts.join(" · "))
+}
+
+fn human_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 4] = ["kB", "MB", "GB", "TB"];
+    let mut value = bytes / 1e3;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if bytes < 1e3 {
+        return format!("{bytes:.0} B");
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn time_left(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("about {seconds} s left"),
+        60..=3599 => format!("about {} min left", (seconds + 30) / 60),
+        _ => format!(
+            "about {} h {} min left",
+            seconds / 3600,
+            seconds % 3600 / 60
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,16 +1457,44 @@ mod tests {
     }
 
     #[test]
-    fn percent_is_read_from_progress_lines() {
-        assert_eq!(
-            parse_percent("Downloading  42%  1.2 GiB/2.9 GiB"),
-            Some(42.0)
-        );
-        assert_eq!(parse_percent("[=====>   ] 63.5% 12 MB/s"), Some(63.5));
-        assert_eq!(parse_percent("100%"), Some(100.0));
-        assert_eq!(parse_percent("step 1 of 3"), None);
-        assert_eq!(parse_percent("up 250%"), None);
-        assert_eq!(parse_percent("%"), None);
+    fn download_bars_are_read_without_trusting_their_total() {
+        // GenieX's bar at 100% while the download is still going.
+        let line = "downloading 100% |██████████| (1.2 GB/310 MB, 25 MB/s) [48s:0s]";
+        let bar = parse_pull_progress(line).unwrap();
+        assert_eq!(bar.downloaded, 1.2e9);
+        assert_eq!(bar.rate, Some(25e6));
+        let (fraction, text) = describe_pull(&bar, Some(2_400_000_000));
+        assert_eq!(fraction, Some(0.5));
+        assert_eq!(text, "50% · 1.2 GB of 2.4 GB · 25.0 MB/s · about 48 s left");
+        // Same unit for both: written once.
+        let bar =
+            parse_pull_progress("downloading  45% |████   | (1.1/2.4 GB, 9.5 MB/s) [1m0s:2m0s]")
+                .unwrap();
+        assert_eq!(bar.downloaded, 1.1e9);
+        assert_eq!(bar.total, Some(2.4e9));
+        // Unknown size: GenieX's total only when it is larger than what came.
+        let (fraction, text) = describe_pull(&bar, None);
+        assert!((fraction.unwrap() - 0.458).abs() < 0.01);
+        assert_eq!(text, "46% · 1.1 GB of 2.4 GB · 9.5 MB/s · about 2 min left");
+        // Never 100% before GenieX finishes.
+        let (fraction, _) = describe_pull(&bar, Some(1_000_000_000));
+        assert_eq!(fraction, Some(0.99));
+        assert_eq!(parse_pull_progress("Detected model type: llm"), None);
+        assert_eq!(parse_pull_progress("fetching available precisions"), None);
+    }
+
+    #[test]
+    fn only_downloads_that_can_recover_are_retried() {
+        assert!(worth_retrying(&anyhow!(
+            "geniex pull failed (exit code: 1): connection reset"
+        )));
+        assert!(!worth_retrying(&anyhow!("cancelled")));
+        assert!(!worth_retrying(&anyhow!(
+            "geniex pull failed: 404 Not Found"
+        )));
+        assert!(!worth_retrying(&anyhow!(
+            "geniex pull failed: no space left on device"
+        )));
     }
 
     #[test]

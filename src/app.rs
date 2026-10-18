@@ -135,6 +135,35 @@ struct Repair {
     failed_rounds: u32,
     next_attempt: Instant,
     in_flight: Option<u64>,
+    /// The popup of the job that saved the transcript, while it is open.
+    window: Option<mpsc::Sender<WindowMsg>>,
+}
+
+impl Repair {
+    /// What is being retried, for the popup.
+    fn what(&self) -> &'static str {
+        if self.plan.pieces.iter().any(|piece| piece.raw.is_some()) {
+            "AI cleanup"
+        } else {
+            "AI notes"
+        }
+    }
+
+    /// Tell the popup where the retry stands; a closed popup is ignored.
+    fn tell(&self, text: String, active: bool, settled: bool) {
+        if let Some(window) = &self.window {
+            let _ = window.send(WindowMsg::Retry {
+                text,
+                active,
+                settled,
+            });
+        }
+    }
+}
+
+/// `120` seconds as `2 min`, for the popup.
+fn minutes(seconds: u64) -> String {
+    format!("{} min", seconds.div_ceil(60).max(1))
 }
 
 /// First retry after two minutes, then slower; after five fruitless rounds
@@ -1623,7 +1652,19 @@ impl AppHandler {
             failed_rounds: 0,
             next_attempt: Instant::now() + Duration::from_secs(REPAIR_BACKOFF_SECONDS[0]),
             in_flight: None,
+            window: job.window.clone(),
         });
+        if let Some(repair) = self.state.repairs.last() {
+            repair.tell(
+                format!(
+                    "Saved, but {} is unfinished; trying again in the background in about {}.",
+                    repair.what(),
+                    minutes(REPAIR_BACKOFF_SECONDS[0])
+                ),
+                false,
+                false,
+            );
+        }
     }
 
     /// Start the next retry of every delivered transcript that is due.
@@ -1656,7 +1697,17 @@ impl AppHandler {
                 .enqueue(Vec::new(), media::TARGET_RATE, config)
             {
                 Ok(job_id) => {
-                    self.state.repairs[index].in_flight = Some(job_id);
+                    let repair = &mut self.state.repairs[index];
+                    repair.in_flight = Some(job_id);
+                    let attempt = repair.failed_rounds + 1;
+                    repair.tell(
+                        format!(
+                            "Retrying {} in the background (try {attempt})…",
+                            repair.what()
+                        ),
+                        true,
+                        false,
+                    );
                     self.state.repair_jobs.insert(job_id, (repair_id, step));
                 }
                 Err(error) => {
@@ -1737,6 +1788,11 @@ impl AppHandler {
             if let Err(reason) = self.rewrite_repaired_transcript(index) {
                 // Most likely the file was edited or moved: leave it alone.
                 let repair = self.state.repairs.remove(index);
+                repair.tell(
+                    format!("Left the file as it is ({reason}); retries stopped."),
+                    false,
+                    true,
+                );
                 warn!(file = %repair.output.display(), reason, "stopping cleanup retries");
                 self.show_job_warning(&format!(
                     "Left {} as it is ({reason}); automatic cleanup stopped",
@@ -1749,10 +1805,23 @@ impl AppHandler {
         let repair = &mut self.state.repairs[index];
         if repair.plan.is_complete() {
             let repair = self.state.repairs.remove(index);
+            repair.tell(
+                format!(
+                    "{} finished in the background; the file was updated.",
+                    repair.what()
+                ),
+                false,
+                true,
+            );
             info!(file = %repair.output.display(), "transcript cleanup finished in the background");
             self.show_job_success(&format!("Finished cleaning up {}", repair.name));
         } else if progressed {
             repair.next_attempt = Instant::now() + REPAIR_STEP_PAUSE;
+            repair.tell(
+                format!("Part of {} done; continuing in a moment…", repair.what()),
+                false,
+                false,
+            );
         } else {
             self.schedule_repair_retry(index);
         }
@@ -1774,6 +1843,11 @@ impl AppHandler {
             return;
         };
         let repair = self.state.repairs.remove(index);
+        repair.tell(
+            format!("Stopped retrying: the provider rejected the request (HTTP {status})."),
+            false,
+            true,
+        );
         warn!(
             file = %repair.output.display(),
             status,
@@ -1806,9 +1880,28 @@ impl AppHandler {
         let repair = &mut self.state.repairs[index];
         repair.failed_rounds += 1;
         match repair_delay(repair.failed_rounds) {
-            Some(delay) => repair.next_attempt = Instant::now() + delay,
+            Some(delay) => {
+                repair.next_attempt = Instant::now() + delay;
+                repair.tell(
+                    format!(
+                        "{} did not finish this time; trying again in about {}.",
+                        repair.what(),
+                        minutes(delay.as_secs())
+                    ),
+                    false,
+                    false,
+                );
+            }
             None => {
                 let repair = self.state.repairs.remove(index);
+                repair.tell(
+                    format!(
+                        "Could not finish {}; the file keeps the recognised text.",
+                        repair.what()
+                    ),
+                    false,
+                    true,
+                );
                 warn!(file = %repair.output.display(), "giving up on background cleanup");
                 self.show_job_warning(&format!(
                     "Could not finish cleaning up {}; it stays as recognised",
@@ -1842,9 +1935,26 @@ impl AppHandler {
         match event {
             // Background retries of AI cleanup / notes never touch the
             // overlay, the job counters or the tray.
-            WorkerEvent::JobStarted { id }
-            | WorkerEvent::EnhancementStarted { id }
-            | WorkerEvent::JobProgress { id, .. }
+            WorkerEvent::JobProgress {
+                id, done, total, ..
+            } if self.state.repair_jobs.contains_key(&id) => {
+                // Only the popup of the retried transcript hears of it.
+                let repair_id = self.state.repair_jobs[&id].0;
+                if let Some(window) = self
+                    .state
+                    .repairs
+                    .iter()
+                    .find(|repair| repair.id == repair_id)
+                    .and_then(|repair| repair.window.as_ref())
+                {
+                    let _ = window.send(WindowMsg::Stage {
+                        stage: transcript_window::Stage::CleaningUp,
+                        done,
+                        total,
+                    });
+                }
+            }
+            WorkerEvent::JobStarted { id } | WorkerEvent::EnhancementStarted { id }
                 if self.state.repair_jobs.contains_key(&id) => {}
             WorkerEvent::JobCompleted {
                 id,

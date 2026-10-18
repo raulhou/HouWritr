@@ -79,6 +79,22 @@ pub enum WindowMsg {
     Failed {
         error: String,
     },
+    /// AI cleanup of the saved transcript is being retried in the
+    /// background: `text` says where it stands. `active` while a retry runs;
+    /// `settled` once nothing is left to retry (finished or given up).
+    Retry {
+        text: String,
+        active: bool,
+        settled: bool,
+    },
+}
+
+/// Where a background retry of AI cleanup stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryStatus {
+    pub text: String,
+    pub active: bool,
+    pub settled: bool,
 }
 
 /// Everything the window shows, as plain data so it is testable without egui.
@@ -97,6 +113,8 @@ pub struct WindowState {
     pub total: usize,
     pub finished: Option<Finished>,
     pub error: Option<String>,
+    /// A background retry of AI cleanup, after the transcript was saved.
+    pub retry: Option<RetryStatus>,
     /// The tray process went away (stdin closed) before the job finished.
     pub parent_gone: bool,
     started: Instant,
@@ -128,6 +146,7 @@ impl WindowState {
             total: 0,
             finished: None,
             error: None,
+            retry: None,
             parent_gone: false,
             started: now,
             stage_started: now,
@@ -184,7 +203,29 @@ impl WindowState {
             WindowMsg::Failed { error } => {
                 self.error = Some(error);
             }
+            WindowMsg::Retry {
+                text,
+                active,
+                settled,
+            } => {
+                if active && !self.retry.as_ref().is_some_and(|retry| retry.active) {
+                    // A new round: its progress starts from nothing.
+                    self.done = 0;
+                    self.total = 0;
+                    self.stage_started = now;
+                }
+                self.retry = Some(RetryStatus {
+                    text,
+                    active,
+                    settled,
+                });
+            }
         }
+    }
+
+    /// The transcript is saved but AI cleanup is still being retried.
+    pub fn retry_pending(&self) -> bool {
+        self.retry.as_ref().is_some_and(|retry| !retry.settled)
     }
 
     pub fn is_running(&self) -> bool {
@@ -311,8 +352,8 @@ enum Incoming {
 pub fn run_window() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 360.0])
-            .with_min_inner_size([380.0, 280.0])
+            .with_inner_size(settings_ui::scaled_size([460.0, 360.0]))
+            .with_min_inner_size(settings_ui::scaled_size([380.0, 280.0]))
             .with_resizable(true)
             .with_title("HouWritr — Transcribe file"),
         ..Default::default()
@@ -402,7 +443,7 @@ impl eframe::App for TranscriptWindow {
             self.title_applied = true;
         }
         let now = Instant::now();
-        if self.state.is_running() && !self.state.parent_gone {
+        if (self.state.is_running() || self.state.retry_pending()) && !self.state.parent_gone {
             // Keep the elapsed clock ticking while idle between messages.
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -414,7 +455,37 @@ impl eframe::App for TranscriptWindow {
             if let Some(error) = &self.state.error {
                 settings_ui::inline_error(ui, format!("Transcription failed: {error}"));
             } else if self.state.finished.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                match self.state.retry.clone() {
+                    Some(retry) if !retry.settled && self.state.parent_gone => {
+                        settings_ui::inline_error(
+                            ui,
+                            "Saved. HouWritr was closed before AI cleanup could be retried.",
+                        );
+                    }
+                    Some(retry) if retry.active => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spinner();
+                            ui.label(&retry.text);
+                        });
+                        if let Some(fraction) = self.state.fraction() {
+                            let mut text = format!("{}/{}", self.state.done, self.state.total);
+                            if let Some(eta) = self.state.eta_secs(now) {
+                                text.push_str(&format!(" · about {} left", format_clock(eta)));
+                            }
+                            ui.add(egui::ProgressBar::new(fraction).text(text));
+                        }
+                    }
+                    Some(retry) if !retry.settled => {
+                        ui.colored_label(egui::Color32::from_rgb(235, 190, 90), &retry.text);
+                    }
+                    Some(retry) => {
+                        ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                        ui.weak(&retry.text);
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                    }
+                }
             } else if self.state.parent_gone {
                 settings_ui::inline_error(ui, "HouWritr was closed before this finished.");
             } else {
@@ -530,6 +601,61 @@ mod tests {
 
     fn at(base: Instant, seconds: u64) -> Instant {
         base + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_retry_keeps_the_window_from_saying_done() {
+        let now = Instant::now();
+        let mut state = WindowState::new(now);
+        state.apply(
+            WindowMsg::Retry {
+                text: "AI cleanup unfinished; trying again in 2 min".into(),
+                active: false,
+                settled: false,
+            },
+            now,
+        );
+        state.apply(
+            WindowMsg::Done {
+                output_path: "a.md".into(),
+                words: 1,
+                chars: 1,
+                preview: String::new(),
+                warning: None,
+                speakers: None,
+            },
+            now,
+        );
+        assert!(state.retry_pending());
+        state.apply(
+            WindowMsg::Retry {
+                text: "Retrying AI cleanup".into(),
+                active: true,
+                settled: false,
+            },
+            now,
+        );
+        assert_eq!((state.done, state.total), (0, 0));
+        state.apply(
+            WindowMsg::Retry {
+                text: "AI cleanup finished".into(),
+                active: false,
+                settled: true,
+            },
+            now,
+        );
+        assert!(!state.retry_pending());
+        // The message survives the trip through JSON.
+        let line = serde_json::to_string(&WindowMsg::Retry {
+            text: "x".into(),
+            active: true,
+            settled: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<WindowMsg>(&line).unwrap(),
+            WindowMsg::Retry { active: true, .. }
+        ));
     }
 
     #[test]

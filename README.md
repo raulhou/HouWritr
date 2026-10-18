@@ -215,8 +215,9 @@ row the rest is skipped, and for a minute no further requests are made.
 Unfinished sections of a meeting get a second try when you press Stop (up to
 90 seconds). Anything still unfinished is retried in the background 2, 5, 10,
 20 and 30 minutes after saving, and the file is updated in place, unless you
-have edited, moved or deleted it. Timeouts grow with the slice length (up to
-10 minutes), for slow networks.
+have edited, moved or deleted it. The transcript window shows each retry and
+its progress, and says "Done" only when nothing is left to retry. Timeouts
+grow with the slice length (up to 10 minutes), for slow networks.
 
 Leave enhancement **Off** to keep everything on this PC. With it on, the
 transcript text goes to your provider, so think twice for confidential
@@ -245,7 +246,8 @@ meetings.
     [GenieX](https://github.com/qualcomm/GenieX) to run a model for you.
     Press **Install GenieX…** (the pinned v0.8.0 installer, checked against
     its SHA-256, installed for your user only), pick a model, then
-    **Download model** (resumable) and **Test model**, which shows how fast
+    **Download model** (one bar with size, speed and time left; a download
+    that stops resumes by itself, up to five tries) and **Test model**, which shows how fast
     it writes. The models:
     * *Qwen3 4B on the NPU* (`ai-hub-models/Qwen3-4B-Instruct-2507`, about
       2.5 GB from Qualcomm AI Hub). Light on the CPU, but on some PCs it
