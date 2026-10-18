@@ -241,18 +241,30 @@ meetings.
   kept in Windows Credential Manager, never in the settings file, and is only
   sent over https (or to a server on this PC).
 * **Local model (on this PC).**
-  * *Built in model (NPU)*: on a Snapdragon PC, HouWritr uses Qualcomm's
-    [GenieX](https://github.com/qualcomm/GenieX) to run
-    `Qwen3-4B-Instruct-2507` on the Hexagon NPU. Press **Install GenieX…**
-    (the pinned v0.8.0 installer, checked against its SHA-256, installed for
-    your user only), then **Download model** (several GB, resumable), then
-    **Test model**. HouWritr starts `geniex serve` on a private port (18651)
-    only when needed and stops it as soon as a transcript is finished, after
-    5 idle minutes, or when it stops answering or slows down sharply. If it
+  * *Built in model*: on a Snapdragon PC, HouWritr uses Qualcomm's
+    [GenieX](https://github.com/qualcomm/GenieX) to run a model for you.
+    Press **Install GenieX…** (the pinned v0.8.0 installer, checked against
+    its SHA-256, installed for your user only), pick a model, then
+    **Download model** (resumable) and **Test model**, which shows how fast
+    it writes. The models:
+    * *Qwen3 4B on the NPU* (`ai-hub-models/Qwen3-4B-Instruct-2507`, about
+      2.5 GB from Qualcomm AI Hub). Light on the CPU, but on some PCs it
+      writes only about one token a second, too slow for cleanup.
+    * *Qwen3 4B on the CPU* (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
+      about 2.4 GB from Hugging Face). The same model through GenieX's
+      llama.cpp runtime on the processor.
+    * *Qwen2.5 7B on the CPU* (`bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0`,
+      about 4.4 GB). Larger and more careful, about half as fast; needs
+      16 GB of memory.
+
+    HouWritr starts `geniex serve` on a private port (18651) only when
+    needed and stops it as soon as a transcript is finished, after 5 idle
+    minutes, or when it stops answering or slows down sharply. If a model
     writes too slowly to be useful (a slice takes over two minutes), cleanup
     stops and the rest of the transcript stays as recognised, without
-    background retries. **Remove model** deletes the model;
-    **Uninstall GenieX…** removes the model and runs GenieX's own uninstaller.
+    background retries. **Remove model** deletes the selected model;
+    **Uninstall GenieX…** removes all of them and runs GenieX's own
+    uninstaller.
   * *Another local server*: any OpenAI compatible server on `localhost`
     (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
     models**, **Test connection** and a setup guide are in Settings.

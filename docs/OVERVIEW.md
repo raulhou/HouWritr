@@ -49,7 +49,8 @@ notes and reports.
   covers about 100, including Chinese and Japanese.
 * **AI cleanup** (optional, off by default): the recognised text, never audio,
   is sent in slices to GitHub Copilot, an OpenAI compatible API, or a model on
-  this PC (Qwen3 4B on the NPU through Qualcomm GenieX, or a local server).
+  this PC (Qwen3 4B on the NPU, or Qwen3 4B or Qwen2.5 7B on the CPU, all
+  through Qualcomm GenieX; or a local server you run).
   Hosted providers get three slices at a time. Every slice is checked by an
   integrity validator, and a slice that fails or cannot be sent keeps its
   recognised text and is retried in the background later.
@@ -79,7 +80,7 @@ at run time).
 │  │   Whisper Large v3 Turbo: encoder + decoder on NPU (QNN)     │   │
 │  │        ↓ text                                                │   │
 │  │ AI cleanup / notes (optional): Copilot, OpenAI compatible,   │   │
-│  │   or local model (GenieX `geniex serve` on the NPU)          │   │
+│  │   or local model (GenieX `geniex serve`, NPU or CPU)         │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                     │ transcript                                   │
 │                     ▼                                              │

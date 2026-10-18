@@ -40,6 +40,82 @@ pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
 /// Qualcomm AI Hub bundle run on the NPU (4B instruct, no reasoning prefix).
 pub const DEFAULT_MODEL: &str = "ai-hub-models/Qwen3-4B-Instruct-2507";
 
+/// A model HouWritr can download and run through GenieX by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltInModel {
+    /// The name GenieX downloads and serves it under (`name[:precision]`).
+    pub id: &'static str,
+    /// Shown in Settings.
+    pub label: &'static str,
+    /// One line for Settings: size and what to expect.
+    pub detail: &'static str,
+    /// Run on the CPU (llama.cpp in GenieX) instead of the NPU.
+    pub cpu: bool,
+}
+
+/// The models offered in Settings. The CPU ones are GGUF files from Hugging
+/// Face that GenieX runs with its llama.cpp runtime: on PCs where the NPU
+/// model writes only about one token a second, the CPU is many times faster.
+pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
+    BuiltInModel {
+        id: DEFAULT_MODEL,
+        label: "Qwen3 4B on the NPU",
+        detail: "About 2.5 GB from Qualcomm AI Hub. Light on the CPU; on some PCs it writes very slowly.",
+        cpu: false,
+    },
+    BuiltInModel {
+        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0",
+        label: "Qwen3 4B on the CPU",
+        detail: "About 2.4 GB from Hugging Face. The same model on the processor; keeps the CPU busy while it cleans up.",
+        cpu: true,
+    },
+    BuiltInModel {
+        id: "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0",
+        label: "Qwen2.5 7B on the CPU",
+        detail: "About 4.4 GB from Hugging Face. Larger and more careful, about half as fast; needs 16 GB of memory.",
+        cpu: true,
+    },
+];
+
+/// The built-in model `model` names, if it is one.
+pub fn built_in(model: &str) -> Option<&'static BuiltInModel> {
+    let model = model.trim();
+    BUILT_IN_MODELS
+        .iter()
+        .find(|known| known.id.eq_ignore_ascii_case(model))
+}
+
+/// Whether the built-in model `model` runs on the NPU (anything unknown is
+/// treated as the NPU model, which is what the managed server ran before).
+pub fn runs_on_npu(model: &str) -> bool {
+    built_in(model).is_none_or(|known| !known.cpu)
+}
+
+/// Add what GenieX needs to run `model` where it should to a chat request.
+/// The NPU model needs nothing: the NPU is GenieX's default.
+pub fn add_request_options(body: &mut serde_json::Value, model: &str) {
+    if runs_on_npu(model) {
+        return;
+    }
+    if let Some(body) = body.as_object_mut() {
+        body.insert("compute".into(), serde_json::json!("cpu"));
+        body.insert("ngl".into(), serde_json::json!(0));
+        // GenieX asks models to think first unless told otherwise; these
+        // instruct models do not, and must not start to.
+        body.insert("enable_think".into(), serde_json::json!(false));
+    }
+}
+
+/// The arguments `geniex pull` needs for `model`, without prompts.
+fn pull_arguments(model: &str) -> Vec<&str> {
+    let mut arguments = vec!["pull", model.trim()];
+    if !runs_on_npu(model) {
+        // A Hugging Face download asks whether the model reads images.
+        arguments.extend(["--model-type", "llm"]);
+    }
+    arguments
+}
+
 /// Pinned official installer (GenieX v0.8.0, Windows ARM64, Inno Setup).
 const INSTALLER_URL: &str = "https://github.com/qualcomm/GenieX/releases/download/v0.8.0/geniex-cli-setup-windows-arm64-v0.8.0.exe";
 const INSTALLER_SHA256: &str = "fcc4d932f371a9b3ad3d08a1b34912fe21a7fdf7c54d47c869250b50d81ec734";
@@ -299,7 +375,7 @@ pub fn pull_model(
 ) -> Result<()> {
     let mut child = hidden(
         Command::new(cli)
-            .args(["pull", model])
+            .args(pull_arguments(model))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
@@ -380,8 +456,12 @@ pub fn remove_model(cli: &Path, model: &str) -> Result<()> {
 /// uninstaller and is left to Windows Settings → Apps.
 pub fn uninstall_cli(cli: &Path) -> Result<()> {
     shutdown();
-    if let Err(error) = remove_model(cli, DEFAULT_MODEL) {
-        warn!(error = %error, "could not remove the GenieX model before uninstalling");
+    for model in BUILT_IN_MODELS {
+        if model_installed(cli, model.id).unwrap_or(true) {
+            if let Err(error) = remove_model(cli, model.id) {
+                warn!(error = %error, model = model.id, "could not remove a GenieX model before uninstalling");
+            }
+        }
     }
     let uninstaller = find_uninstaller(cli).ok_or_else(|| {
         anyhow!(
@@ -485,6 +565,8 @@ struct Server {
     reaper_running: bool,
     /// The model has answered at least once since the server started.
     model_loaded: bool,
+    /// Which model the server was last asked to load.
+    loaded_model: Option<String>,
     /// The model has written at normal speed since the server started.
     was_fast: bool,
     /// Slow answers in a row from this server.
@@ -498,18 +580,35 @@ static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
         failed_at: None,
         reaper_running: false,
         model_loaded: false,
+        loaded_model: None,
         was_fast: false,
         slow_answers: 0,
     })
 });
 
-/// Make sure a request to `endpoint` can be answered. A no-op for every
-/// endpoint other than the managed one.
-pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), LocalLlmError> {
+/// Make sure a request for `model` to `endpoint` can be answered (with no
+/// model, only that the server runs). A no-op for every endpoint other than
+/// the managed one.
+pub fn ensure_running(
+    endpoint: &EndpointScope,
+    model: Option<&str>,
+) -> std::result::Result<(), LocalLlmError> {
     if !is_managed(endpoint) {
         return Ok(());
     }
     let mut server = SERVER.lock();
+    // Another built-in model is wanted: stop the server so the one it holds
+    // does not stay in memory next to the new one.
+    if let (Some(wanted), Some(loaded)) = (model, server.loaded_model.as_deref()) {
+        if !wanted.trim().eq_ignore_ascii_case(loaded) && server.child.is_some() {
+            info!(
+                from = loaded,
+                to = wanted.trim(),
+                "switching the local model"
+            );
+            stop_locked(&mut server);
+        }
+    }
     let previous_use = server.last_used;
     server.last_used = Instant::now();
 
@@ -557,13 +656,19 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
     // the model after five idle minutes. The first request after either has
     // to wait for the load, which takes far longer than a cleanup request may
     // wait, so load it here, once, before any real request is sent.
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        server.failed_at = None;
+        return Ok(());
+    };
     if !server.model_loaded || previous_use.elapsed() >= MODEL_RESIDENT {
-        info!("loading the local model");
+        let place = if runs_on_npu(model) { "NPU" } else { "CPU" };
+        info!(model, place, "loading the local model");
         let started = Instant::now();
-        match load_model() {
+        match load_model(model) {
             Ok(()) => {
                 info!(took = ?started.elapsed(), "local model is loaded");
                 server.model_loaded = true;
+                server.loaded_model = Some(model.to_string());
                 server.failed_at = None;
             }
             Err(error) => {
@@ -586,19 +691,21 @@ const MODEL_RESIDENT: Duration = Duration::from_secs(240);
 /// The longest a model load may take.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Make the server load [`DEFAULT_MODEL`] by asking it for one token.
-fn load_model() -> Result<()> {
+/// Make the server load `model` by asking it for one token.
+fn load_model(model: &str) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(LOAD_TIMEOUT)
         .build()?;
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+    });
+    add_request_options(&mut body, model);
     let response = client
         .post(format!("{MANAGED_BASE_URL}/chat/completions"))
-        .json(&serde_json::json!({
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-        }))
+        .json(&body)
         .send()
         .context("no answer")?;
     if !response.status().is_success() {
@@ -745,6 +852,7 @@ fn stop_locked(server: &mut Server) {
         let _ = child.wait();
     }
     server.model_loaded = false;
+    server.loaded_model = None;
     server.was_fast = false;
     server.slow_answers = 0;
 }
@@ -908,7 +1016,7 @@ pub fn discover_models(base_url: &str) -> Result<Vec<String>> {
     if !scope.is_loopback() {
         bail!("only servers on this PC can be queried here");
     }
-    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    ensure_running(&scope, None).map_err(|error| anyhow!(error.to_string()))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -956,22 +1064,26 @@ pub fn test_chat(base_url: &str, model: &str) -> Result<TestResult> {
     if model.trim().is_empty() {
         bail!("enter a model ID first");
     }
-    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    ensure_running(&scope, Some(model)).map_err(|error| anyhow!(error.to_string()))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(240))
         .build()?;
+    let mut body = serde_json::json!({
+        "model": model.trim(),
+        "messages": [{
+            "role": "user",
+            "content": "Write two short sentences about a quiet morning."
+        }],
+        "max_tokens": 48,
+        "temperature": 0.0,
+    });
+    if is_managed(&scope) {
+        add_request_options(&mut body, model);
+    }
     let started = Instant::now();
     let response = client
         .post(scope.join("/chat/completions"))
-        .json(&serde_json::json!({
-            "model": model.trim(),
-            "messages": [{
-                "role": "user",
-                "content": "Write two short sentences about a quiet morning."
-            }],
-            "max_tokens": 48,
-            "temperature": 0.0,
-        }))
+        .json(&body)
         .send()
         .context("the server did not answer")?;
     if !response.status().is_success() {
@@ -1021,6 +1133,47 @@ mod tests {
 
     fn scope(raw: &str) -> EndpointScope {
         EndpointScope::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn cpu_models_are_asked_to_run_on_the_cpu() {
+        let cpu = BUILT_IN_MODELS.iter().find(|model| model.cpu).unwrap();
+        assert!(!runs_on_npu(cpu.id));
+        assert!(runs_on_npu(DEFAULT_MODEL));
+        assert!(runs_on_npu("something-else"));
+        let mut body = serde_json::json!({"model": cpu.id});
+        add_request_options(&mut body, cpu.id);
+        assert_eq!(body["compute"], "cpu");
+        assert_eq!(body["ngl"], 0);
+        assert_eq!(body["enable_think"], false);
+        let mut npu = serde_json::json!({"model": DEFAULT_MODEL});
+        add_request_options(&mut npu, DEFAULT_MODEL);
+        assert!(npu.get("compute").is_none());
+    }
+
+    #[test]
+    fn downloads_never_wait_for_an_answer() {
+        assert_eq!(pull_arguments(DEFAULT_MODEL), ["pull", DEFAULT_MODEL]);
+        for model in BUILT_IN_MODELS.iter().filter(|model| model.cpu) {
+            // A precision and a model type, or GenieX would ask for them.
+            assert!(model.id.ends_with(":Q4_0"));
+            assert_eq!(
+                pull_arguments(model.id),
+                ["pull", model.id, "--model-type", "llm"]
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_models_are_found_by_name_and_listed_apart() {
+        assert_eq!(
+            built_in(" unsloth/qwen3-4b-instruct-2507-gguf:q4_0 ").map(|model| model.cpu),
+            Some(true)
+        );
+        let listing = r#"[{"name":"unsloth/Qwen3-4B-Instruct-2507-GGUF","precisions":["Q4_0"]}]"#;
+        assert!(lists_model(listing, BUILT_IN_MODELS[1].id));
+        assert!(!lists_model(listing, DEFAULT_MODEL));
+        assert!(!lists_model(listing, BUILT_IN_MODELS[2].id));
     }
 
     #[test]
@@ -1190,7 +1343,7 @@ mod tests {
 
     #[test]
     fn unmanaged_endpoints_never_start_anything() {
-        assert!(ensure_running(&scope("http://127.0.0.1:11434/v1")).is_ok());
-        assert!(ensure_running(&scope("https://api.openai.com/v1")).is_ok());
+        assert!(ensure_running(&scope("http://127.0.0.1:11434/v1"), Some("m")).is_ok());
+        assert!(ensure_running(&scope("https://api.openai.com/v1"), None).is_ok());
     }
 }

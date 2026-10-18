@@ -650,7 +650,8 @@ fn is_managed_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(crate::local_llm::is_managed)
 }
 
-/// Whether the configured cleanup provider is the built-in model on the NPU.
+/// Whether the configured cleanup provider is one of the built-in models
+/// (GenieX, started by HouWritr, on the NPU or the CPU).
 pub fn uses_managed_model(settings: &Settings) -> bool {
     settings
         .prompt_target()
@@ -691,7 +692,12 @@ pub fn cleanup_engine_label(settings: &Settings) -> String {
     match settings.prompt_target() {
         Ok(target) => match target.endpoint() {
             Some(endpoint) if crate::local_llm::is_managed(endpoint) => {
-                format!("{name} · this PC (NPU)")
+                let name = name.split(':').next().unwrap_or(name);
+                if crate::local_llm::runs_on_npu(model) {
+                    format!("{name} · this PC (NPU)")
+                } else {
+                    format!("{name} · this PC (CPU)")
+                }
             }
             Some(endpoint) if endpoint.is_loopback() => format!("{name} · this PC"),
             Some(endpoint) => format!("{name} · {}", endpoint.host()),
@@ -748,7 +754,9 @@ fn is_cjk(c: char) -> bool {
 }
 
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
-    if uses_managed_model(settings) {
+    // The small-context limit is the NPU model's; on the CPU GenieX runs a
+    // 4,096-token context like any other local server.
+    if uses_managed_model(settings) && crate::local_llm::runs_on_npu(&settings.enhance.model) {
         scaled_for_script(MANAGED_CLEANUP_CHARS, text)
     } else if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
@@ -808,7 +816,8 @@ fn request_content(
 
     // OpenWritr's own local model server is started on demand.
     if let Some(endpoint) = prepared.target.endpoint() {
-        if let Err(error) = crate::local_llm::ensure_running(endpoint) {
+        let model = prepared.body.get("model").and_then(|model| model.as_str());
+        if let Err(error) = crate::local_llm::ensure_running(endpoint, model) {
             warn!(error = %error, "local model server is not available");
             return Err(FallbackReason::RequestFailed);
         }
@@ -888,6 +897,9 @@ fn request_content(
     };
 
     let managed = is_managed_target(&prepared.target);
+    if managed {
+        crate::local_llm::add_request_options(&mut body, &configured);
+    }
     let sent = Instant::now();
     let mut result = match send_cancellable(build(&body, &route), !local) {
         Ok(result) => result,
@@ -1756,6 +1768,27 @@ mod long_form_tests {
         settings.enhance.base_url = base_url.into();
         settings.enhance.model = "some-model".into();
         settings
+    }
+
+    #[test]
+    fn built_in_cpu_models_get_the_usual_local_slices() {
+        let mut cpu = openai_settings("http://127.0.0.1:18651/v1");
+        cpu.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0".into();
+        assert!(uses_managed_model(&cpu));
+        assert_eq!(
+            cleanup_slice_chars(&cpu, "plain english text"),
+            LOCAL_CLEANUP_CHARS
+        );
+        assert_eq!(
+            cleanup_engine_label(&cpu),
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (CPU)"
+        );
+        let mut npu = cpu.clone();
+        npu.enhance.model = crate::local_llm::DEFAULT_MODEL.into();
+        assert_eq!(
+            cleanup_slice_chars(&npu, "plain english text"),
+            MANAGED_CLEANUP_CHARS
+        );
     }
 
     #[test]
