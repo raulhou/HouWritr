@@ -83,12 +83,16 @@ pub fn run_dialog(show_about: bool) -> Result<()> {
                 engine_states,
                 copilot_readiness: None,
                 copilot_rx: Some(copilot_rx),
+                copilot_models: None,
+                copilot_models_rx: None,
                 confirm_discard: false,
                 prompt_editor: PromptEditorState::default(),
                 show_about,
                 about_error: None,
                 autostart: AutostartUi::new(),
                 speaker_model: SpeakerModelUi::load(),
+                confirm_remove: None,
+                removal_notice: None,
             }))
         }),
     )
@@ -180,6 +184,10 @@ struct SettingsApp {
     engine_states: HashMap<String, EngineUiState>,
     copilot_readiness: Option<CopilotReadiness>,
     copilot_rx: Option<Receiver<CopilotReadiness>>,
+    /// The models Copilot offers this account, once asked (see
+    /// [`enhance::copilot_offered_models`]).
+    copilot_models: Option<Result<Vec<enhance::CopilotModel>, String>>,
+    copilot_models_rx: Option<Receiver<Result<Vec<enhance::CopilotModel>, String>>>,
     confirm_discard: bool,
     prompt_editor: PromptEditorState,
     show_about: bool,
@@ -187,6 +195,10 @@ struct SettingsApp {
     autostart: AutostartUi,
     speaker_model: SpeakerModelUi,
     local_model: LocalModelUi,
+    /// A model whose "Remove" was clicked once; the next click confirms.
+    confirm_remove: Option<String>,
+    /// What the last model removal did, and for which model.
+    removal_notice: Option<(String, std::result::Result<String, String>)>,
 }
 
 /// Id of the speaker-label models in `models-manifest.json`.
@@ -425,8 +437,12 @@ impl SettingsApp {
         };
         match receiver.try_recv() {
             Ok(status) => {
+                let ready = matches!(status, CopilotReadiness::Ready(_));
                 self.copilot_readiness = Some(status);
                 self.copilot_rx = None;
+                if ready && self.copilot_models.is_none() {
+                    self.refresh_copilot_models();
+                }
             }
             Err(TryRecvError::Disconnected) => {
                 self.copilot_readiness = Some(CopilotReadiness::Failed(
@@ -435,6 +451,126 @@ impl SettingsApp {
                 self.copilot_rx = None;
             }
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// A "Remove" button for downloaded model `model_id` that asks once more
+    /// before deleting. `allowed` says why removing is not possible now.
+    fn render_remove_model(
+        &mut self,
+        ui: &mut egui::Ui,
+        model_id: &str,
+        label: &str,
+        allowed: std::result::Result<(), &str>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            if self.confirm_remove.as_deref() == Some(model_id) {
+                ui.label("Delete these files? They are downloaded again when next needed.");
+                if ui.button("Delete").clicked() {
+                    self.confirm_remove = None;
+                    self.remove_model_files(model_id);
+                }
+                if ui.button("Keep").clicked() {
+                    self.confirm_remove = None;
+                }
+            } else {
+                let button = ui.add_enabled(allowed.is_ok(), egui::Button::new(label).small());
+                let button = match allowed {
+                    Err(reason) => button.on_disabled_hover_text(reason),
+                    Ok(()) => button,
+                };
+                if button.clicked() {
+                    self.confirm_remove = Some(model_id.to_string());
+                }
+            }
+        });
+    }
+
+    /// Delete a downloaded model, unless the running app uses it.
+    fn remove_model_files(&mut self, model_id: &str) {
+        // The app runs the engine saved in the settings file, which may differ
+        // from an unsaved choice in this window.
+        let saved_engine = Settings::load().map(|saved| saved.engine).ok();
+        let outcome = if saved_engine.as_deref() == Some(model_id) {
+            Err("HouWritr is using this engine. Choose and save another engine first.".into())
+        } else {
+            match ModelManager::remove_installed(model_id) {
+                Ok(()) => Ok("Model files removed.".into()),
+                Err(error) => Err(format!(
+                    "Could not remove the model files: {error}. If HouWritr is using them, \
+                     wait for the current transcription to finish and try again."
+                )),
+            }
+        };
+        self.removal_notice = Some((model_id.to_string(), outcome));
+        self.refresh_engine_states();
+        self.speaker_model.refresh();
+    }
+
+    /// The last removal's result, under the section it belongs to: speaker
+    /// labels (`speaker == true`) or the speech engines.
+    fn render_removal_notice(&self, ui: &mut egui::Ui, speaker: bool) {
+        let Some((model_id, outcome)) = &self.removal_notice else {
+            return;
+        };
+        if (model_id == SPEAKER_MODEL_ID) != speaker {
+            return;
+        }
+        match outcome {
+            Ok(message) => status_label(ui, message, status_green()),
+            Err(message) => inline_error(ui, message.clone()),
+        }
+    }
+
+    /// Ask Copilot, on a background thread, which models this account has.
+    fn refresh_copilot_models(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("settings-copilot-models".into())
+            .spawn(move || {
+                let _ = sender.send(enhance::copilot_offered_models());
+            });
+        if spawned.is_ok() {
+            self.copilot_models_rx = Some(receiver);
+        }
+    }
+
+    fn poll_copilot_models(&mut self) {
+        let Some(receiver) = &self.copilot_models_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(models) => {
+                self.copilot_models = Some(models);
+                self.copilot_models_rx = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.copilot_models = Some(Err("the model list could not be loaded".into()));
+                self.copilot_models_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// The models to offer for Copilot: the account's own list once loaded,
+    /// the built-in names until then (or if it could not be loaded).
+    fn copilot_model_choices(&self) -> Vec<(String, String)> {
+        match &self.copilot_models {
+            Some(Ok(models)) if !models.is_empty() => models
+                .iter()
+                .map(|model| {
+                    let label = if model.name == model.id {
+                        model.id.clone()
+                    } else {
+                        format!("{} ({})", model.name, model.id)
+                    };
+                    (model.id.clone(), label)
+                })
+                .collect(),
+            _ => catalog::all()
+                .iter()
+                .map(|model| (model.id.to_string(), model.display_name.to_string()))
+                .collect(),
         }
     }
 
@@ -827,6 +963,17 @@ impl SettingsApp {
                                 .small()
                                 .color(secondary_text()),
                             );
+                            if info.cache_state != ModelCacheState::Missing {
+                                let in_use = self.settings.engine == descriptor.id;
+                                self.render_remove_model(
+                                    ui,
+                                    descriptor.id,
+                                    "Remove model files",
+                                    (!in_use).then_some(()).ok_or(
+                                        "This engine is selected; choose and save another engine first.",
+                                    ),
+                                );
+                            }
                         }
                         Err(error) => inline_error(
                             ui,
@@ -843,6 +990,7 @@ impl SettingsApp {
         {
             self.refresh_engine_states();
         }
+        self.render_removal_notice(ui, false);
         if let Some(error) = self.selected_engine_error() {
             inline_error(ui, error);
         }
@@ -995,7 +1143,20 @@ impl SettingsApp {
                     refresh = true;
                 }
             });
+            let present = matches!(
+                &details,
+                Ok(details) if details.info.cache_state != ModelCacheState::Missing
+            );
+            if present {
+                self.render_remove_model(
+                    ui,
+                    SPEAKER_MODEL_ID,
+                    "Remove models",
+                    (!busy).then_some(()).ok_or("Wait for the download or check to finish."),
+                );
+            }
         });
+        self.render_removal_notice(ui, true);
 
         match &self.speaker_model.outcome {
             Some(Ok(message)) => status_label(ui, message, status_green()),
@@ -1231,20 +1392,39 @@ impl SettingsApp {
             }
         });
         ui.add_space(6.0);
-        ui.label("Model");
-        let models = catalog::all();
-        let mut selection = copilot_model_picker_value(&self.settings.enhance.model);
-        let selected_label = models
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Model");
+            let loading = self.copilot_models_rx.is_some();
+            match &self.copilot_models {
+                _ if loading => {
+                    status_label(ui, "Loading your Copilot models...", secondary_text())
+                }
+                Some(Ok(models)) => status_label(
+                    ui,
+                    &format!("{} offered to your account", models.len()),
+                    secondary_text(),
+                ),
+                Some(Err(error)) => status_label(ui, error, warning_color()),
+                None => {}
+            }
+            let ready = matches!(self.copilot_readiness, Some(CopilotReadiness::Ready(_)));
+            if ready && !loading && ui.small_button("Refresh").clicked() {
+                self.refresh_copilot_models();
+            }
+        });
+        let choices = self.copilot_model_choices();
+        let mut selection = copilot_model_picker_value(&self.settings.enhance.model, &choices);
+        let selected_label = choices
             .iter()
-            .find(|model| model.id == selection)
-            .map(|model| model.display_name)
-            .unwrap_or("Custom model ID");
+            .find(|(id, _)| *id == selection)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| "Custom model ID".into());
         let before_selection = selection.clone();
         egui::ComboBox::from_id_salt("copilot_model")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
-                for model in models {
-                    ui.selectable_value(&mut selection, model.id.into(), model.display_name);
+                for (id, label) in &choices {
+                    ui.selectable_value(&mut selection, id.clone(), label);
                 }
                 ui.selectable_value(&mut selection, "custom".into(), "Custom model ID");
             });
@@ -1267,7 +1447,7 @@ impl SettingsApp {
         ui.horizontal_wrapped(|ui| {
             info_button(
                 ui,
-                "Model availability and premium usage depend on your current Copilot plan.",
+                "The list comes from GitHub Copilot for your account. On Copilot Free, GitHub offers models through automatic selection only, so a listed model can still be refused; HouWritr then uses one that answers and the log names it.",
             );
             ui.hyperlink_to(
                 egui::RichText::new("View GitHub model documentation").small(),
@@ -1707,6 +1887,7 @@ impl SettingsApp {
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_copilot_probe();
+        self.poll_copilot_models();
         self.poll_speaker_model_job(ctx);
         self.poll_local_model(ctx);
 
@@ -2067,8 +2248,8 @@ fn prompt_source_label(source: PromptSource) -> &'static str {
     }
 }
 
-fn copilot_model_picker_value(model_id: &str) -> String {
-    if catalog::lookup(model_id).is_some() {
+fn copilot_model_picker_value(model_id: &str, choices: &[(String, String)]) -> String {
+    if choices.iter().any(|(id, _)| id == model_id) {
         model_id.to_string()
     } else {
         "custom".to_string()
@@ -2286,9 +2467,13 @@ mod tests {
 
     #[test]
     fn advisory_picker_keeps_custom_model_ids_as_custom() {
-        assert_eq!(copilot_model_picker_value("gpt-5.6-luna"), "gpt-5.6-luna");
+        let choices = vec![
+            ("gpt-4.1".to_string(), "GPT-4.1 (gpt-4.1)".to_string()),
+            ("gpt-4o".to_string(), "GPT-4o (gpt-4o)".to_string()),
+        ];
+        assert_eq!(copilot_model_picker_value("gpt-4.1", &choices), "gpt-4.1");
         assert_eq!(
-            copilot_model_picker_value("my-private/deployment-v42"),
+            copilot_model_picker_value("my-private/deployment-v42", &choices),
             "custom"
         );
         let mut settings = Settings::default();

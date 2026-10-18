@@ -140,26 +140,12 @@ fn with_copilot_headers(
 /// what it says about `wanted`, which explains a refusal. `None` when the
 /// list cannot be read.
 fn copilot_models(wanted: &str, token: &str, integration: &'static str) -> Option<Vec<String>> {
-    let token = token.to_string();
-    let listing = run_cancellable(move || -> reqwest::Result<serde_json::Value> {
-        let request = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?
-            .get(COPILOT_MODELS_URL)
-            .bearer_auth(token);
-        with_copilot_headers(request, integration)
-            .send()?
-            .error_for_status()?
-            .json()
-    });
-    let listing = match listing {
-        Ok(Ok(listing)) => listing,
-        Ok(Err(error)) => {
+    let listing = match fetch_copilot_listing(token, integration) {
+        Ok(listing) => listing,
+        Err(error) => {
             warn!(error = %error, integration, "could not list the GitHub Copilot models");
             return None;
         }
-        Err(_) => return None,
     };
     let entry = listing
         .get("data")
@@ -182,6 +168,139 @@ fn copilot_models(wanted: &str, token: &str, integration: &'static str) -> Optio
     Some(available)
 }
 
+/// Copilot's `/models` listing for this sign-in under `integration`.
+fn fetch_copilot_listing(
+    token: &str,
+    integration: &'static str,
+) -> std::result::Result<serde_json::Value, String> {
+    let token = token.to_string();
+    let listing = run_cancellable(move || -> reqwest::Result<serde_json::Value> {
+        let request = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .get(COPILOT_MODELS_URL)
+            .bearer_auth(token);
+        with_copilot_headers(request, integration)
+            .send()?
+            .error_for_status()?
+            .json()
+    });
+    match listing {
+        Ok(Ok(listing)) => Ok(listing),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(why) => Err(why.to_string()),
+    }
+}
+
+/// Whether a `/models` entry is a chat model this account may use on the
+/// chat completions endpoint (missing fields count as yes).
+fn is_usable_chat_model(model: &serde_json::Value) -> bool {
+    let chat = model
+        .pointer("/capabilities/type")
+        .and_then(|kind| kind.as_str())
+        .map_or(true, |kind| kind == "chat");
+    let enabled = model
+        .pointer("/policy/state")
+        .and_then(|state| state.as_str())
+        .map_or(true, |state| state == "enabled");
+    let completions = model
+        .get("supported_endpoints")
+        .and_then(|endpoints| endpoints.as_array())
+        .map_or(true, |endpoints| {
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint.as_str() == Some("/chat/completions"))
+        });
+    chat && enabled && completions
+}
+
+/// A model GitHub Copilot offers this account, for the Settings picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopilotModel {
+    pub id: String,
+    /// The name Copilot shows for it (the ID when it has none).
+    pub name: String,
+}
+
+/// Copilot's own helpers, listed as chat models but not for writing text.
+const COPILOT_INTERNAL_PREFIXES: [&str; 3] = ["copilot-search", "exec-agent", "trajectory-"];
+
+/// The models in a `/models` listing worth offering for cleanup: usable chat
+/// models, minus Copilot's internal helpers, the ones Copilot shows in its
+/// own model picker first, otherwise in the listing's order.
+fn offered_copilot_models(listing: &serde_json::Value) -> Vec<CopilotModel> {
+    let mut shown = Vec::new();
+    let mut others = Vec::new();
+    let models = listing
+        .get("data")
+        .and_then(|data| data.as_array())
+        .into_iter()
+        .flatten();
+    for model in models.filter(|model| is_usable_chat_model(model)) {
+        let Some(id) = model.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        if COPILOT_INTERNAL_PREFIXES
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+        {
+            continue;
+        }
+        let seen = |list: &Vec<CopilotModel>| list.iter().any(|known| known.id == id);
+        if seen(&shown) || seen(&others) {
+            continue;
+        }
+        let entry = CopilotModel {
+            id: id.to_string(),
+            name: model
+                .get("name")
+                .and_then(|name| name.as_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(id)
+                .to_string(),
+        };
+        if model
+            .get("model_picker_enabled")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false)
+        {
+            shown.push(entry);
+        } else {
+            others.push(entry);
+        }
+    }
+    shown.extend(others);
+    shown
+}
+
+/// The models GitHub Copilot offers the signed-in account, asked under each
+/// app identity until one answers with a list. Copilot Free has no fixed
+/// model list (GitHub documents only automatic model selection for it), so
+/// this is the only reliable source.
+pub fn copilot_offered_models() -> std::result::Result<Vec<CopilotModel>, String> {
+    let (token, source) =
+        crate::copilot_auth::copilot_token().map_err(|error| error.to_string())?;
+    let mut problem = "GitHub Copilot listed no models for this account".to_string();
+    for integration in copilot_integrations(source) {
+        match fetch_copilot_listing(&token, integration) {
+            Ok(listing) => {
+                let models = offered_copilot_models(&listing);
+                if !models.is_empty() {
+                    info!(
+                        integration,
+                        count = models.len(),
+                        "GitHub Copilot models listed for Settings"
+                    );
+                    return Ok(models);
+                }
+            }
+            Err(error) => problem = format!("could not list the GitHub Copilot models: {error}"),
+        }
+    }
+    Err(problem)
+}
+
 /// Chat model IDs in a Copilot `/models` listing, leaving out models whose
 /// policy is not enabled and models that do not answer on the chat
 /// completions endpoint.
@@ -193,24 +312,8 @@ fn copilot_chat_models(listing: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .flatten();
     for model in models {
-        let chat = model
-            .pointer("/capabilities/type")
-            .and_then(|kind| kind.as_str())
-            .map_or(true, |kind| kind == "chat");
-        let enabled = model
-            .pointer("/policy/state")
-            .and_then(|state| state.as_str())
-            .map_or(true, |state| state == "enabled");
-        let completions = model
-            .get("supported_endpoints")
-            .and_then(|endpoints| endpoints.as_array())
-            .map_or(true, |endpoints| {
-                endpoints
-                    .iter()
-                    .any(|endpoint| endpoint.as_str() == Some("/chat/completions"))
-            });
         if let Some(id) = model.get("id").and_then(|id| id.as_str()) {
-            if chat && enabled && completions && !ids.iter().any(|seen| seen == id) {
+            if is_usable_chat_model(model) && !ids.iter().any(|seen| seen == id) {
                 ids.push(id.to_string());
             }
         }
@@ -548,7 +651,7 @@ fn is_managed_target(target: &PromptTarget) -> bool {
 }
 
 /// Whether the configured cleanup provider is the built-in model on the NPU.
-fn uses_managed_model(settings: &Settings) -> bool {
+pub fn uses_managed_model(settings: &Settings) -> bool {
     settings
         .prompt_target()
         .map(|target| is_managed_target(&target))
@@ -1420,8 +1523,12 @@ fn clean_slices(
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
         if !tripped && index + 1 < total && give_up() {
+            // Not retried in the background either: a model this slow was
+            // just as slow on every retry, and each one held the NPU for
+            // minutes.
             tripped = true;
-            warn!("cleanup is too slow to finish; the remaining slices are left for later");
+            rejected = true;
+            warn!("cleanup is too slow on this PC; the remaining slices keep their text and are not retried");
         }
     }
 
@@ -1997,7 +2104,7 @@ mod long_form_tests {
     }
 
     #[test]
-    fn a_model_that_keeps_writing_slowly_leaves_the_rest_for_later() {
+    fn a_model_that_keeps_writing_slowly_stops_without_retries() {
         let mut calls = 0;
         let result = clean_slices(
             slices(6),
@@ -2013,8 +2120,8 @@ mod long_form_tests {
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(result.report.cleaned, 1);
-        assert_eq!(result.report.unreachable, 5);
-        assert!(result.report.needs_retry());
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
     }
 
     #[test]
@@ -2056,6 +2163,34 @@ mod long_form_tests {
         assert_eq!(
             copilot_integrations(TokenSource::GithubCli),
             [COPILOT_VSCODE, COPILOT_CLI]
+        );
+    }
+
+    #[test]
+    fn settings_offer_usable_models_with_copilot_picker_ones_first() {
+        let listing = serde_json::json!({"data": [
+            {"id": "copilot-search-a", "capabilities": {"type": "chat"}},
+            {"id": "gpt-4o", "name": "GPT-4o", "capabilities": {"type": "chat"}},
+            {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "capabilities": {"type": "chat"},
+             "policy": {"state": "disabled"}, "model_picker_enabled": true},
+            {"id": "gpt-4.1", "name": "GPT-4.1", "capabilities": {"type": "chat"},
+             "model_picker_enabled": true},
+            {"id": "text-embedding-3-small", "capabilities": {"type": "embeddings"}},
+            {"id": "gpt-4o", "name": "GPT-4o again"},
+            {"id": "gpt-4"}
+        ]});
+        let offered = offered_copilot_models(&listing);
+        let pairs: Vec<(&str, &str)> = offered
+            .iter()
+            .map(|model| (model.id.as_str(), model.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("gpt-4.1", "GPT-4.1"),
+                ("gpt-4o", "GPT-4o"),
+                ("gpt-4", "gpt-4")
+            ]
         );
     }
 

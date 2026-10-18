@@ -253,6 +253,12 @@ impl ModelManager {
     /// Install state plus the pinned file list and install directory. No
     /// hashing and no network, so it is cheap enough to call on every UI
     /// refresh.
+    /// Delete a downloaded model's files to free the space. The next engine
+    /// load (or speaker-label job) downloads them again.
+    pub fn remove_installed(model_id: &str) -> Result<(), ModelError> {
+        remove_model_at(&paths::models_dir(), model_id)
+    }
+
     pub fn describe(model_id: &str) -> Result<ModelDetails, ModelError> {
         describe_model_at(&paths::models_dir(), model_id)
     }
@@ -567,6 +573,35 @@ fn inspect_model_at(root: &Path, model_id: &str) -> Result<ModelInfo, ModelError
         .find(|model| model.id == model_id)
         .ok_or_else(|| ModelError::from(anyhow!("unknown model {model_id}")))?;
     inspect_manifest_model(root, manifest.schema_version, model)
+}
+
+/// Remove `model_id`'s folder. It is first renamed aside, so a model whose
+/// files are open (loaded by the app) fails as a whole instead of being left
+/// half deleted.
+fn remove_model_at(root: &Path, model_id: &str) -> Result<(), ModelError> {
+    let manifest = parse_embedded_manifest()?;
+    let model = manifest
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ModelError::from(anyhow!("unknown model {model_id}")))?;
+    remove_path_if_exists(&root.join(format!(".{}.staging", model.local_dir)))?;
+    remove_path_if_exists(&root.join(format!(".{}.replaced", model.local_dir)))?;
+    let directory = root.join(&model.local_dir);
+    if !directory.exists() {
+        return Ok(());
+    }
+    let aside = root.join(format!(".{}.removing", model.local_dir));
+    remove_path_if_exists(&aside)?;
+    fs::rename(&directory, &aside).with_context(|| {
+        format!(
+            "move {} aside (it may be in use by HouWritr)",
+            directory.display()
+        )
+    })?;
+    remove_path_if_exists(&aside)?;
+    info!(model = model_id, "model files removed");
+    Ok(())
 }
 
 fn describe_model_at(root: &Path, model_id: &str) -> Result<ModelDetails, ModelError> {
@@ -1109,6 +1144,7 @@ fn cleanup_stale_workdirs(root: &Path, manifest: &ManifestRoot) -> Result<(), Mo
     for model in &manifest.models {
         remove_path_if_exists(&root.join(format!(".{}.staging", model.local_dir)))?;
         remove_path_if_exists(&root.join(format!(".{}.replaced", model.local_dir)))?;
+        remove_path_if_exists(&root.join(format!(".{}.removing", model.local_dir)))?;
     }
     Ok(())
 }
@@ -1284,6 +1320,27 @@ mod tests {
             Arc::new(|_| Ok(u64::MAX)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn removing_a_model_deletes_its_folder_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let speaker = root.path().join("diarization-pyannote3-wespeaker-r34");
+        let other = root.path().join("parakeet-tdt-0.6b-v3-onnx");
+        for folder in [&speaker, &other] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("model.onnx"), b"weights").unwrap();
+        }
+        remove_model_at(root.path(), "diarization").unwrap();
+        assert!(!speaker.exists());
+        assert!(!root
+            .path()
+            .join(".diarization-pyannote3-wespeaker-r34.removing")
+            .exists());
+        assert!(other.join("model.onnx").exists());
+        // Removing what is not there is fine; an unknown model is not.
+        remove_model_at(root.path(), "diarization").unwrap();
+        assert!(remove_model_at(root.path(), "no_such_model").is_err());
     }
 
     #[test]
