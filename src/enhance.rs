@@ -746,6 +746,135 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// How many times a rejected slice is cut in two and tried again, piece by
+/// piece: 400 characters, then 200, then 100.
+const MAX_SPLITS: usize = 2;
+/// Pieces are not cut below this many characters.
+const MIN_PIECE_CHARS: usize = 40;
+
+/// Whether a rejection says "the model's version was not acceptable", where
+/// a smaller piece may pass, rather than "the provider could not be used".
+fn is_splittable(reason: &FallbackReason) -> bool {
+    matches!(
+        reason,
+        FallbackReason::IntegrityRejected(_) | FallbackReason::EmptyCandidate
+    )
+}
+
+/// Cut `slice` in two at the block or sentence end nearest its middle:
+/// `(left, gap, right)`, where the gap is the whitespace between them. `None`
+/// when no cut leaves both pieces at least [`MIN_PIECE_CHARS`] long.
+fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
+    let total = slice.chars().count();
+    if total < MIN_PIECE_CHARS * 2 {
+        return None;
+    }
+    let middle = total / 2;
+    let characters: Vec<(usize, char)> = slice.char_indices().collect();
+    // (distance from the middle, end of the left piece, start of the right).
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (position, &(byte, c)) in characters.iter().enumerate() {
+        let (left_end, left_chars) = if c == '\n' && slice[byte..].starts_with("\n\n") {
+            (byte, position)
+        } else if matches!(c, '。' | '！' | '？' | '；') {
+            (byte + c.len_utf8(), position + 1)
+        } else if matches!(c, '.' | '!' | '?' | ';')
+            && characters
+                .get(position + 1)
+                .map_or(true, |&(_, next)| next.is_whitespace())
+        {
+            (byte + c.len_utf8(), position + 1)
+        } else {
+            continue;
+        };
+        let rest = &slice[left_end..];
+        let right_start = left_end + (rest.len() - rest.trim_start().len());
+        let right_chars = slice[right_start..].chars().count();
+        if left_chars < MIN_PIECE_CHARS || right_chars < MIN_PIECE_CHARS {
+            continue;
+        }
+        let distance = left_chars.abs_diff(middle);
+        if best.map_or(true, |(nearest, _, _)| distance < nearest) {
+            best = Some((distance, left_end, right_start));
+        }
+    }
+    best.map(|(_, left_end, right_start)| {
+        (
+            &slice[..left_end],
+            &slice[left_end..right_start],
+            &slice[right_start..],
+        )
+    })
+}
+
+/// Clean `slice` with `clean`; when the model's version is rejected for
+/// changing content, cut the slice in two, clean each half on its own (cutting
+/// again if a half is rejected too, down to [`MAX_SPLITS`]) and put the
+/// pieces back together with the gaps they had. A change is then lost only
+/// for the smallest piece that keeps failing, not the whole slice, and the
+/// model gets different text to work on each time. A failure of the provider
+/// itself (unreachable, refused) is not retried this way.
+fn clean_splitting(
+    slice: &str,
+    depth: usize,
+    clean: &mut dyn FnMut(&str) -> Option<EnhanceOutcome>,
+) -> Option<EnhanceOutcome> {
+    let outcome = clean(slice)?;
+    let EnhanceOutcome::RawFallback { reason, .. } = &outcome else {
+        return Some(outcome);
+    };
+    if depth >= MAX_SPLITS || !is_splittable(reason) {
+        return Some(outcome);
+    }
+    let Some((left, gap, right)) = split_in_two(slice) else {
+        return Some(outcome);
+    };
+    info!(
+        ?reason,
+        chars = slice.chars().count(),
+        depth,
+        "cleanup slice rejected; trying its two halves"
+    );
+    let first = clean_splitting(left, depth + 1, clean)?;
+    let second = clean_splitting(right, depth + 1, clean)?;
+    // A half the provider could not be used for fails the whole slice the
+    // same way, so it is retried or reported as before.
+    for half in [&first, &second] {
+        if let EnhanceOutcome::RawFallback { reason, .. } = half {
+            if !is_splittable(reason) {
+                return Some(EnhanceOutcome::raw_fallback(slice, reason.clone()));
+            }
+        }
+    }
+    let whole = |half: &EnhanceOutcome| {
+        matches!(half, EnhanceOutcome::Enhanced { warnings, .. }
+            if !warnings.contains(&ViolationKind::PartlyCleaned))
+    };
+    let cleaned = |half: &EnhanceOutcome| matches!(half, EnhanceOutcome::Enhanced { .. });
+    if !cleaned(&first) && !cleaned(&second) {
+        return Some(outcome);
+    }
+    let mut warnings: Vec<ViolationKind> = Vec::new();
+    for half in [&first, &second] {
+        if let EnhanceOutcome::Enhanced { warnings: more, .. } = half {
+            for kind in more {
+                if *kind != ViolationKind::PartlyCleaned && !warnings.contains(kind) {
+                    warnings.push(*kind);
+                }
+            }
+        }
+    }
+    if !(whole(&first) && whole(&second)) {
+        warnings.push(ViolationKind::PartlyCleaned);
+    }
+    let text = format!("{}{gap}{}", first.text(), second.text());
+    info!(
+        whole = whole(&first) && whole(&second),
+        "cleanup slice recovered by cutting it in two"
+    );
+    Some(EnhanceOutcome::enhanced(text, warnings))
+}
+
 /// The `Speaker N: ` at the start of a block, if it has one.
 fn speaker_prefix(block: &str) -> Option<&str> {
     let rest = block.strip_prefix("Speaker ")?;
@@ -1164,6 +1293,9 @@ pub struct CleanupReport {
     pub total: usize,
     /// Slices the provider cleaned.
     pub cleaned: usize,
+    /// Slices cleaned in part: some pieces passed the checks, the others kept
+    /// the recognised text.
+    pub partly: usize,
     /// Slices left as recognised because the provider could not be reached or
     /// did not answer in time (or the circuit breaker skipped them): worth
     /// trying again later.
@@ -1179,6 +1311,7 @@ impl CleanupReport {
     pub fn add(&mut self, other: CleanupReport) {
         self.total += other.total;
         self.cleaned += other.cleaned;
+        self.partly += other.partly;
         self.unreachable += other.unreachable;
     }
 }
@@ -1246,14 +1379,22 @@ pub fn enhance_long_form(
         return clean_slices(
             slices,
             &joins,
-            |slice| clean_slice_keeping_labels(slice, settings, instruction, || !interrupted()),
+            |slice| {
+                clean_splitting(slice, 0, &mut |piece| {
+                    clean_slice_keeping_labels(piece, settings, instruction, || !interrupted())
+                })
+            },
             &give_up,
             &interrupted,
             progress,
         );
     }
     // Workers cannot see `interrupted`; it is checked as results are taken.
-    let clean = |slice: &str| clean_slice_keeping_labels(slice, settings, instruction, || true);
+    let clean = |slice: &str| {
+        clean_splitting(slice, 0, &mut |piece| {
+            clean_slice_keeping_labels(piece, settings, instruction, || true)
+        })
+    };
     let all: Vec<&str> = slices.clone();
     with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, &clean, |take| {
         clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
@@ -1539,6 +1680,7 @@ pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
     let joins = joins_between(text, &slices);
     LongFormCleanup {
         report: CleanupReport {
+            partly: 0,
             total: slices.len(),
             cleaned: 0,
             unreachable: slices.len(),
@@ -1590,8 +1732,12 @@ fn clean_slices(
             continue;
         }
         match clean(slice)? {
-            EnhanceOutcome::Enhanced { text, .. } => {
-                report.cleaned += 1;
+            EnhanceOutcome::Enhanced { text, warnings } => {
+                if warnings.contains(&ViolationKind::PartlyCleaned) {
+                    report.partly += 1;
+                } else {
+                    report.cleaned += 1;
+                }
                 in_a_row = 0;
                 joined.push_str(&text);
             }
@@ -1637,18 +1783,19 @@ fn clean_slices(
         }
     }
 
-    let failed = report.total - report.cleaned;
+    let failed = report.total - report.cleaned - report.partly;
     if failed > 0 {
         warn!(
             failed,
             total,
+            partly = report.partly,
             unreachable = report.unreachable,
             "some long-form cleanup slices kept raw text"
         );
     }
     let outcome = match first_failure {
         Some(reason) if report.cleaned == 0 => EnhanceOutcome::raw_fallback(joined, reason),
-        _ if report.cleaned > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
+        _ if report.cleaned + report.partly > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
         _ => EnhanceOutcome::skipped(joined, SkipReason::EmptyTranscript),
     };
     Some(LongFormCleanup { outcome, report })
@@ -1856,6 +2003,102 @@ mod long_form_tests {
         settings.enhance.base_url = base_url.into();
         settings.enhance.model = "some-model".into();
         settings
+    }
+
+    #[test]
+    fn a_slice_is_cut_in_two_at_the_boundary_nearest_the_middle() {
+        let text = format!(
+            "{}。{}。{}。",
+            "甲".repeat(45),
+            "乙".repeat(45),
+            "丙".repeat(45)
+        );
+        let (left, gap, right) = split_in_two(&text).unwrap();
+        assert!(left.ends_with('。') && right.ends_with('。'));
+        assert_eq!(gap, "");
+        assert_eq!(format!("{left}{gap}{right}"), text);
+        // A block boundary near the middle is used, and the gap kept.
+        let blocks = format!(
+            "Speaker 1: {}.\n\nSpeaker 2: {}.",
+            "a".repeat(60),
+            "b".repeat(60)
+        );
+        let (left, gap, right) = split_in_two(&blocks).unwrap();
+        assert!(left.starts_with("Speaker 1:") && right.starts_with("Speaker 2:"));
+        assert_eq!(gap, "\n\n");
+        // Decimals are not sentence ends; too short or no boundary: no cut.
+        assert!(split_in_two(&"1.5 ".repeat(5)).is_none());
+        assert!(split_in_two(&"x".repeat(200)).is_none());
+        assert!(split_in_two("short。text。").is_none());
+    }
+
+    fn rejected() -> EnhanceOutcome {
+        EnhanceOutcome::raw_fallback(
+            "raw",
+            FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]),
+        )
+    }
+
+    #[test]
+    fn a_rejected_slice_is_cut_in_two_and_put_back_together() {
+        let text = format!(
+            "{}。BAD{}。{}。",
+            "甲".repeat(40),
+            "乙".repeat(40),
+            "丙".repeat(40)
+        );
+        let mut calls = 0;
+        // The model "cleans" by upper-casing, and always garbles text with BAD.
+        let mut clean = |piece: &str| {
+            calls += 1;
+            Some(if piece.contains("BAD") {
+                EnhanceOutcome::raw_fallback(
+                    piece,
+                    FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]),
+                )
+            } else {
+                EnhanceOutcome::enhanced(format!("[{piece}]"), Vec::new())
+            })
+        };
+        let outcome = clean_splitting(&text, 0, &mut clean).unwrap();
+        let EnhanceOutcome::Enhanced {
+            text: joined,
+            warnings,
+        } = outcome
+        else {
+            panic!("the good piece should have been recovered");
+        };
+        // One piece kept as it was, the others cleaned; nothing lost or moved.
+        assert!(warnings.contains(&ViolationKind::PartlyCleaned));
+        assert!(joined.contains("BAD"));
+        assert_eq!(joined.replace(['[', ']'], ""), text);
+        assert!(calls > 1 && calls <= 1 + 2 + 4, "{calls}");
+
+        // Every piece fails: the slice keeps its text and the first reason.
+        let mut always = |piece: &str| {
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                FallbackReason::IntegrityRejected(vec![ViolationKind::NegationChanged]),
+            ))
+        };
+        assert!(matches!(
+            clean_splitting(&text, 0, &mut always),
+            Some(EnhanceOutcome::RawFallback { .. })
+        ));
+        // A provider failure is not retried in halves.
+        let mut calls = 0;
+        let mut down = |piece: &str| {
+            calls += 1;
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                FallbackReason::RequestFailed,
+            ))
+        };
+        clean_splitting(&text, 0, &mut down);
+        assert_eq!(calls, 1);
+        // Interrupted: stops at once.
+        assert!(clean_splitting(&text, 0, &mut |_| None).is_none());
+        let _ = rejected();
     }
 
     #[test]
@@ -2183,6 +2426,7 @@ mod long_form_tests {
         assert_eq!(
             result.report,
             CleanupReport {
+                partly: 0,
                 total: 3,
                 cleaned: 3,
                 unreachable: 0

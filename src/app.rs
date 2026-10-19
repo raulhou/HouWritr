@@ -264,22 +264,33 @@ fn cleanup_summary(report: &crate::enhance::CleanupReport) -> Option<String> {
 /// section was cleaned. Not an error: the file is complete and the sections
 /// that were not cleaned keep exactly what was recognised.
 fn cleanup_notice(report: &crate::enhance::CleanupReport) -> Option<String> {
-    if report.total == 0 || report.cleaned >= report.total {
-        return None;
+    if report.total == 0 || report.cleaned + report.partly >= report.total {
+        // Everything cleaned, or the rest only in part (said below).
+        if report.partly == 0 {
+            return None;
+        }
     }
-    // Neither cleaned nor unreachable: the cleaned version failed the safety
-    // checks (a number or a speaker label changed), or was empty.
+    // Neither cleaned, cleaned in part nor unreachable: the cleaned version
+    // failed the safety checks (a number or speaker label changed) even for
+    // the smallest piece, or was empty.
     let kept = report
         .total
         .saturating_sub(report.cleaned)
+        .saturating_sub(report.partly)
         .saturating_sub(report.unreachable);
     let mut notice = format!(
         "AI cleanup finished: {} of {} sections cleaned.",
         report.cleaned, report.total
     );
+    if report.partly > 0 {
+        notice.push_str(&format!(
+            " {} more in part: the pieces that failed the safety checks kept the recognised text.",
+            report.partly
+        ));
+    }
     if kept > 0 {
         notice.push_str(&format!(
-            " {kept} kept the recognised text because the cleaned version failed the safety checks (a number or speaker label changed); they are not retried."
+            " {kept} kept the recognised text because the cleaned version failed the safety checks (a number or speaker label changed), even in smaller pieces; they are not retried."
         ));
     }
     if report.unreachable > 0 {
@@ -2825,6 +2836,7 @@ mod tests {
     #[test]
     fn partly_cleaned_text_gets_a_calm_notice_that_counts_what_was_kept() {
         let report = |total, cleaned, unreachable| crate::enhance::CleanupReport {
+            partly: 0,
             total,
             cleaned,
             unreachable,
@@ -2834,6 +2846,16 @@ mod tests {
         let notice = super::cleanup_notice(&report(48, 39, 0)).unwrap();
         assert!(notice.starts_with("AI cleanup finished: 39 of 48 sections cleaned."));
         assert!(notice.contains("9 kept the recognised text"));
+        let notice = super::cleanup_notice(&crate::enhance::CleanupReport {
+            total: 48,
+            cleaned: 40,
+            partly: 5,
+            unreachable: 0,
+        })
+        .unwrap();
+        assert!(notice.contains("40 of 48 sections cleaned."));
+        assert!(notice.contains("5 more in part"));
+        assert!(notice.contains("3 kept the recognised text"));
         assert!(!notice.contains("could not be sent"));
         let notice = super::cleanup_notice(&report(48, 30, 8)).unwrap();
         assert!(notice.contains("10 kept"));
@@ -2904,6 +2926,7 @@ mod tests {
         use super::cleanup_summary;
         use crate::enhance::CleanupReport;
         let report = |total, cleaned| CleanupReport {
+            partly: 0,
             total,
             cleaned,
             unreachable: 0,

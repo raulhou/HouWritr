@@ -210,6 +210,14 @@ and recognition slips:
   text, and the log says why. If no slice can be cleaned, the raw transcript is
   saved with a warning that names the reason.
 
+**Changes the safety checks refuse.** When the cleaned version of a section
+changes a number or a speaker label, that section is not discarded at once:
+it is cut in two at the sentence or block boundary nearest its middle, each
+half is cleaned on its own (and cut again if it fails too, down to about a
+quarter of the section), and the pieces are put back together with the gaps
+they had. Only the smallest piece that keeps failing keeps its recognised
+text. The transcript window counts such sections as cleaned in part.
+
 **Unreliable connections.** Cleanup never holds up a transcript. A slice that
 cannot reach the provider keeps its recognised text; after three failures in a
 row the rest is skipped, and for a minute no further requests are made.

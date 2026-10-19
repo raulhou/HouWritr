@@ -1710,6 +1710,7 @@ const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 /// the meeting (a model on this PC). It counts as not yet cleaned, so if the
 /// end never gets to it, the background retry picks it up.
 const DEFERRED_CLEANUP: enhance::CleanupReport = enhance::CleanupReport {
+    partly: 0,
     total: 1,
     cleaned: 0,
     unreachable: 1,
@@ -2617,6 +2618,7 @@ mod tests {
 
     fn report(total: usize, cleaned: usize, unreachable: usize) -> enhance::CleanupReport {
         enhance::CleanupReport {
+            partly: 0,
             total,
             cleaned,
             unreachable,
@@ -3434,6 +3436,7 @@ mod tests {
                     text: raw.to_uppercase(),
                     warning: None,
                     report: enhance::CleanupReport {
+                        partly: 0,
                         total: 1,
                         cleaned: 1,
                         unreachable: 0,

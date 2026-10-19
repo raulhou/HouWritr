@@ -82,6 +82,9 @@ pub enum ViolationKind {
     RetainedFiller,
     /// Adjacent word repetition remained in the candidate.
     AdjacentRepetition,
+    /// Not a check: marks a slice of a long cleanup of which only some pieces
+    /// passed the checks (the others kept their recognised text).
+    PartlyCleaned,
 }
 
 /// A single integrity violation.
