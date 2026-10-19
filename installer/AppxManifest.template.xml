@@ -27,7 +27,7 @@
     <!-- Must equal the publisher display name shown in Partner Center. -->
     <PublisherDisplayName>Wenxuan Hou</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
-    <Description>Meeting recording and audio/video transcription. Local transcription with NVIDIA Parakeet and Whisper on the Snapdragon Hexagon NPU (ARM64) or CPU (x64). No telemetry. Optional AI cleanup runs on this PC or with a provider you choose.</Description>
+    <Description>Record meetings and transcribe audio or video files into text, with speech recognition that runs on your PC (the Snapdragon NPU, or the CPU). Optional speaker labels, AI cleanup and meeting notes. No telemetry.</Description>
   </Properties>
 
   <Dependencies>
@@ -43,7 +43,7 @@
     <Application Id="HouWritr" Executable="houwritr.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="HouWritr for Windows"
-        Description="Meeting recording and audio/video transcription on this PC."
+        Description="Record meetings and transcribe audio and video files on your PC."
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">
