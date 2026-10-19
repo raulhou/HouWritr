@@ -49,8 +49,8 @@ notes and reports.
   covers about 100, including Chinese and Japanese.
 * **AI cleanup** (optional, off by default): the recognised text, never audio,
   is sent in slices to GitHub Copilot, an OpenAI compatible API, or a model on
-  this PC (Qwen3 4B on the NPU, or Qwen3 4B or Qwen2.5 7B on the CPU, all
-  through Qualcomm GenieX; or a local server you run).
+  this PC (Qwen3 4B on the NPU, alone or with the CPU, through Qualcomm
+  GenieX's llama.cpp runtime; or a local server you run).
   Hosted providers get three slices at a time. Every slice is checked by an
   integrity validator, and a slice that fails or cannot be sent keeps its
   recognised text and is retried in the background later.

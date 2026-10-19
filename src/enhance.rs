@@ -718,12 +718,6 @@ fn local_max_tokens(text: &str) -> usize {
 /// Small local models have short context windows and generate slowly, so
 /// they get smaller slices than a hosted model.
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
-/// The built-in model gets smaller slices still, so a request (about 160
-/// tokens of instructions, the slice, and a reply as long as the slice)
-/// stays inside GenieX's smallest 512-token context. A request that outgrew
-/// it switched the model to its 1,024-token variant, and from that token on
-/// the NPU wrote about 20 times slower until the server was restarted.
-const MANAGED_CLEANUP_CHARS: usize = 600;
 const LOCAL_NOTES_PART_CHARS: usize = 8_000;
 
 /// Chinese, Japanese and Korean text costs about one token per character,
@@ -826,12 +820,9 @@ pub fn cleanup_slice_count(text: &str, settings: &Settings) -> usize {
 }
 
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
-    // The small-context limit is the NPU model's; on the CPU GenieX runs a
-    // 4,096-token context like any other local server.
-    if uses_managed_model(settings) && crate::local_llm::runs_on_npu_bundle(&settings.enhance.model)
-    {
-        scaled_for_script(MANAGED_CLEANUP_CHARS, text)
-    } else if uses_local_model(settings) {
+    // The built-in models run with a 4,096-token context like any local
+    // server.
+    if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
         LONG_FORM_CLEANUP_CHARS
@@ -1886,23 +1877,23 @@ mod long_form_tests {
     }
 
     #[test]
-    fn built_in_cpu_models_get_the_usual_local_slices() {
-        let mut cpu = openai_settings("http://127.0.0.1:18651/v1");
-        cpu.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0".into();
-        assert!(uses_managed_model(&cpu));
+    fn built_in_models_get_the_usual_local_slices_and_name_where_they_run() {
+        let mut npu = openai_settings("http://127.0.0.1:18651/v1");
+        npu.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu".into();
+        assert!(uses_managed_model(&npu));
         assert_eq!(
-            cleanup_slice_chars(&cpu, "plain english text"),
+            cleanup_slice_chars(&npu, "plain english text"),
             LOCAL_CLEANUP_CHARS
         );
         assert_eq!(
-            cleanup_engine_label(&cpu),
-            "Qwen3-4B-Instruct-2507-GGUF · this PC (CPU)"
+            cleanup_engine_label(&npu),
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (NPU, llama.cpp)"
         );
-        let mut npu = cpu.clone();
-        npu.enhance.model = crate::local_llm::DEFAULT_MODEL.into();
+        let mut hybrid = npu.clone();
+        hybrid.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid".into();
         assert_eq!(
-            cleanup_slice_chars(&npu, "plain english text"),
-            MANAGED_CLEANUP_CHARS
+            cleanup_engine_label(&hybrid),
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (NPU + CPU)"
         );
     }
 
@@ -1913,7 +1904,7 @@ mod long_form_tests {
         assert!(uses_managed_model(&managed));
         assert_eq!(
             cleanup_slice_chars(&managed, "plain english text"),
-            MANAGED_CLEANUP_CHARS
+            LOCAL_CLEANUP_CHARS
         );
 
         let local = openai_settings("http://127.0.0.1:11434/v1");
@@ -1949,7 +1940,7 @@ mod long_form_tests {
                 s.enhance.model = "ai-hub-models/Qwen3-4B-Instruct-2507".into();
                 s
             }),
-            "Qwen3-4B-Instruct-2507 · this PC (NPU)"
+            "Qwen3-4B-Instruct-2507 · this PC (NPU, llama.cpp)"
         );
         assert_eq!(
             cleanup_engine_label(&openai_settings("http://localhost:11434/v1")),
@@ -2026,17 +2017,16 @@ mod long_form_tests {
     }
 
     #[test]
-    fn built_in_model_slices_stay_inside_its_smallest_context() {
-        const { assert!(MANAGED_CLEANUP_CHARS < LOCAL_CLEANUP_CHARS) };
+    fn built_in_model_slices_cut_chinese_to_a_third() {
         let managed = openai_settings("http://127.0.0.1:18651/v1");
-        // The transcript from the failed run: Chinese, one slice of up to 400
-        // characters came to about 250 tokens; now at most 200 characters.
+        // One token per character: a Chinese slice is a third of the English
+        // size, 400 characters.
         let chinese = "这是一段很长的中文文字，用来测试切分。".repeat(100);
-        assert_eq!(cleanup_slice_chars(&managed, &chinese), 200);
+        assert_eq!(cleanup_slice_chars(&managed, &chinese), 400);
         assert!(
             split_for_cleanup(&chinese, cleanup_slice_chars(&managed, &chinese))
                 .iter()
-                .all(|slice| slice.chars().count() <= 200)
+                .all(|slice| slice.chars().count() <= 400)
         );
     }
 

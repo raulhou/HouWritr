@@ -249,20 +249,17 @@ meetings.
     its SHA-256, installed for your user only), pick a model, then
     **Download model** (one bar with size, speed and time left; a download
     that stops resumes by itself, up to five tries) and **Test model**, which shows how fast
-    it writes. The models:
-    * *Qwen3 4B on the NPU* (`ai-hub-models/Qwen3-4B-Instruct-2507`, about
-      2.5 GB from Qualcomm AI Hub). Light on the CPU, but on some PCs it
-      writes only about one token a second, too slow for cleanup.
-    * *Qwen3 4B on the NPU (llama.cpp)* and *Qwen3 4B on the NPU and CPU*:
-      the GGUF file below, run on the NPU through llama.cpp's Hexagon
-      backend instead of Qualcomm's bundle, or split between the NPU and the
-      processor. Worth trying where the bundle is slow.
-    * *Qwen3 4B on the CPU* (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
-      about 2.4 GB from Hugging Face). The same model through GenieX's
-      llama.cpp runtime on the processor.
-    * *Qwen2.5 7B on the CPU* (`bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0`,
-      about 4.4 GB). Larger and more careful, about half as fast; needs
-      16 GB of memory.
+    it writes. One Qwen3 4B file (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
+    about 2.4 GB from Hugging Face), run two ways through GenieX's llama.cpp
+    runtime:
+    * *Qwen3 4B on the NPU (llama.cpp)*: all layers on the NPU. Steady speed
+      (about 13 tokens a second on a Snapdragon X Elite) and light on the CPU.
+    * *Qwen3 4B on the NPU and CPU*: split between the two. Faster (about 18
+      tokens a second) but it uses more CPU.
+
+    Earlier versions also offered Qualcomm's precompiled NPU bundle (about
+    one token a second on the test PC), the CPU alone, and Qwen2.5 7B. Their
+    files are not deleted by the update; **Uninstall GenieX…** removes them.
 
     HouWritr starts `geniex serve` on a private port (18651) only when a
     job needs it and stops it as soon as that job is finished (each meeting
