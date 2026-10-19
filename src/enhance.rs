@@ -79,6 +79,26 @@ fn send_cancellable(
     })
 }
 
+/// Pauses before asking again after "busy" (429) or "unavailable" (503).
+const BUSY_PAUSES: [Duration; 3] = [
+    Duration::from_secs(4),
+    Duration::from_secs(10),
+    Duration::from_secs(25),
+];
+
+/// Wait `pause`, ending early when [`cancel_requests`] is called. `false`
+/// when it was cancelled.
+fn pause_unless_cancelled(pause: Duration) -> bool {
+    let until = Instant::now() + pause;
+    while Instant::now() < until {
+        if CANCEL_REQUESTS.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
 /// Models GitHub Copilot lists for this account: the chat models it offers
 /// and has not switched off by policy.
 const COPILOT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
@@ -1063,7 +1083,24 @@ fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
     if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
-        LONG_FORM_CLEANUP_CHARS
+        scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, text)
+    }
+}
+
+/// Chinese, Japanese and Korean cost about one token a character, so a hosted
+/// model writes the answer to a 3,000 character slice in 45 to 75 seconds.
+/// Shorter slices let more of them run at the same time and keep the last
+/// ones from waiting on one long reply.
+fn scaled_for_hosted(base_chars: usize, text: &str) -> usize {
+    let total = text.chars().filter(|c| !c.is_whitespace()).count();
+    if total == 0 {
+        return base_chars;
+    }
+    let cjk = text.chars().filter(|&c| is_cjk(c)).count();
+    match cjk * 100 / total {
+        0..=9 => base_chars,
+        10..=29 => base_chars * 3 / 4,
+        _ => base_chars / 2,
     }
 }
 
@@ -1281,6 +1318,28 @@ fn request_content(
                     integration: *integration,
                 });
             }
+        }
+    }
+    // A hosted provider that is busy (429) or briefly down (503) is asked
+    // again after a pause: with several slices in flight at once it will
+    // say so now and then, and a slice should not lose its cleanup for it.
+    if !local && !managed {
+        for pause in BUSY_PAUSES {
+            let busy = matches!(&result, Ok((status, _)) if matches!(status.as_u16(), 429 | 503));
+            if !busy {
+                break;
+            }
+            warn!(?pause, "the cleanup provider is busy; asking again");
+            if !pause_unless_cancelled(pause) {
+                return Err(FallbackReason::RequestFailed);
+            }
+            result = match send_cancellable(build(&body, &route), true) {
+                Ok(result) => result,
+                Err(why) => {
+                    info!(waited = ?sent.elapsed(), "cleanup request {why}");
+                    return Err(FallbackReason::RequestFailed);
+                }
+            };
         }
     }
     let (status, body) = match result {
@@ -1505,13 +1564,34 @@ pub fn enhance_long_form(
         })
     };
     let all: Vec<&str> = slices.clone();
-    with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, &clean, |take| {
+    // Finding a working model takes the first request; waiting for a whole
+    // slice to come back first cost the time of one slice (45 to 75 seconds
+    // for Chinese) before the others started.
+    let ready = warm_up_hosted(settings, instruction);
+    with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, ready, &clean, |take| {
         clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
     })
 }
 
+/// One tiny request that finds the working model and checks the provider
+/// answers, so the slices can start together. `false` when it did not clearly
+/// work; the slices then start one at a time as before.
+fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> bool {
+    matches!(
+        enhance_outcome_with("OK", settings, instruction, || true),
+        Some(
+            EnhanceOutcome::Enhanced { .. }
+                | EnhanceOutcome::Skipped { .. }
+                | EnhanceOutcome::RawFallback {
+                    reason: FallbackReason::IntegrityRejected(_),
+                    ..
+                }
+        )
+    )
+}
+
 /// Slices a hosted provider cleans at the same time.
-const HOSTED_PARALLEL_SLICES: usize = 3;
+const HOSTED_PARALLEL_SLICES: usize = 5;
 
 /// Work shared between the slice workers and the thread putting the
 /// transcript back together.
@@ -1533,13 +1613,14 @@ struct ParallelSlices {
 fn with_parallel_cleaner<R>(
     slices: &[&str],
     workers: usize,
+    ready: bool,
     clean: &(dyn Fn(&str) -> Option<EnhanceOutcome> + Sync),
     consume: impl FnOnce(&mut dyn FnMut(&str) -> Option<EnhanceOutcome>) -> R,
 ) -> R {
     let state = parking_lot::Mutex::new(ParallelSlices {
         results: (0..slices.len()).map(|_| None).collect(),
         next: 0,
-        started: false,
+        started: ready,
         stop: false,
     });
     let changed = parking_lot::Condvar::new();
@@ -2757,7 +2838,7 @@ mod long_form_tests {
             std::thread::sleep(Duration::from_millis(wait as u64 * 5));
             enhanced(&slice.to_uppercase())
         };
-        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+        let result = with_parallel_cleaner(&parts, 3, false, &clean, |take| {
             clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
         })
         .unwrap();
@@ -2770,6 +2851,41 @@ mod long_form_tests {
     }
 
     #[test]
+    fn a_ready_provider_has_every_worker_start_at_once() {
+        let parts = ["one", "two", "three", "four", "five", "six"];
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let most = std::sync::atomic::AtomicUsize::new(0);
+        let clean = |slice: &str| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            running.fetch_sub(1, Ordering::SeqCst);
+            enhanced(&slice.to_uppercase())
+        };
+        let result = with_parallel_cleaner(&parts, 3, true, &clean, |take| {
+            clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(result.report.cleaned, 6);
+        // Without the first slice finishing alone, three ran together.
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn hosted_slices_are_shorter_for_chinese() {
+        let english = "word ".repeat(200);
+        let chinese = "我们这个时候说的话还是对的。".repeat(50);
+        assert_eq!(
+            scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, &english),
+            LONG_FORM_CLEANUP_CHARS
+        );
+        assert_eq!(
+            scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, &chinese),
+            LONG_FORM_CLEANUP_CHARS / 2
+        );
+    }
+
+    #[test]
     fn parallel_cleanup_stops_after_a_rejection() {
         let parts = ["one", "two", "three", "four", "five", "six"];
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -2777,7 +2893,7 @@ mod long_form_tests {
             calls.fetch_add(1, Ordering::SeqCst);
             failed(FallbackReason::ProviderRejected(400))
         };
-        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+        let result = with_parallel_cleaner(&parts, 3, false, &clean, |take| {
             clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
         })
         .unwrap();

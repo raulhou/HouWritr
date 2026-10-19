@@ -198,13 +198,14 @@ text and never as audio, to the provider you chose, which fixes punctuation
 and recognition slips:
 
 * The transcript is sent in slices: about 3,000 characters for a hosted
-  provider, 1,200 for a local server and 600 for the built in NPU model (local
-  models get a third of that for Chinese and Japanese, which take more tokens
-  per character). Slices are cut at sentence ends and never split a speaker's
-  block.
-* With a hosted provider the first slice goes alone, then three slices are
-  cleaned at a time; the results are put back in order. A model on this PC
-  gets one slice at a time.
+  provider (half of that for Chinese and Japanese, which take more tokens per
+  character, so more slices can run together) and 1,200 for a model on this PC
+  (a third of that for Chinese and Japanese). Slices are cut at sentence ends
+  and never split a speaker's block.
+* With a hosted provider one tiny request first finds a working model, then
+  five slices are cleaned at a time; the results are put back in order. A
+  provider that answers "busy" (429) or "unavailable" (503) is asked again
+  after 4, 10 and 25 seconds. A model on this PC gets one slice at a time.
 * `[m:ss]` markers are held back from the request and put back afterwards.
 * Speaker labels are held back too. When a section holds several speakers,
   each speaker's block is sent with a tag (`[A]`, `[B]`, ...) that the model
