@@ -265,11 +265,12 @@ meetings.
     about 2.4 GB from Hugging Face), run two ways through GenieX's llama.cpp
     runtime:
     * *Qwen3 4B in hybrid mode* (the default): GenieX's `hybrid` setting, where
-      llama.cpp's scheduler chooses per step between the NPU and the CPU
-      (Qualcomm's documentation; GenieX does not log which one ran a step).
-      The faster choice (about 18 tokens a second on a Snapdragon X Elite);
-      on the test PC the CPU stayed below 50% with other work in the
-      foreground.
+      llama.cpp's scheduler spreads the work over what it can use.
+      Qualcomm's documentation says NPU and CPU, but on the test PC Task
+      Manager showed `geniex.exe` using the Adreno GPU (about 76%) and the NPU
+      (about 69%) with the CPU low (about 9%); GenieX does not log which
+      processor ran a step. The faster choice (about 18 tokens a second on a
+      Snapdragon X Elite), but the GPU load costs battery.
     * *Qwen3 4B on the NPU only*: all layers on the NPU. Steady (about 13
       tokens a second) and the lightest on the CPU.
 

@@ -56,7 +56,8 @@ const LEGACY_MODELS: &[&str] = &[
 pub enum Runtime {
     /// All layers on the NPU.
     NpuLlama,
-    /// llama.cpp's per tensor scheduler between the NPU and the CPU, which
+    /// llama.cpp's per tensor scheduler across the backends it can use (the
+    /// NPU and, as measured on the test PC, the GPU), which
     /// GenieX calls the fast path on Snapdragon. Shown to the user as
     /// "hybrid mode"; GenieX's own log does not say which processor ran a step.
     Hybrid,
@@ -108,7 +109,7 @@ pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
         id: DEFAULT_MODEL,
         name: QWEN3_4B_GGUF,
         label: "Qwen3 4B in hybrid mode",
-        detail: "About 2.4 GB from Hugging Face. Hybrid mode: llama.cpp decides for each step whether the NPU or the processor does it. The faster choice (about 18 tokens a second on a Snapdragon X Elite).",
+        detail: "About 2.4 GB from Hugging Face. Hybrid mode: llama.cpp spreads the work over the NPU and the other processors. The faster choice (about 18 tokens a second on a Snapdragon X Elite), but on that PC Task Manager showed the GPU as busy as the NPU.",
         runtime: Runtime::Hybrid,
         download_bytes: Some(QWEN3_4B_GGUF_BYTES),
     },
