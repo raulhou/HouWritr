@@ -917,16 +917,40 @@ fn clean_slice_keeping_labels(
     if !labelled && blocks.len() > 1 {
         return enhance_outcome_with(slice, settings, extra_instruction, before_validate);
     }
-    let bare = blocks
+    let bare_blocks: Vec<&str> = blocks
         .iter()
         .zip(&prefixes)
         .map(|(block, prefix)| &block[prefix.len()..])
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let outcome = enhance_outcome_with(&bare, settings, extra_instruction, before_validate)?;
+        .collect();
+    // Several speakers in one slice: each block gets a tag the model has to
+    // keep, so the blocks are matched by their tags and not by counting blank
+    // lines. Models merge the short turns of a fast conversation ("嗯。")
+    // and the slice was rejected for it: 35 of 123 slices in a two speaker
+    // podcast, each costing a wasted request.
+    let tagged = (2..=BLOCK_TAGS).contains(&blocks.len());
+    let (bare, instruction) = if tagged {
+        let instruction = match extra_instruction {
+            Some(extra) => format!("{extra}\n\n{TAG_INSTRUCTION}"),
+            None => TAG_INSTRUCTION.to_string(),
+        };
+        (tag_blocks(&bare_blocks), Some(instruction))
+    } else {
+        (
+            bare_blocks.join("\n\n"),
+            extra_instruction.map(str::to_string),
+        )
+    };
+    let outcome = enhance_outcome_with(&bare, settings, instruction.as_deref(), before_validate)?;
     Some(match outcome {
         EnhanceOutcome::Enhanced { text, warnings } => {
-            let cleaned: Vec<String> = if text.split("\n\n").count() == blocks.len() {
+            let by_tag = if tagged {
+                split_tagged(&text, blocks.len())
+            } else {
+                None
+            };
+            let cleaned: Vec<String> = if let Some(by_tag) = by_tag {
+                by_tag
+            } else if text.split("\n\n").count() == blocks.len() && !has_block_tags(&text) {
                 text.split("\n\n").map(str::to_string).collect()
             } else if blocks.len() == 1 {
                 // One block going in: the paragraph breaks the model added
@@ -951,6 +975,60 @@ fn clean_slice_keeping_labels(
         EnhanceOutcome::Skipped { reason, .. } => EnhanceOutcome::skipped(slice, reason),
         EnhanceOutcome::RawFallback { reason, .. } => EnhanceOutcome::raw_fallback(slice, reason),
     })
+}
+
+/// Tags for the blocks of a slice with several speakers: `[A]`, `[B]`, ...
+/// They hold no digit (the number check would see one) and a slice has to fit
+/// in the alphabet.
+const BLOCK_TAGS: usize = 26;
+
+const TAG_INSTRUCTION: &str = "Each paragraph starts with a tag such as [A]. Keep every tag exactly as written, in the same order, at the start of its own paragraph. Never merge, split, move, drop or add paragraphs.";
+
+fn block_tag(index: usize) -> String {
+    format!("[{}]", char::from(b'A' + index as u8))
+}
+
+/// `[A] first block`, a blank line, `[B] second block`, and so on.
+fn tag_blocks(blocks: &[&str]) -> String {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| format!("{} {}", block_tag(index), block.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Whether `text` still holds one of the block tags.
+fn has_block_tags(text: &str) -> bool {
+    (0..BLOCK_TAGS).any(|index| text.contains(&block_tag(index)))
+}
+
+/// The text of each of `count` blocks in a model's answer, found by their
+/// tags whatever the model did with the blank lines between them. `None` when
+/// a tag is missing, out of order or repeated, when a block came back empty,
+/// or when there is text before the first tag.
+fn split_tagged(text: &str, count: usize) -> Option<Vec<String>> {
+    let mut starts = Vec::with_capacity(count);
+    let mut position = 0;
+    for index in 0..count {
+        let tag = block_tag(index);
+        let at = position + text[position..].find(&tag)?;
+        starts.push((at, at + tag.len()));
+        position = at + tag.len();
+    }
+    if !text[..starts[0].0].trim().is_empty() {
+        return None;
+    }
+    let mut blocks = Vec::with_capacity(count);
+    for (index, &(_, body)) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).map_or(text.len(), |next| next.0);
+        let block = text[body..end].trim();
+        if block.is_empty() || has_block_tags(block) {
+            return None;
+        }
+        blocks.push(block.to_string());
+    }
+    Some(blocks)
 }
 
 /// Join the paragraphs of `text` into one block: nothing between two wide
@@ -2826,5 +2904,26 @@ mod long_form_tests {
             skipped.outcome.text().split_whitespace().count(),
             text.split_whitespace().count()
         );
+    }
+
+    #[test]
+    fn blocks_are_tagged_and_found_again_by_their_tags() {
+        let tagged = tag_blocks(&["你好。", " 嗯。 ", "是的。"]);
+        assert_eq!(tagged, "[A] 你好。\n\n[B] 嗯。\n\n[C] 是的。");
+        // Blank lines gone, tags kept: still three blocks.
+        assert_eq!(
+            split_tagged("[A] 你好。 [B] 嗯。\n[C]\n是的。\n", 3),
+            Some(vec!["你好。".into(), "嗯。".into(), "是的。".into()])
+        );
+        // A tag missing, out of order, repeated, or text before the first.
+        assert_eq!(split_tagged("[A] 你好。 嗯。 [C] 是的。", 3), None);
+        assert_eq!(split_tagged("[B] 嗯。 [A] 你好。 [C] 是的。", 3), None);
+        assert_eq!(
+            split_tagged("[A] 你好。 [B] 嗯。 [B] 嗯。 [C] 是的。", 3),
+            None
+        );
+        assert_eq!(split_tagged("Here you go: [A] a [B] b", 2), None);
+        // A block that came back empty is a change.
+        assert_eq!(split_tagged("[A] a [B] [C] c", 3), None);
     }
 }

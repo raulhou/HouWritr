@@ -206,6 +206,11 @@ and recognition slips:
   cleaned at a time; the results are put back in order. A model on this PC
   gets one slice at a time.
 * `[m:ss]` markers are held back from the request and put back afterwards.
+* Speaker labels are held back too. When a section holds several speakers,
+  each speaker's block is sent with a tag (`[A]`, `[B]`, ...) that the model
+  must keep, and the answer is matched to the blocks by those tags, so a model
+  that merges the short turns of a fast conversation no longer fails the
+  section. A tag that is missing or out of order still counts as a change.
 * If most of the Chinese in a transcript is Simplified (or Traditional), every
   slice is told to write in that script, so a transcript does not drift
   between the two.
