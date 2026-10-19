@@ -22,7 +22,7 @@ Meeting recording
 
 File transcription
 * Drop in an audio or video file and get a transcript saved next to it.
-* A Jobs window shows what is running and waiting, and every job can be stopped.
+* A Jobs window shows what is running and waiting, and a file job can be stopped.
 
 Speaker labels
 * Optional "Speaker 1", "Speaker 2" labels, also worked out on your PC.
