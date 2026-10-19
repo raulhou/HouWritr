@@ -49,6 +49,8 @@ pub enum UserEvent {
         output: PathBuf,
         markdown: bool,
         window: mpsc::Sender<WindowMsg>,
+        /// Set when the user presses Stop in that popup.
+        stop: Arc<AtomicBool>,
     },
     /// The file dialog was dismissed, or decoding failed (`Some(reason)`).
     FileImportEnded(Option<String>),
@@ -79,6 +81,10 @@ struct FileJob {
     details: String,
     /// Popup window for this job. `None` (meetings) keeps the overlay pill.
     window: Option<mpsc::Sender<WindowMsg>>,
+    /// Set when the user presses Stop in the popup; `stop_sent` once the
+    /// worker was told.
+    stop: Option<Arc<AtomicBool>>,
+    stop_sent: bool,
     /// A non-final part of a rolling meeting transcription: it only feeds the
     /// worker's session and is never shown or delivered on its own.
     background: bool,
@@ -692,9 +698,16 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                 output,
                 markdown,
                 window,
+                stop,
             } => {
                 self.state.file_import_running = false;
-                self.dispatch_file(path, samples, output, markdown, window);
+                if stop.load(Ordering::Acquire) {
+                    // Stopped while the file was being read.
+                    info!(file = %path.display(), "transcription stopped before it started");
+                    let _ = window.send(WindowMsg::Stopped);
+                } else {
+                    self.dispatch_file(path, samples, output, markdown, window, stop);
+                }
             }
             UserEvent::MeetingNotesChoice(create_notes) => {
                 self.finish_pending_meeting(create_notes);
@@ -725,6 +738,19 @@ impl ApplicationHandler<UserEvent> for AppHandler {
 
 impl AppHandler {
     fn tick(&mut self, el: &ActiveEventLoop) {
+        // Stop pressed in a transcript window: tell the worker once.
+        for (id, job) in self.state.file_jobs.iter_mut() {
+            if !job.stop_sent
+                && job
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.load(Ordering::Acquire))
+            {
+                job.stop_sent = true;
+                info!(id, "transcription stop requested");
+                self.state.worker.stop_job(*id);
+            }
+        }
         while let Some(event) = self.state.worker.try_recv() {
             let finished = match &event {
                 WorkerEvent::JobCompleted { id, .. }
@@ -1026,6 +1052,7 @@ impl AppHandler {
         output: PathBuf,
         markdown: bool,
         window: mpsc::Sender<WindowMsg>,
+        stop: Arc<AtomicBool>,
     ) {
         let name = source
             .file_name()
@@ -1047,6 +1074,8 @@ impl AppHandler {
                 format_duration(seconds)
             ),
             window: Some(window),
+            stop: Some(stop),
+            stop_sent: false,
             background: false,
             session: None,
             partial: None,
@@ -1298,6 +1327,8 @@ impl AppHandler {
                 title: String::new(),
                 details: String::new(),
                 window: None,
+                stop: None,
+                stop_sent: false,
                 background: true,
                 session: Some((part, settings.clone())),
                 partial: None,
@@ -1398,6 +1429,8 @@ impl AppHandler {
             notes: create_notes,
             notes_output,
             window: None,
+            stop: None,
+            stop_sent: false,
             background: false,
             partial: Some(pending.session.partial),
             session: Some((part, pending.session.settings)),
@@ -2200,9 +2233,14 @@ impl AppHandler {
                     return;
                 }
                 if let Some(job) = file_job {
-                    job.tell_window(WindowMsg::Failed {
-                        error: "Cancelled because HouWritr is quitting".into(),
-                    });
+                    if job.stop_sent {
+                        job.tell_window(WindowMsg::Stopped);
+                        info!(id, "transcription job stopped by the user");
+                    } else {
+                        job.tell_window(WindowMsg::Failed {
+                            error: "Cancelled because HouWritr is quitting".into(),
+                        });
+                    }
                 }
                 info!(id, "transcription job discarded");
                 self.update_job_status();
@@ -2437,7 +2475,8 @@ fn import_file(
     engine: String,
 ) -> UserEvent {
     let (window, messages) = mpsc::channel();
-    if let Err(error) = transcript_window::spawn_window_thread(messages) {
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Err(error) = transcript_window::spawn_window_thread(messages, stop.clone()) {
         // The job still runs; the result is saved and revealed as usual.
         warn!(error = %error, "could not open the transcript window");
     }
@@ -2473,6 +2512,7 @@ fn import_file(
                 output,
                 markdown,
                 window,
+                stop,
             }
         }
         Err(error) => {
@@ -2549,6 +2589,8 @@ mod tests {
             title: String::new(),
             details: String::new(),
             window: window.then(|| std::sync::mpsc::channel().0),
+            stop: None,
+            stop_sent: false,
             background,
             session: None,
             partial: None,

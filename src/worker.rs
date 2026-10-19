@@ -322,6 +322,8 @@ pub struct Worker {
     latest_generation: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    /// Jobs the user stopped; the worker drops them at the next check.
+    stopped: Arc<Mutex<HashSet<u64>>>,
     pending_jobs_by_generation: Arc<Mutex<HashMap<u64, usize>>>,
     job_events: Mutex<JobEventTracker>,
     synthetic_events: Mutex<VecDeque<WorkerEvent>>,
@@ -344,6 +346,8 @@ impl Worker {
         let latest_generation = Arc::new(AtomicU64::new(0));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let discard_requested = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(HashSet::new()));
+        let worker_stopped = stopped.clone();
         let pending_jobs_by_generation = Arc::new(Mutex::new(HashMap::new()));
         let transition_gate = Arc::new(Mutex::new(()));
         let worker_generation = latest_generation.clone();
@@ -364,6 +368,7 @@ impl Worker {
                     worker_generation,
                     worker_shutdown,
                     worker_discard,
+                    worker_stopped,
                     worker_pending_jobs,
                     worker_transition_gate,
                 )
@@ -376,6 +381,7 @@ impl Worker {
             latest_generation,
             shutdown_requested,
             discard_requested,
+            stopped,
             pending_jobs_by_generation,
             job_events: Mutex::new(JobEventTracker::default()),
             synthetic_events: Mutex::new(VecDeque::new()),
@@ -416,6 +422,13 @@ impl Worker {
             return Err(error).context("send engine load command");
         }
         Ok(generation)
+    }
+
+    /// Stop job `id`, queued or running: it ends with `JobDiscarded` at the
+    /// next point where it checks (between transcription windows or cleanup
+    /// slices), and nothing of it is delivered.
+    pub fn stop_job(&self, id: u64) {
+        self.stopped.lock().insert(id);
     }
 
     pub fn cancel_load(&mut self) -> u64 {
@@ -666,6 +679,7 @@ fn worker_main(
     latest_generation: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    stopped: Arc<Mutex<HashSet<u64>>>,
     pending_jobs_by_generation: Arc<Mutex<HashMap<u64, usize>>>,
     transition_gate: Arc<Mutex<()>>,
 ) {
@@ -788,7 +802,8 @@ fn worker_main(
                 crate::log_files::begin(job.id, recording_kind(&job.config));
                 {
                     let _transition = transition_gate.lock();
-                    if discard_requested.load(Ordering::Acquire) {
+                    if discard_requested.load(Ordering::Acquire) || stopped.lock().contains(&job.id)
+                    {
                         let _ = event_tx.send(WorkerEvent::JobDiscarded { id: job.id });
                         continue;
                     }
@@ -875,8 +890,13 @@ fn worker_main(
                 let mut diarization = DiarizationOutcome::NotRequested;
                 let transcription = if job.config.long_form {
                     let interrupted = || {
-                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                            .is_some()
+                        interrupted_job_event(
+                            job.id,
+                            &stopped,
+                            &discard_requested,
+                            &engine_cancellation,
+                        )
+                        .is_some()
                     };
                     let send_progress = |stage: JobStage, done: usize, total: usize| {
                         let _ = event_tx.send(WorkerEvent::JobProgress {
@@ -978,6 +998,7 @@ fn worker_main(
                         let _transition = transition_gate.lock();
                         let event = terminal_job_event(
                             job.id,
+                            &stopped,
                             &discard_requested,
                             &engine_cancellation,
                             || WorkerEvent::JobFailed {
@@ -991,17 +1012,25 @@ fn worker_main(
                 };
                 {
                     let _transition = transition_gate.lock();
-                    if let Some(event) =
-                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                    {
+                    if let Some(event) = interrupted_job_event(
+                        job.id,
+                        &stopped,
+                        &discard_requested,
+                        &engine_cancellation,
+                    ) {
                         let _ = event_tx.send(event);
                         continue;
                     }
                 }
 
                 let interrupted_now = || {
-                    interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                        .is_some()
+                    interrupted_job_event(
+                        job.id,
+                        &stopped,
+                        &discard_requested,
+                        &engine_cancellation,
+                    )
+                    .is_some()
                 };
                 let send_cleaning_progress = |done: usize, total: usize| {
                     let _ = event_tx.send(WorkerEvent::JobProgress {
@@ -1026,44 +1055,45 @@ fn worker_main(
                 if deferred && !transcription_failed {
                     cleanup_report = Some(DEFERRED_CLEANUP);
                 }
-                let (final_text, enhancement_warning) = if job.config.should_enhance()
-                    && !transcription_failed
-                    && !deferred
-                {
-                    let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
-                    info!("enhancement requested");
-                    let cleaned = if job.config.long_form {
-                        clean_transcript(
-                            &raw_text,
-                            &job.config.settings,
-                            &mut gate,
-                            &interrupted_now,
-                            send_cleaning_progress,
-                        )
-                        .map(|cleaned| (cleaned.text, cleaned.warning, Some(cleaned.report)))
+                let (final_text, enhancement_warning) =
+                    if job.config.should_enhance() && !transcription_failed && !deferred {
+                        let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
+                        info!("enhancement requested");
+                        let cleaned = if job.config.long_form {
+                            clean_transcript(
+                                &raw_text,
+                                &job.config.settings,
+                                &mut gate,
+                                &interrupted_now,
+                                send_cleaning_progress,
+                            )
+                            .map(|cleaned| (cleaned.text, cleaned.warning, Some(cleaned.report)))
+                        } else {
+                            enhance::enhance_outcome(&raw_text, &job.config.settings, || {
+                                !interrupted_now()
+                            })
+                            .map(|outcome| {
+                                let (text, warning) = completed_cleanup(outcome);
+                                (text, warning, None)
+                            })
+                        };
+                        let Some((cleaned_text, warning, report)) = cleaned else {
+                            let _transition = transition_gate.lock();
+                            if let Some(event) = interrupted_job_event(
+                                job.id,
+                                &stopped,
+                                &discard_requested,
+                                &engine_cancellation,
+                            ) {
+                                let _ = event_tx.send(event);
+                            }
+                            continue;
+                        };
+                        cleanup_report = report;
+                        (cleaned_text, warning)
                     } else {
-                        enhance::enhance_outcome(&raw_text, &job.config.settings, || {
-                            !interrupted_now()
-                        })
-                        .map(|outcome| {
-                            let (text, warning) = completed_cleanup(outcome);
-                            (text, warning, None)
-                        })
+                        (raw_text.clone(), None)
                     };
-                    let Some((cleaned_text, warning, report)) = cleaned else {
-                        let _transition = transition_gate.lock();
-                        if let Some(event) =
-                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                        {
-                            let _ = event_tx.send(event);
-                        }
-                        continue;
-                    };
-                    cleanup_report = report;
-                    (cleaned_text, warning)
-                } else {
-                    (raw_text.clone(), None)
-                };
 
                 // Parts of a rolling meeting: remember everything but the last
                 // part's text; the last part carries the whole transcript.
@@ -1139,6 +1169,7 @@ fn worker_main(
                             // delivery still comes from the stitched whole.
                             let event = terminal_job_event(
                                 job.id,
+                                &stopped,
                                 &discard_requested,
                                 &engine_cancellation,
                                 || WorkerEvent::JobCompleted {
@@ -1201,6 +1232,7 @@ fn worker_main(
                             let _transition = transition_gate.lock();
                             if let Some(event) = interrupted_job_event(
                                 job.id,
+                                &stopped,
                                 &discard_requested,
                                 &engine_cancellation,
                             ) {
@@ -1216,18 +1248,21 @@ fn worker_main(
                 let chars = final_text.chars().count();
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let _transition = transition_gate.lock();
-                let event =
-                    terminal_job_event(job.id, &discard_requested, &engine_cancellation, || {
-                        WorkerEvent::JobCompleted {
-                            id: job.id,
-                            text: final_text,
-                            diarization,
-                            cleanup: final_report,
-                            repair: repair_plan.filter(|plan| !plan.is_complete()),
-                            notes: notes_text,
-                            enhancement_warning,
-                        }
-                    });
+                let event = terminal_job_event(
+                    job.id,
+                    &stopped,
+                    &discard_requested,
+                    &engine_cancellation,
+                    || WorkerEvent::JobCompleted {
+                        id: job.id,
+                        text: final_text,
+                        diarization,
+                        cleanup: final_report,
+                        repair: repair_plan.filter(|plan| !plan.is_complete()),
+                        notes: notes_text,
+                        enhancement_warning,
+                    },
+                );
                 if matches!(&event, WorkerEvent::JobCompleted { .. }) {
                     info!(id = job.id, chars, elapsed_ms, "transcription job complete");
                 }
@@ -1854,10 +1889,11 @@ fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>
 
 fn interrupted_job_event(
     id: u64,
+    stopped: &Mutex<HashSet<u64>>,
     discard_requested: &AtomicBool,
     engine_cancellation: &Option<CancellationToken>,
 ) -> Option<WorkerEvent> {
-    if discard_requested.load(Ordering::Acquire) {
+    if discard_requested.load(Ordering::Acquire) || stopped.lock().contains(&id) {
         Some(WorkerEvent::JobDiscarded { id })
     } else if engine_cancellation
         .as_ref()
@@ -1875,11 +1911,13 @@ fn interrupted_job_event(
 
 fn terminal_job_event(
     id: u64,
+    stopped: &Mutex<HashSet<u64>>,
     discard_requested: &AtomicBool,
     engine_cancellation: &Option<CancellationToken>,
     otherwise: impl FnOnce() -> WorkerEvent,
 ) -> WorkerEvent {
-    interrupted_job_event(id, discard_requested, engine_cancellation).unwrap_or_else(otherwise)
+    interrupted_job_event(id, stopped, discard_requested, engine_cancellation)
+        .unwrap_or_else(otherwise)
 }
 
 fn should_process_load(
@@ -3107,6 +3145,29 @@ mod tests {
         );
         assert_eq!(&*calls.lock(), &[3]);
         assert_eq!(&*loads.lock(), &["ready", "ready"]);
+    }
+
+    #[test]
+    fn a_stopped_job_is_dropped_and_the_next_one_runs() {
+        let (mut worker, calls, _, _) = worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let config = || job_config(Settings::default(), RecordingIntent::Raw);
+        let first = worker.enqueue(vec![1.0], 16_000, config()).unwrap();
+        let stopped = worker.enqueue(vec![2.0], 16_000, config()).unwrap();
+        let last = worker.enqueue(vec![3.0], 16_000, config()).unwrap();
+        worker.stop_job(stopped);
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == last),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::JobDiscarded { id } if *id == stopped)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == first)));
+        assert_eq!(&*calls.lock(), &[1, 3]);
     }
 
     #[test]

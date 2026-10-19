@@ -79,6 +79,8 @@ pub enum WindowMsg {
     Failed {
         error: String,
     },
+    /// The job was stopped from this window; nothing was saved.
+    Stopped,
     /// AI cleanup of the saved transcript is being retried in the
     /// background: `text` says where it stands. `active` while a retry runs;
     /// `settled` once nothing is left to retry (finished or given up).
@@ -113,6 +115,10 @@ pub struct WindowState {
     pub total: usize,
     pub finished: Option<Finished>,
     pub error: Option<String>,
+    /// The user stopped the job (`Stop` was pressed, the app confirmed).
+    pub stopped: bool,
+    /// `Stop` was pressed; waiting for the app to confirm.
+    pub stop_requested: bool,
     /// A background retry of AI cleanup, after the transcript was saved.
     pub retry: Option<RetryStatus>,
     /// The tray process went away (stdin closed) before the job finished.
@@ -146,6 +152,8 @@ impl WindowState {
             total: 0,
             finished: None,
             error: None,
+            stopped: false,
+            stop_requested: false,
             retry: None,
             parent_gone: false,
             started: now,
@@ -203,6 +211,9 @@ impl WindowState {
             WindowMsg::Failed { error } => {
                 self.error = Some(error);
             }
+            WindowMsg::Stopped => {
+                self.stopped = true;
+            }
             WindowMsg::Retry {
                 text,
                 active,
@@ -229,7 +240,7 @@ impl WindowState {
     }
 
     pub fn is_running(&self) -> bool {
-        self.finished.is_none() && self.error.is_none()
+        self.finished.is_none() && self.error.is_none() && !self.stopped
     }
 
     /// Progress of the current stage in `0.0..=1.0`, when it is measurable.
@@ -302,32 +313,58 @@ fn word_count(text: &str) -> usize {
 // Tray side: spawn the child and stream messages to it.
 // ---------------------------------------------------------------------------
 
+/// What the window prints when the user presses `Stop`.
+const STOP_LINE: &str = "stop";
+
 /// Launch the popup and forward everything received on `messages` to it.
 ///
 /// Runs on its own thread because `CreateProcess` can block for seconds on
 /// ARM64 with real-time scanning. The thread ends when the sender is dropped
 /// or the window is closed (write fails); it never kills the child.
-pub fn spawn_window_thread(messages: Receiver<WindowMsg>) -> std::io::Result<()> {
+/// `stop` is set when the user presses `Stop` in the window.
+pub fn spawn_window_thread(
+    messages: Receiver<WindowMsg>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("transcript-window".into())
         .spawn(move || {
-            if let Err(error) = pump_messages(messages) {
+            if let Err(error) = pump_messages(messages, stop) {
                 warn!(error = %error, "transcript window ended early");
             }
         })
         .map(|_| ())
 }
 
-fn pump_messages(messages: Receiver<WindowMsg>) -> Result<()> {
+fn pump_messages(
+    messages: Receiver<WindowMsg>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut child = Command::new(exe)
         .arg("--transcript-window")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .context("start transcript window")?;
+    if let Some(output) = child.stdout.take() {
+        // The window's only message back: the user pressed Stop.
+        let _ = std::thread::Builder::new()
+            .name("transcript-window-out".into())
+            .spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    match line {
+                        Ok(line) if line.trim() == STOP_LINE => {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+    }
     let mut stdin = child.stdin.take().context("transcript window stdin")?;
     for message in messages {
         let mut line = serde_json::to_string(&message).context("encode window message")?;
@@ -452,7 +489,9 @@ impl eframe::App for TranscriptWindow {
             ui.heading(&self.state.title);
             ui.add_space(6.0);
 
-            if let Some(error) = &self.state.error {
+            if self.state.stopped {
+                ui.label("Stopped. Nothing was saved.");
+            } else if let Some(error) = &self.state.error {
                 settings_ui::inline_error(ui, format!("Transcription failed: {error}"));
             } else if self.state.finished.is_some() {
                 match self.state.retry.clone() {
@@ -510,6 +549,21 @@ impl eframe::App for TranscriptWindow {
                     timing.push_str(&format!(" · about {} left", format_clock(eta)));
                 }
                 ui.weak(timing);
+                ui.add_space(4.0);
+                if self.state.stop_requested {
+                    ui.weak("Stopping… (the current step finishes first)");
+                } else if ui
+                    .button("Stop")
+                    .on_hover_text("Stop this transcription. Nothing is saved.")
+                    .clicked()
+                {
+                    // The tray reads this window's output.
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(STOP_LINE.as_bytes());
+                    let _ = out.write_all(b"\n");
+                    let _ = out.flush();
+                    self.state.stop_requested = true;
+                }
             }
 
             ui.add_space(8.0);
@@ -564,6 +618,13 @@ impl eframe::App for TranscriptWindow {
             {
                 ui.add_space(6.0);
                 settings_ui::inline_error(ui, warning);
+            }
+
+            if self.state.stopped {
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
 
             if self.state.finished.is_some() {
