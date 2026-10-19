@@ -924,7 +924,13 @@ fn worker_main(
                                 // heard).
                                 Some(part) => {
                                     let state = sessions.entry(part.id).or_default();
-                                    let mapping = state.speakers.assign(&result.centroids);
+                                    let speech = asr::diarize::speech_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    let mapping = state
+                                        .speakers
+                                        .assign_with_speech(&result.centroids, &speech);
                                     let mut turns = result.turns;
                                     asr::diarize::remap_speakers(&mut turns, &mapping);
                                     if turns.is_empty() {
@@ -937,10 +943,27 @@ fn worker_main(
                                     }
                                 }
                                 None => {
-                                    let speakers = asr::diarize::speaker_count(&result.turns);
+                                    // Voices heard for a few seconds are not
+                                    // people of their own.
+                                    let speech = asr::diarize::speech_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    let merges = asr::diarize::weak_speaker_merges(
+                                        &result.centroids,
+                                        &speech,
+                                    );
+                                    let turns =
+                                        asr::diarize::merge_speakers(&result.turns, &merges);
+                                    let speakers = asr::diarize::speaker_count(&turns);
+                                    info!(
+                                        found = asr::diarize::speaker_count(&result.turns),
+                                        kept = speakers,
+                                        "speakers after merging the ones heard only briefly"
+                                    );
                                     if speakers >= 2 {
                                         diarization = DiarizationOutcome::Labelled { speakers };
-                                        Some(result.turns)
+                                        Some(turns)
                                     } else {
                                         diarization = DiarizationOutcome::SingleSpeaker;
                                         None
@@ -1112,6 +1135,7 @@ fn worker_main(
                         if part.last {
                             let mut state = sessions.remove(&part.id).unwrap_or_default();
                             let mut own = own;
+                            state.consolidate_speakers(&mut own);
                             if deferred {
                                 let _ =
                                     event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
@@ -1551,6 +1575,45 @@ impl PartText {
     }
 }
 
+/// `text` with the number of each `[m:ss] Speaker N:` block head replaced by
+/// `number(N - 1) + 1`. Blocks without such a head are left as they are.
+fn relabel_blocks(text: &str, number: &mut dyn FnMut(usize) -> usize) -> String {
+    let mut relabelled = String::with_capacity(text.len());
+    for (index, block) in text.split("\n\n").enumerate() {
+        if index > 0 {
+            relabelled.push_str("\n\n");
+        }
+        match speaker_label(block) {
+            Some((digits, speaker)) => {
+                relabelled.push_str(&block[..digits.start]);
+                relabelled.push_str(&(number(speaker - 1) + 1).to_string());
+                relabelled.push_str(&block[digits.end..]);
+            }
+            None => relabelled.push_str(block),
+        }
+    }
+    relabelled
+}
+
+/// Where the number is in a block that starts `[m:ss] Speaker N:` (the stamp
+/// is optional), and the number.
+fn speaker_label(block: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    let start = if block.starts_with('[') {
+        block.find("] ")? + 2
+    } else {
+        0
+    };
+    block.get(start..)?.strip_prefix("Speaker ")?;
+    let number_start = start + "Speaker ".len();
+    let rest = block.get(number_start..)?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(':') {
+        return None;
+    }
+    let speaker: usize = rest[..digits].parse().ok()?;
+    (speaker >= 1).then_some((number_start..number_start + digits, speaker))
+}
+
 /// A rolling meeting transcription, put together.
 struct Stitched {
     text: String,
@@ -1570,9 +1633,51 @@ struct SessionState {
     labelled: bool,
     diarization_failure: Option<String>,
     cleanup_warning: Option<FallbackReason>,
+    /// Speakers left after [`consolidate_speakers`](Self::consolidate_speakers).
+    final_speakers: Option<usize>,
 }
 
 impl SessionState {
+    /// Once the whole meeting is known, count speakers heard only briefly as
+    /// the closest voice heard properly (see `weak_speaker_merges`) and number
+    /// everyone by first appearance, in the recognised and the cleaned text of
+    /// every part. Each five minute part is clustered on its own, and a few
+    /// seconds of applause or one word over the speakers used to become a
+    /// speaker of its own: 28 of them in a meeting of five people.
+    fn consolidate_speakers(&mut self, own: &mut PartText) {
+        let merges = self.speakers.merges();
+        if merges.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        for part in self.parts.iter().chain(std::iter::once(&*own)) {
+            relabel_blocks(&part.text, &mut |speaker| {
+                let counted_as = merges.get(speaker).copied().unwrap_or(speaker);
+                if !order.contains(&counted_as) {
+                    order.push(counted_as);
+                }
+                speaker
+            });
+        }
+        let mut number = |speaker: usize| {
+            let counted_as = merges.get(speaker).copied().unwrap_or(speaker);
+            order
+                .iter()
+                .position(|&s| s == counted_as)
+                .unwrap_or(speaker)
+        };
+        for part in self.parts.iter_mut().chain(std::iter::once(own)) {
+            part.text = relabel_blocks(&part.text, &mut number);
+            part.raw = relabel_blocks(&part.raw, &mut number);
+        }
+        info!(
+            found = self.speakers.len(),
+            kept = order.len(),
+            "speakers after merging the ones heard only briefly"
+        );
+        self.final_speakers = Some(order.len());
+    }
+
     /// Remember what a finished part contributed besides its text.
     fn note_part(&mut self, diarization: &DiarizationOutcome, warning: &Option<FallbackReason>) {
         match diarization {
@@ -1597,7 +1702,7 @@ impl SessionState {
     ) -> Stitched {
         let labelled =
             self.labelled || matches!(own_diarization, DiarizationOutcome::Labelled { .. });
-        let speakers = self.speakers.len();
+        let speakers = self.final_speakers.unwrap_or_else(|| self.speakers.len());
         let mut report = enhance::CleanupReport::default();
         let mut pieces = Vec::new();
         for part in self.parts.into_iter().chain(std::iter::once(own)) {
@@ -2607,6 +2712,55 @@ mod tests {
             .collect();
         state.speakers.assign(&voices);
         state
+    }
+
+    #[test]
+    fn block_heads_are_relabelled_and_other_text_is_left_alone() {
+        let text = "[0:00] Speaker 1: hello Speaker 2: there\n\n[0:05] Speaker 12: hi\n\nSpeaker 3: no stamp\n\nplain words\n\n[0:09] Speaker x: odd";
+        let mut seen = Vec::new();
+        let out = relabel_blocks(text, &mut |speaker| {
+            seen.push(speaker);
+            speaker + 1
+        });
+        assert_eq!(
+            out,
+            "[0:00] Speaker 2: hello Speaker 2: there\n\n[0:05] Speaker 13: hi\n\nSpeaker 4: no stamp\n\nplain words\n\n[0:09] Speaker x: odd"
+        );
+        assert_eq!(seen, vec![0, 11, 2]);
+    }
+
+    #[test]
+    fn briefly_heard_speakers_join_the_closest_voice_across_the_meeting() {
+        let minute = 60 * 16_000;
+        let voice = |angle: f32| vec![angle.cos(), angle.sin()];
+        let mut state = SessionState::default();
+        // Two real people, then a stray voice that sounds close to the second.
+        state
+            .speakers
+            .assign_with_speech(&[voice(0.0), voice(2.0)], &[10 * minute, 5 * minute]);
+        state
+            .speakers
+            .assign_with_speech(&[voice(4.0)], &[20 * 16_000]);
+        assert_eq!(state.speakers.len(), 3);
+        state.labelled = true;
+        state.parts = parts(&["[0:00] Speaker 2: question\n\n[0:05] Speaker 1: answer"]);
+        let mut own = PartText::plain("[5:00] Speaker 3: thanks\n\n[5:03] Speaker 1: yes".into());
+        state.consolidate_speakers(&mut own);
+        // Speaker 3 counts as speaker 2; numbering follows first appearance.
+        assert_eq!(
+            state.parts[0].text,
+            "[0:00] Speaker 1: question\n\n[0:05] Speaker 2: answer"
+        );
+        assert_eq!(
+            own.text,
+            "[5:00] Speaker 1: thanks\n\n[5:03] Speaker 2: yes"
+        );
+        assert_eq!(own.raw, own.text);
+        let stitched = state.finish(own, None, DiarizationOutcome::Labelled { speakers: 3 });
+        assert_eq!(
+            stitched.outcome,
+            DiarizationOutcome::Labelled { speakers: 2 }
+        );
     }
 
     fn parts(texts: &[&str]) -> Vec<PartText> {

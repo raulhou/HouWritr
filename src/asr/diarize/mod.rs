@@ -43,6 +43,15 @@ const MAX_EMBED_SAMPLES: usize = 6 * 16_000;
 const MIN_TURN_SAMPLES: usize = 4_000;
 /// Same-speaker turns separated by less than this are joined.
 const MAX_GAP_SAMPLES: usize = 8_000;
+/// Someone heard for less than this in one part of a meeting is not given a
+/// number of their own: a voice print from a few seconds of speech (applause,
+/// a cough, a word over the speakers) is too unreliable to tell people apart.
+const NEW_SPEAKER_MIN_SAMPLES: usize = 15 * 16_000;
+/// Over a whole recording, a speaker needs at least this much speech, or this
+/// share of all the speech, to keep a number. The rest are attached to the
+/// closest voice that does.
+const KEPT_SPEAKER_MIN_SAMPLES: usize = 30 * 16_000;
+const KEPT_SPEAKER_MIN_SHARE: f32 = 0.02;
 
 /// Result of diarizing one stretch of audio.
 #[derive(Clone, Debug)]
@@ -216,12 +225,90 @@ fn normalize(vector: &mut [f32]) {
     }
 }
 
+/// Samples of speech each speaker id has in `turns`, for ids `0..count`.
+pub fn speech_per_speaker(turns: &[Turn], count: usize) -> Vec<usize> {
+    let mut speech = vec![0usize; count];
+    for turn in turns {
+        if let Some(total) = speech.get_mut(turn.speaker) {
+            *total += turn.end.saturating_sub(turn.start);
+        }
+    }
+    speech
+}
+
+/// For each speaker, the one it is counted as: itself when it has enough
+/// speech to be a person of its own, otherwise the closest voice that has.
+/// Clustering on short, noisy stretches splits one person into several, and
+/// applause or a stray word becomes a speaker; this is what turned a
+/// five person meeting into 28 speakers.
+pub fn weak_speaker_merges(centroids: &[Vec<f32>], speech: &[usize]) -> Vec<usize> {
+    let count = centroids.len().min(speech.len());
+    let total: usize = speech.iter().take(count).sum();
+    let floor = KEPT_SPEAKER_MIN_SAMPLES.max((total as f32 * KEPT_SPEAKER_MIN_SHARE) as usize);
+    let mut kept: Vec<usize> = (0..count).filter(|&i| speech[i] >= floor).collect();
+    if kept.is_empty() {
+        // Nobody reaches the floor (a short recording): the most heard stays.
+        kept.extend((0..count).max_by_key(|&i| speech[i]));
+    }
+    (0..count)
+        .map(|speaker| {
+            if kept.contains(&speaker) {
+                return speaker;
+            }
+            kept.iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    similarity(&centroids[speaker], &centroids[a])
+                        .total_cmp(&similarity(&centroids[speaker], &centroids[b]))
+                })
+                .unwrap_or(speaker)
+        })
+        .collect()
+}
+
+fn similarity(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Count each speaker as `merges` says, number them by first appearance, and
+/// join turns of the same speaker that now sit next to each other.
+pub fn merge_speakers(turns: &[Turn], merges: &[usize]) -> Vec<Turn> {
+    let mut order: Vec<usize> = Vec::new();
+    let mut merged: Vec<Turn> = Vec::new();
+    for turn in turns {
+        let counted_as = merges.get(turn.speaker).copied().unwrap_or(turn.speaker);
+        let speaker = match order.iter().position(|&s| s == counted_as) {
+            Some(position) => position,
+            None => {
+                order.push(counted_as);
+                order.len() - 1
+            }
+        };
+        match merged.last_mut() {
+            Some(last)
+                if last.speaker == speaker
+                    && turn.start.saturating_sub(last.end) <= MAX_GAP_SAMPLES =>
+            {
+                last.end = turn.end.max(last.end);
+            }
+            _ => merged.push(Turn {
+                start: turn.start,
+                end: turn.end,
+                speaker,
+            }),
+        }
+    }
+    merged
+}
+
 /// Speakers seen so far across the separately diarized parts of one
 /// recording, so "Speaker 1" in hour one is still "Speaker 1" in hour two.
 #[derive(Debug, Default)]
 pub struct SpeakerBook {
     /// (centroid, how many parts have contributed to it)
     speakers: Vec<(Vec<f32>, usize)>,
+    /// Samples of speech heard from each speaker, in all parts so far.
+    speech: Vec<usize>,
 }
 
 impl SpeakerBook {
@@ -237,8 +324,23 @@ impl SpeakerBook {
     /// at most once per part, since two different people talking in the same
     /// part must stay different. Everyone left over becomes a new speaker.
     pub fn assign(&mut self, centroids: &[Vec<f32>]) -> Vec<usize> {
+        let speech = vec![NEW_SPEAKER_MIN_SAMPLES; centroids.len()];
+        self.assign_with_speech(centroids, &speech)
+    }
+
+    /// [`assign`](Self::assign) knowing how much speech each local speaker
+    /// has in this part. One with very little is never made a new speaker:
+    /// it goes to the closest known voice and leaves that voice print alone.
+    pub fn assign_with_speech(&mut self, centroids: &[Vec<f32>], speech: &[usize]) -> Vec<usize> {
+        let weak = |local: usize| {
+            speech.get(local).copied().unwrap_or(usize::MAX) < NEW_SPEAKER_MIN_SAMPLES
+                && !self.speakers.is_empty()
+        };
         let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
         for (local, centroid) in centroids.iter().enumerate() {
+            if weak(local) {
+                continue;
+            }
             for (global, (known, _)) in self.speakers.iter().enumerate() {
                 let dot: f32 = centroid.iter().zip(known).map(|(a, b)| a * b).sum();
                 let distance = 1.0 - dot;
@@ -249,12 +351,14 @@ impl SpeakerBook {
         }
         pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+        let weak_locals: Vec<bool> = (0..centroids.len()).map(weak).collect();
         let mut mapping: Vec<Option<usize>> = vec![None; centroids.len()];
         let mut used = vec![false; self.speakers.len()];
         for (_, local, global) in pairs {
             if mapping[local].is_none() && !used[global] {
                 mapping[local] = Some(global);
                 used[global] = true;
+                self.speech[global] += speech.get(local).copied().unwrap_or(0);
                 let (known, weight) = &mut self.speakers[global];
                 for (k, c) in known.iter_mut().zip(&centroids[local]) {
                     *k = *k * *weight as f32 + c;
@@ -263,16 +367,36 @@ impl SpeakerBook {
                 normalize(known);
             }
         }
+        let known = self.speakers.len();
         mapping
             .into_iter()
             .enumerate()
             .map(|(local, matched)| {
-                matched.unwrap_or_else(|| {
-                    self.speakers.push((centroids[local].clone(), 1));
-                    self.speakers.len() - 1
-                })
+                if let Some(global) = matched {
+                    return global;
+                }
+                if weak_locals[local] {
+                    let closest = (0..known).max_by(|&a, &b| {
+                        similarity(&centroids[local], &self.speakers[a].0)
+                            .total_cmp(&similarity(&centroids[local], &self.speakers[b].0))
+                    });
+                    if let Some(global) = closest {
+                        self.speech[global] += speech.get(local).copied().unwrap_or(0);
+                        return global;
+                    }
+                }
+                self.speakers.push((centroids[local].clone(), 1));
+                self.speech.push(speech.get(local).copied().unwrap_or(0));
+                self.speakers.len() - 1
             })
             .collect()
+    }
+
+    /// Which speaker each one is counted as once the whole recording is
+    /// known: see [`weak_speaker_merges`].
+    pub fn merges(&self) -> Vec<usize> {
+        let centroids: Vec<Vec<f32>> = self.speakers.iter().map(|(c, _)| c.clone()).collect();
+        weak_speaker_merges(&centroids, &self.speech)
     }
 }
 
@@ -479,6 +603,56 @@ mod tests {
         assert_eq!(mapping[1], 0);
         assert_ne!(mapping[0], mapping[1]);
         assert_eq!(book.len(), 2);
+    }
+
+    #[test]
+    fn a_speaker_with_little_speech_is_never_a_new_person() {
+        let mut book = SpeakerBook::default();
+        let long = 60 * 16_000;
+        let short = 3 * 16_000;
+        // Part 1: two real speakers.
+        book.assign_with_speech(&[voice(0.0), voice(2.0)], &[long, long]);
+        // Part 2: a stray three seconds that sounds like nobody known.
+        let mapping = book.assign_with_speech(&[voice(4.0)], &[short]);
+        assert_eq!(book.len(), 2);
+        assert!(mapping[0] < 2);
+        // The voice print of the person it was attached to is unchanged.
+        assert!(similarity(&book.speakers[mapping[0]].0, &voice(4.0)) < 0.9);
+        // The very first speaker of a recording is always kept.
+        let mut fresh = SpeakerBook::default();
+        assert_eq!(fresh.assign_with_speech(&[voice(0.0)], &[short]), vec![0]);
+    }
+
+    #[test]
+    fn small_speakers_join_the_closest_voice_that_was_heard_enough() {
+        let centroids = vec![voice(0.0), voice(2.0), voice(0.1), voice(2.1), voice(4.0)];
+        let minute = 60 * 16_000;
+        let speech = vec![10 * minute, 8 * minute, 4 * 16_000, 2 * 16_000, 5 * 16_000];
+        let merges = weak_speaker_merges(&centroids, &speech);
+        assert_eq!(merges, vec![0, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn when_nobody_reaches_the_floor_the_most_heard_stays() {
+        let centroids = vec![voice(0.0), voice(2.0)];
+        let merges = weak_speaker_merges(&centroids, &[16_000, 5 * 16_000]);
+        assert_eq!(merges, vec![1, 1]);
+    }
+
+    #[test]
+    fn merged_speakers_are_numbered_by_first_appearance_and_neighbours_join() {
+        let turns = vec![
+            turn(0, 16_000, 2),
+            turn(16_000, 32_000, 0),
+            turn(32_000, 48_000, 3),
+            turn(48_000, 64_000, 2),
+        ];
+        // 3 counts as 0.
+        let merged = merge_speakers(&turns, &[0, 1, 2, 0]);
+        let ids: Vec<usize> = merged.iter().map(|t| t.speaker).collect();
+        assert_eq!(ids, vec![0, 1, 0]);
+        // 0 and 3 are now one person, so their turns join: 16k to 48k.
+        assert_eq!((merged[1].start, merged[1].end), (16_000, 48_000));
     }
 
     #[test]

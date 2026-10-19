@@ -177,7 +177,11 @@ Labels never remove speech: audio that cannot be attributed is transcribed with
 the neighbouring speaker. Labels are numbered in order of appearance and are
 **not** names. Accuracy drops with overlapping speech, short interjections,
 similar voices and poor audio, and one voice is sometimes split into two
-labels. With a single speaker the transcript stays unlabelled; if the models
+labels. To limit that, a voice heard for less than 30 seconds (or 2% of all the
+speech, if that is more) is counted as the closest voice that was heard enough,
+and in a meeting this is decided once, after Stop, across all the parts: applause or
+a stray word no longer becomes a "Speaker 17". The cost is that someone who only
+speaks briefly is labelled as another speaker. With a single speaker the transcript stays unlabelled; if the models
 cannot run you still get the transcript and a note saying so.
 
 The Speaker labels section also shows whether the models are installed, with
