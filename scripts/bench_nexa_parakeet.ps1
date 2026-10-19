@@ -1,7 +1,7 @@
 #requires -Version 7
 <#
 .SYNOPSIS
-    Benchmark nexa-sdk's Parakeet-NPU vs OpenWritr's CPU INT8 baseline.
+    Benchmark nexa-sdk's Parakeet-NPU vs HouWritr's CPU INT8 baseline.
 
 .DESCRIPTION
     Runs `nexa infer NexaAI/parakeet-tdt-0.6b-v3-npu --input <wav>` N times
@@ -21,8 +21,8 @@
 param(
     [string]$Model = 'NexaAI/parakeet-tdt-0.6b-v3-npu',
     [string[]]$Wavs = @(
-        "$env:LOCALAPPDATA\OpenWritr\models\parakeet-tdt-0.6b-v3\test_en.wav",
-        "$env:LOCALAPPDATA\OpenWritr\models\parakeet-tdt-0.6b-v3\test_de.wav"
+        "$env:LOCALAPPDATA\HouWritr\models\parakeet-tdt-0.6b-v3\test_en.wav",
+        "$env:LOCALAPPDATA\HouWritr\models\parakeet-tdt-0.6b-v3\test_de.wav"
     ),
     [int]$Runs = 5
 )

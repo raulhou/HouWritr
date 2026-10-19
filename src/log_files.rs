@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::paths;
 
 /// Set by the tray for the windows it opens, so they log into its file.
-const SESSION_LOG_VARIABLE: &str = "OPENWRITR_SESSION_LOG";
+const SESSION_LOG_VARIABLE: &str = "HOUWRITR_SESSION_LOG";
 
 /// Session logs kept; older ones are deleted when the tray starts.
 const KEEP_SESSIONS: usize = 30;
@@ -282,7 +282,7 @@ mod tests {
         let stamp = file_stamp(&utc_text(1_792_275_428));
         assert_eq!(stamp, "2026-10-17_22-17-08Z");
         assert!(has_stamp(Path::new(&format!("{stamp}_tray_4388.log"))));
-        assert!(!has_stamp(Path::new("openwritr.2026-10-17.log")));
+        assert!(!has_stamp(Path::new("houwritr.2026-10-17.log")));
         assert!(!has_stamp(Path::new("2026-10-17_22-17-08Z")));
     }
 

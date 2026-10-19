@@ -2,14 +2,14 @@
 # optional .msixbundle for upload.
 #
 # Prerequisites:
-#   - Both exes built:   cargo build --release --bin openwritr
-#                        cargo build --release --target x86_64-pc-windows-msvc --bin openwritr
+#   - Both exes built:   cargo build --release --bin houwritr
+#                        cargo build --release --target x86_64-pc-windows-msvc --bin houwritr
 #   - Release staged:    python scripts/prepare_release.py --arch arm64
 #                        python scripts/prepare_release.py --arch x64
 #   - Store assets:      python installer/make_icon.py
 #
 # Usage:
-#   .\scripts\build_msix.ps1 -IdentityName "12345TorstenMahr.OpenWritr" `
+#   .\scripts\build_msix.ps1 -IdentityName "12345TorstenMahr.HouWritr" `
 #                            -Publisher "CN=A1B2C3D4-...." `
 #                            [-Version 0.6.1.0]
 #
@@ -18,7 +18,7 @@
 # but the Store upload requires the real Partner Center identity values.
 
 param(
-    [string]$IdentityName = "TEST.OpenWritr",
+    [string]$IdentityName = "TEST.HouWritr",
     [string]$Publisher = "CN=TEST",
     [string]$Version = "0.6.1.0",
     [switch]$RequireStoreIdentity
@@ -29,7 +29,7 @@ if ([string]::IsNullOrWhiteSpace($IdentityName) -or
     [string]::IsNullOrWhiteSpace($Publisher)) {
     throw "MSIX identity name and publisher must both be provided"
 }
-$usesTestIdentity = $IdentityName -eq "TEST.OpenWritr" -or $Publisher -eq "CN=TEST"
+$usesTestIdentity = $IdentityName -eq "TEST.HouWritr" -or $Publisher -eq "CN=TEST"
 if ($RequireStoreIdentity -and $usesTestIdentity) {
     throw "Store MSIX build requires the real Partner Center identity name and publisher"
 }
@@ -63,7 +63,7 @@ foreach ($arch in @("arm64", "x64")) {
                           Replace("{ARCH}", $arch)
     Set-Content "$stage\AppxManifest.xml" $manifest -Encoding utf8
 
-    $msix = Join-Path $dist "openwritr-$arch-$Version.msix"
+    $msix = Join-Path $dist "houwritr-$arch-$Version.msix"
     Remove-Item $msix -Force -ErrorAction SilentlyContinue
     & $makeappx pack /d $stage /p $msix /o | Select-Object -Last 1
     if ($LASTEXITCODE -ne 0) { throw "makeappx failed for $arch" }
@@ -76,7 +76,7 @@ $bundleDir = Join-Path $root "target\msix-bundle"
 Remove-Item $bundleDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $bundleDir | Out-Null
 foreach ($p in $packages) { Copy-Item $p $bundleDir }
-$bundle = Join-Path $dist "openwritr-$Version.msixbundle"
+$bundle = Join-Path $dist "houwritr-$Version.msixbundle"
 Remove-Item $bundle -Force -ErrorAction SilentlyContinue
 & $makeappx bundle /d $bundleDir /p $bundle /o | Select-Object -Last 1
 if ($LASTEXITCODE -ne 0) { throw "makeappx bundle failed" }

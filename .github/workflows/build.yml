@@ -39,7 +39,7 @@ jobs:
           . .\scripts\envup.ps1 -Arch arm64
           cargo build --release --bins
           . .\scripts\envup.ps1 -Arch x64
-          cargo build --release --target x86_64-pc-windows-msvc --bin openwritr
+          cargo build --release --target x86_64-pc-windows-msvc --bin houwritr
 
       # Runtime files are staged after Cargo finishes so Cargo's target
       # directory cleanup cannot remove non-Cargo DLLs.
@@ -58,9 +58,9 @@ jobs:
       - name: Run staged self-checks
         shell: pwsh
         run: |
-          $arm = Start-Process target\stage\arm64\openwritr.exe -ArgumentList "--self-check" -NoNewWindow -Wait -PassThru
+          $arm = Start-Process target\stage\arm64\houwritr.exe -ArgumentList "--self-check" -NoNewWindow -Wait -PassThru
           if ($arm.ExitCode -ne 0) { throw "ARM64 self-check failed" }
-          $x64 = Start-Process target\stage\x64\openwritr.exe -ArgumentList "--self-check" -NoNewWindow -Wait -PassThru
+          $x64 = Start-Process target\stage\x64\houwritr.exe -ArgumentList "--self-check" -NoNewWindow -Wait -PassThru
           if ($x64.ExitCode -ne 0) { throw "x64 self-check failed" }
 
       - name: Package and verify ZIP files
@@ -80,9 +80,9 @@ jobs:
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = $metadata.packages[0].version
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc /Qp "/DAppVersion=$version" installer\openwritr.iss
+          & $iscc /Qp "/DAppVersion=$version" installer\houwritr.iss
           if ($LASTEXITCODE -ne 0) { throw "ARM64 installer build failed" }
-          & $iscc /Qp "/DAppVersion=$version" installer\openwritr-x64.iss
+          & $iscc /Qp "/DAppVersion=$version" installer\houwritr-x64.iss
           if ($LASTEXITCODE -ne 0) { throw "x64 installer build failed" }
 
       - name: Build and verify MSIX packages
@@ -103,8 +103,8 @@ jobs:
           } else {
             .\scripts\build_msix.ps1 -Version $version
           }
-          python scripts\verify_artifact.py --arch arm64 --artifact "target\dist\openwritr-arm64-$version.msix" --format msix
-          python scripts\verify_artifact.py --arch x64 --artifact "target\dist\openwritr-x64-$version.msix" --format msix
+          python scripts\verify_artifact.py --arch arm64 --artifact "target\dist\houwritr-arm64-$version.msix" --format msix
+          python scripts\verify_artifact.py --arch x64 --artifact "target\dist\houwritr-x64-$version.msix" --format msix
 
       - name: Report skipped Store package
         if: ${{ startsWith(github.ref, 'refs/tags/v') && (vars.MSIX_IDENTITY_NAME == '' || vars.MSIX_PUBLISHER == '') }}
@@ -118,7 +118,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location target\dist
-          $files = Get-ChildItem openwritr-* -File |
+          $files = Get-ChildItem houwritr-* -File |
             Where-Object { $_.Extension -in ".exe", ".zip" } |
             Sort-Object Name
           $lines = foreach ($file in $files) {
@@ -130,12 +130,12 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openwritr-dist
+          name: houwritr-dist
           path: |
-            target/dist/openwritr-windows-*.zip
-            target/dist/openwritr-windows-*-setup.exe
-            target/dist/openwritr-*.msix
-            target/dist/openwritr-*.msixbundle
+            target/dist/houwritr-windows-*.zip
+            target/dist/houwritr-windows-*-setup.exe
+            target/dist/houwritr-*.msix
+            target/dist/houwritr-*.msixbundle
             target/dist/SHA256SUMS.txt
           if-no-files-found: error
 
@@ -144,8 +144,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/dist/openwritr-windows-*.zip
-            target/dist/openwritr-windows-*-setup.exe
+            target/dist/houwritr-windows-*.zip
+            target/dist/houwritr-windows-*-setup.exe
             target/dist/SHA256SUMS.txt
 
       - name: Install Microsoft Store CLI
@@ -170,5 +170,5 @@ jobs:
 
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = "$($metadata.packages[0].version).0"
-          $bundle = Join-Path $PWD "target\dist\openwritr-$version.msixbundle"
+          $bundle = Join-Path $PWD "target\dist\houwritr-$version.msixbundle"
           msstore publish $bundle --appId $env:STORE_PRODUCT_ID

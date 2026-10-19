@@ -66,7 +66,7 @@ at run time).
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  openwritr.exe (tray process, winit event loop on the main thread) │
+│  houwritr.exe (tray process, winit event loop on the main thread) │
 │                                                                    │
 │  tray menu ── file picker ── decode (Symphonia) → 16 kHz mono      │
 │           └── meeting capture: mic (cpal) + loopback (WASAPI)      │
@@ -154,7 +154,7 @@ are cut to one copy.
   for the optional local model, the pinned GenieX installer) and, only if you
   turn it on, AI cleanup and notes, which send transcript text to the provider
   you configured with your own credentials.
-* Settings, models and logs live under `%LOCALAPPDATA%\OpenWritr\`; API keys
+* Settings, models and logs live under `%LOCALAPPDATA%\HouWritr\`; API keys
   live in Windows Credential Manager. See [PRIVACY.md](../PRIVACY.md).
 
 ## Tech stack

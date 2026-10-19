@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-OpenWritr loads one process-wide ONNX Runtime DLL. On ARM64, the same
+HouWritr loads one process-wide ONNX Runtime DLL. On ARM64, the same
 runtime and QNN execution-provider stack serves Parakeet CPU, Parakeet NPU,
 and Whisper NPU, so their versions must move together.
 

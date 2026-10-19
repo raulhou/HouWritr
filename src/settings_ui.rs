@@ -2073,7 +2073,7 @@ impl eframe::App for SettingsApp {
 
         if self.show_about {
             let mut close_about = false;
-            egui::Modal::new(egui::Id::new("about_openwritr")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::new("about_houwritr")).show(ctx, |ui| {
                 ui.set_min_width(520.0);
                 egui::ScrollArea::vertical()
                     .max_height(560.0)

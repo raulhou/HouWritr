@@ -250,8 +250,7 @@ fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 /// Where a transcript goes when its own folder cannot be written:
 /// `Documents\HouWritr\<file name>`.
 fn fallback_output(output: &std::path::Path) -> Option<PathBuf> {
-    let documents = directories::UserDirs::new()?.document_dir()?.to_path_buf();
-    Some(documents.join("HouWritr").join(output.file_name()?))
+    Some(crate::paths::documents_dir()?.join(output.file_name()?))
 }
 
 /// "cleaned 21 of 25 sections" when some of the text is still as recognised.

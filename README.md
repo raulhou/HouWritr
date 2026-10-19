@@ -1,4 +1,4 @@
-# HouWritr for Windows
+# HouWritr
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Windows 11](https://img.shields.io/badge/Windows-11_24H2-0078D4?logo=windows)](https://github.com/raulhou/HouWritr)
@@ -51,23 +51,23 @@ no admin rights needed:
 Not sure? Snapdragon laptops report "ARM based processor" in Settings →
 System → About. Everything else is x64.
 
-**Installer.** Download `openwritr-windows-<arch>-vX.Y.Z-setup.exe` from
+**Installer.** Download `houwritr-windows-<arch>-vX.Y.Z-setup.exe` from
 [Releases](https://github.com/raulhou/HouWritr/releases/latest) and run it.
 It adds a Start menu entry, an optional start at sign in entry and an
 uninstaller under Settings → Apps.
 
-**Portable zip.** Download `openwritr-windows-<arch>-vX.Y.Z.zip`, unzip it
-into any folder and run `openwritr.exe`. The app finds its DLLs next to the
+**Portable zip.** Download `houwritr-windows-<arch>-vX.Y.Z.zip`, unzip it
+into any folder and run `houwritr.exe`. The app finds its DLLs next to the
 exe. Start at sign in is available here too (Settings → Startup) and is
 repaired automatically if you move the folder.
 
 > **Windows SmartScreen.** The binaries are not code signed yet, so the first
 > launch shows "Windows protected your PC". Click **More info → Run anyway**.
 > To check a download, compare its SHA-256 with `SHA256SUMS.txt` on the
-> release: `Get-FileHash .\openwritr-windows-<arch>-vX.Y.Z-setup.exe`.
+> release: `Get-FileHash .\houwritr-windows-<arch>-vX.Y.Z-setup.exe`.
 
 On first use the selected engine downloads its verified model files into
-`%LOCALAPPDATA%\OpenWritr\models\`: Parakeet CPU about 670 MB, Parakeet NPU
+`%LOCALAPPDATA%\HouWritr\models\`: Parakeet CPU about 670 MB, Parakeet NPU
 about 650 MB more, Whisper NPU a 2.0 GB archive (about 2.2 GB unpacked).
 Progress shows in the tray.
 
@@ -142,7 +142,7 @@ playing, only the microphone contributes).
   bars, or amber `Paused 12:34`. It steps aside while the status pill needs the
   same spot. Turn it off in Settings, or for the session from the tray. The
   tray icon turns red (recording) or amber (paused) either way.
-* Transcripts are saved to `Documents\OpenWritr\Meetings\Meeting <date>
+* Transcripts are saved to `Documents\HouWritr\Meetings\Meeting <date>
   <time>.txt`, named after when the meeting started. Quitting while recording
   saves what was recorded.
 
@@ -260,10 +260,12 @@ meetings.
     it writes. One Qwen3 4B file (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
     about 2.4 GB from Hugging Face), run two ways through GenieX's llama.cpp
     runtime:
-    * *Qwen3 4B on the NPU and CPU* (the default): split between the two by
-      llama.cpp. The faster choice (about 18 tokens a second on a Snapdragon
-      X Elite); on the test PC the CPU stayed below 50% with other work in
-      the foreground.
+    * *Qwen3 4B in hybrid mode* (the default): GenieX's `hybrid` setting, where
+      llama.cpp's scheduler chooses per step between the NPU and the CPU
+      (Qualcomm's documentation; GenieX does not log which one ran a step).
+      The faster choice (about 18 tokens a second on a Snapdragon X Elite);
+      on the test PC the CPU stayed below 50% with other work in the
+      foreground.
     * *Qwen3 4B on the NPU only*: all layers on the NPU. Steady (about 13
       tokens a second) and the lightest on the CPU.
 
@@ -329,7 +331,7 @@ Tray icon → right click → **Settings**:
 * **About, credits & support**: version, architecture, source, issues,
   privacy, licences, model and runtime credits.
 
-Settings are stored in `%LOCALAPPDATA%\OpenWritr\settings.json`, written
+Settings are stored in `%LOCALAPPDATA%\HouWritr\settings.json`, written
 atomically and picked up live, including edits made outside the app. Settings
 files from older (dictation) versions still load; their shortcut and paste
 options are ignored, and cleanup that used to need Shift is simply on.
@@ -339,18 +341,19 @@ options are ignored, and cleanup that used to need Shift is simply on.
 | What | Where |
 |---|---|
 | File transcripts | Next to the source file |
-| Meeting transcripts and notes | `Documents\OpenWritr\Meetings\` |
+| Meeting transcripts and notes | `Documents\HouWritr\Meetings\` |
 | Transcripts that could not be saved where they belong | `Documents\HouWritr\` |
-| Settings, models, logs | `%LOCALAPPDATA%\OpenWritr\` |
+| Settings, models, logs | `%LOCALAPPDATA%\HouWritr\` |
 | API keys | Windows Credential Manager |
 
-The data folders keep the OpenWritr name so existing installs keep their
-models and settings. `AppData` is hidden; paste `%LOCALAPPDATA%\OpenWritr`
-into the Explorer address bar to open it.
+The data folders were called OpenWritr before the rename. HouWritr moves them
+to the new name the first time it starts, with models and settings intact (the Credential Manager entry for an API key
+and the startup entry move too). `AppData` is hidden; paste
+`%LOCALAPPDATA%\HouWritr` into the Explorer address bar to open it.
 
 ## Logs and diagnostics
 
-Logs are in `%LOCALAPPDATA%\OpenWritr\logs`:
+Logs are in `%LOCALAPPDATA%\HouWritr\logs`:
 
 * `sessions\` holds one file per run of the app (the settings and transcript
   windows it opens write into the same file).
@@ -512,7 +515,7 @@ HouWritr/
 └── target/                gitignored build and staging output
 ```
 
-The shipped `openwritr.exe` does not call Python at runtime.
+The shipped `houwritr.exe` does not call Python at runtime.
 
 ## Development
 
@@ -523,7 +526,7 @@ cd HouWritr
 cargo build --release --bins
 python scripts/fetch_runtime.py --arch arm64
 python scripts/prepare_release.py --arch arm64
-target\stage\arm64\openwritr.exe --self-check
+target\stage\arm64\houwritr.exe --self-check
 ```
 
 For x64 packaging, stage the CPU runtime with:

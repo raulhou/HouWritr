@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 
-LOCALAPP = Path.home() / "AppData" / "Local" / "OpenWritr"
+LOCALAPP = Path.home() / "AppData" / "Local" / "HouWritr"
 MODELS = LOCALAPP / "models"
 CALIB_GLOB = str(LOCALAPP / "calibration" / "fleurs" / "*" / "*.wav")
 

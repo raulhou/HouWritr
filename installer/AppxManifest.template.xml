@@ -23,7 +23,7 @@
     ProcessorArchitecture="{ARCH}" />
 
   <Properties>
-    <DisplayName>OpenWritr</DisplayName>
+    <DisplayName>HouWritr</DisplayName>
     <PublisherDisplayName>Torsten Mahr</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>Meeting recording and audio/video transcription. Local transcription with NVIDIA Parakeet and Whisper on the Snapdragon Hexagon NPU (ARM64) or CPU (x64). No cloud, no telemetry.</Description>
@@ -39,9 +39,9 @@
   </Resources>
 
   <Applications>
-    <Application Id="OpenWritr" Executable="openwritr.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="HouWritr" Executable="houwritr.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="OpenWritr"
+        DisplayName="HouWritr"
         Description="Meeting recording and audio/video transcription, fully local."
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
@@ -57,8 +57,8 @@
              Enabled=false by default per Store policy friendliness — the
              installer's autostart task covered this for the GitHub build,
              Store users opt in via Settings → Apps → Startup. -->
-        <desktop:Extension Category="windows.startupTask" Executable="openwritr.exe" EntryPoint="Windows.FullTrustApplication">
-          <desktop:StartupTask TaskId="OpenWritrStartup" Enabled="false" DisplayName="OpenWritr" />
+        <desktop:Extension Category="windows.startupTask" Executable="houwritr.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="HouWritrStartup" Enabled="false" DisplayName="HouWritr" />
         </desktop:Extension>
       </Extensions>
     </Application>

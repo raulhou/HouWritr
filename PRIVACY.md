@@ -22,7 +22,7 @@ servers operated by us.
 - HouWritr never pastes text or puts it on the Windows clipboard.
 - **Files you transcribe and meetings you record are saved as transcript
   files**: next to the imported file, and meetings under
-  `Documents\OpenWritr\Meetings`. A transcript that cannot be saved there
+  `Documents\HouWritr\Meetings`. A transcript that cannot be saved there
   goes to `Documents\HouWritr`. They stay on your PC until you delete them.
 
 ## Network access
@@ -58,8 +58,8 @@ HouWritr connects to the internet only for:
 ## Data stored on your device
 
 Settings, downloaded models, and a local diagnostic log are stored under
-`%LOCALAPPDATA%\OpenWritr\` on your machine (the folder keeps the name of
-the project HouWritr started from, so existing installs keep their models).
+`%LOCALAPPDATA%\HouWritr\` on your machine (an older OpenWritr folder is moved
+there the first time the app starts, so existing installs keep their models).
 They never leave it unless you choose to share a diagnostics export, which
 removes API keys and prompt text first. API keys you enter are kept in Windows
 Credential Manager, not in the settings file. Deleting that folder (or

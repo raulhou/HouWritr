@@ -69,7 +69,7 @@ impl EnhanceProvider {
                 ("Copilot-Integration-Id", "vscode-chat"),
                 (
                     "Editor-Version",
-                    concat!("OpenWritr/", env!("CARGO_PKG_VERSION")),
+                    concat!("HouWritr/", env!("CARGO_PKG_VERSION")),
                 ),
             ],
             EnhanceProvider::OpenAiCompatible => &[],

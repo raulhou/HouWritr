@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     let dist = PathBuf::from("target").join("dist");
     std::fs::create_dir_all(&dist).context("create target/dist")?;
     let output = dist.join(format!(
-        "openwritr-windows-{}-v{}.zip",
+        "houwritr-windows-{}-v{}.zip",
         architecture.as_str(),
         env!("CARGO_PKG_VERSION")
     ));

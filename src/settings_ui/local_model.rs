@@ -1,7 +1,7 @@
 //! "Local model" choice for AI cleanup: a model that runs on this PC.
 //!
 //! Two sources:
-//! * **Built-in** – OpenWritr manages Qualcomm's GenieX tool and a model on
+//! * **Built-in** – HouWritr manages Qualcomm's GenieX tool and a model on
 //!   the NPU or the CPU (see [`crate::local_llm`]): install the tool, pick
 //!   and download a model, done.
 //! * **Another local server** – any OpenAI-compatible server on this PC

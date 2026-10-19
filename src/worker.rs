@@ -1278,7 +1278,7 @@ fn worker_main(
     }
 }
 
-/// Stops OpenWritr's own local text model when dropped, if the job it was made
+/// Stops HouWritr's own local text model when dropped, if the job it was made
 /// for asks for that (see [`releases_local_model`]).
 struct ReleaseLocalModel(bool);
 

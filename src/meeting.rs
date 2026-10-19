@@ -33,7 +33,7 @@ use tracing::{info, warn};
 const MAX_MEETING_SECONDS: usize = 12 * 3600;
 const MAX_SAMPLES: usize = MAX_MEETING_SECONDS * TARGET_RATE as usize;
 /// Audio is cut off for transcription once this much is waiting. The
-/// `OPENWRITR_ROLL_SECONDS` environment variable shortens it so the rolling
+/// `HOUWRITR_ROLL_SECONDS` environment variable shortens it so the rolling
 /// behaviour can be tried with shorter parts.
 const ROLL_SECONDS: usize = 5 * 60;
 /// A pause only hands out a part if at least this much was recorded since
@@ -200,7 +200,7 @@ fn pieces_to_f32(pieces: Vec<Vec<i16>>) -> Vec<f32> {
 }
 
 fn roll_samples() -> usize {
-    std::env::var("OPENWRITR_ROLL_SECONDS")
+    std::env::var("HOUWRITR_ROLL_SECONDS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|seconds| *seconds >= 10)
@@ -324,7 +324,7 @@ impl MeetingRecorder {
     }
 
     /// Whether enough audio is waiting to be handed out for transcription
-    /// (five minutes, or `OPENWRITR_ROLL_SECONDS`).
+    /// (five minutes, or `HOUWRITR_ROLL_SECONDS`).
     pub fn roll_due(&self) -> bool {
         self.shared.mix.lock().pending() >= roll_samples()
     }
@@ -562,12 +562,10 @@ fn write(shared: &Shared, track: &mut Track) {
 }
 
 /// Transcript path for a meeting that started now:
-/// `Documents\OpenWritr\Meetings\Meeting YYYY-MM-DD HH-MM.txt`.
+/// `Documents\HouWritr\Meetings\Meeting YYYY-MM-DD HH-MM.txt`.
 pub fn default_output_path(local_time: LocalTime) -> std::path::PathBuf {
-    let base = directories::UserDirs::new()
-        .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(crate::paths::data_dir);
-    base.join("OpenWritr").join("Meetings").join(format!(
+    let base = crate::paths::documents_dir().unwrap_or_else(crate::paths::data_dir);
+    base.join("Meetings").join(format!(
         "Meeting {:04}-{:02}-{:02} {:02}-{:02}.txt",
         local_time.year, local_time.month, local_time.day, local_time.hour, local_time.minute
     ))
@@ -608,7 +606,7 @@ pub fn append_partial(path: &std::path::Path, text: &str) -> std::io::Result<()>
 }
 
 /// Notes path next to the transcript:
-/// `Documents\OpenWritr\Meetings\Meeting notes YYYY-MM-DD HH-MM.md`.
+/// `Documents\HouWritr\Meetings\Meeting notes YYYY-MM-DD HH-MM.md`.
 pub fn default_notes_path(local_time: LocalTime) -> std::path::PathBuf {
     let mut path = default_output_path(local_time);
     let name = format!(
@@ -866,7 +864,7 @@ mod tests {
     #[test]
     fn the_roll_threshold_defaults_to_five_minutes() {
         // (The override is read from the environment, which tests don't set.)
-        if std::env::var_os("OPENWRITR_ROLL_SECONDS").is_none() {
+        if std::env::var_os("HOUWRITR_ROLL_SECONDS").is_none() {
             assert_eq!(roll_samples(), 300 * TARGET_RATE as usize);
         }
         assert_eq!(MIN_PAUSE_SEGMENT_SAMPLES, 5 * TARGET_RATE as usize);

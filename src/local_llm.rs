@@ -1,7 +1,7 @@
 //! A language model that runs on this machine, for AI text cleanup and meeting
 //! notes.
 //!
-//! OpenWritr drives Qualcomm's GenieX command-line tool (`geniex serve` is an
+//! HouWritr drives Qualcomm's GenieX command-line tool (`geniex serve` is an
 //! OpenAI-compatible server that runs AI Hub models on the Hexagon NPU) as a
 //! private child process, and the normal OpenAI-compatible cleanup pipeline
 //! talks to it over loopback. Nothing is bound in-process: GenieX is a
@@ -12,7 +12,7 @@
 //! * finding (or, with the user's consent, installing) the official GenieX CLI;
 //! * downloading / removing the model with `geniex pull` / `geniex remove`;
 //! * starting `geniex serve` on a private port when a request needs it, and
-//!   stopping it again when idle or when OpenWritr exits.
+//!   stopping it again when idle or when HouWritr exits.
 //!
 //! The server is only ever started for the *managed* endpoint
 //! ([`MANAGED_BASE_URL`]). Any other loopback address (Ollama, LM Studio, a
@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::cleanup::EndpointScope;
 
-/// Private port for the server OpenWritr starts. Deliberately not GenieX's
+/// Private port for the server HouWritr starts. Deliberately not GenieX's
 /// default (18181) so it never collides with a server the user runs.
 pub const MANAGED_PORT: u16 = 18651;
 pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
@@ -56,8 +56,9 @@ const LEGACY_MODELS: &[&str] = &[
 pub enum Runtime {
     /// All layers on the NPU.
     NpuLlama,
-    /// Split between the NPU and the CPU by llama.cpp, which GenieX calls
-    /// the fast path on Snapdragon.
+    /// llama.cpp's per tensor scheduler between the NPU and the CPU, which
+    /// GenieX calls the fast path on Snapdragon. Shown to the user as
+    /// "hybrid mode"; GenieX's own log does not say which processor ran a step.
     Hybrid,
 }
 
@@ -66,7 +67,7 @@ impl Runtime {
     pub fn place(self) -> &'static str {
         match self {
             Runtime::NpuLlama => "NPU, llama.cpp",
-            Runtime::Hybrid => "NPU + CPU",
+            Runtime::Hybrid => "hybrid mode",
         }
     }
 
@@ -106,8 +107,8 @@ pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
     BuiltInModel {
         id: DEFAULT_MODEL,
         name: QWEN3_4B_GGUF,
-        label: "Qwen3 4B on the NPU and CPU",
-        detail: "About 2.4 GB from Hugging Face. Split between the NPU and the processor by llama.cpp: the faster choice (about 18 tokens a second on a Snapdragon X Elite).",
+        label: "Qwen3 4B in hybrid mode",
+        detail: "About 2.4 GB from Hugging Face. Hybrid mode: llama.cpp decides for each step whether the NPU or the processor does it. The faster choice (about 18 tokens a second on a Snapdragon X Elite).",
         runtime: Runtime::Hybrid,
         download_bytes: Some(QWEN3_4B_GGUF_BYTES),
     },
@@ -186,7 +187,7 @@ const IDLE_STOP: Duration = Duration::from_secs(5 * 60);
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Whether `endpoint` is the server OpenWritr manages itself.
+/// Whether `endpoint` is the server HouWritr manages itself.
 pub fn is_managed(endpoint: &EndpointScope) -> bool {
     endpoint.is_loopback()
         && endpoint.port() == Some(MANAGED_PORT)
@@ -975,7 +976,7 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
             );
         }
     }
-    // Everything the server prints goes into OpenWritr's log, so a model
+    // Everything the server prints goes into HouWritr's log, so a model
     // that fails or stalls can be diagnosed from one file.
     if let Some(stream) = child.stdout.take() {
         forward_output(stream, "stdout");
@@ -1000,11 +1001,11 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     Err(LocalLlmError::StartFailed("timed out".into()))
 }
 
-/// How loud a line of the server's output is in OpenWritr's log.
+/// How loud a line of the server's output is in HouWritr's log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineLevel {
     /// Two lines per model step (hundreds per reply): only with
-    /// `RUST_LOG=openwritr=debug`, where they time each part of the model.
+    /// `RUST_LOG=houwritr=debug`, where they time each part of the model.
     Debug,
     Info,
     /// The server or the NPU runtime reported an error.
@@ -1117,9 +1118,9 @@ pub fn server_exited() -> bool {
     }
 }
 
-/// Stop the server OpenWritr started, now, so the NPU and its memory go back
+/// Stop the server HouWritr started, now, so the NPU and its memory go back
 /// to the rest of the system. The next request starts it again (and reloads
-/// the model, about half a minute). Does nothing when OpenWritr did not start
+/// the model, about half a minute). Does nothing when HouWritr did not start
 /// a server, so a server the user runs is never touched. Also cancels
 /// whatever the server is still generating, e.g. a reply nobody waits for
 /// any more after a timeout.
@@ -1213,7 +1214,7 @@ pub fn forget_timeout() {
     TIMED_OUT.store(false, Ordering::Relaxed);
 }
 
-/// Stop the server (called when OpenWritr exits or the model is removed).
+/// Stop the server (called when HouWritr exits or the model is removed).
 pub fn shutdown() {
     // A model load can hold the lock for minutes; do not make quitting wait
     // for it (Windows ends the server with the app anyway).
@@ -1222,7 +1223,7 @@ pub fn shutdown() {
     }
 }
 
-/// Tie the child's life to ours: when OpenWritr exits for any reason, even a
+/// Tie the child's life to ours: when HouWritr exits for any reason, even a
 /// crash, Windows ends the server too, so the NPU is never left occupied.
 fn kill_with_parent(child: &Child) {
     use std::os::windows::io::AsRawHandle;

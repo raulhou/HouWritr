@@ -108,7 +108,7 @@ def main():
             helper.make_opsetid("", 17),
             helper.make_opsetid("com.microsoft", 1),
         ],
-        producer_name="openwritr-aihub-wrapper",
+        producer_name="houwritr-aihub-wrapper",
     )
     onnx.checker.check_model(model)
     onnx.save(model, str(out_path))

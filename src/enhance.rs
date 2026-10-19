@@ -15,12 +15,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Set when OpenWritr quits without finishing its work: requests still
+/// Set when HouWritr quits without finishing its work: requests still
 /// waiting for an answer are abandoned at once instead of holding up the exit
 /// for as long as their timeout.
 static CANCEL_REQUESTS: AtomicBool = AtomicBool::new(false);
 
-/// Abandon every cleanup or notes request in flight (OpenWritr is quitting).
+/// Abandon every cleanup or notes request in flight (HouWritr is quitting).
 pub fn cancel_requests() {
     CANCEL_REQUESTS.store(true, Ordering::Release);
 }
@@ -645,7 +645,7 @@ fn key_may_travel_to(endpoint: &EndpointScope) -> bool {
     endpoint.scheme() == "https" || endpoint.is_loopback()
 }
 
-/// Whether the target is the server OpenWritr starts itself (GenieX on the NPU).
+/// Whether the target is the server HouWritr starts itself (GenieX on the NPU).
 fn is_managed_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(crate::local_llm::is_managed)
 }
@@ -1038,7 +1038,7 @@ fn request_content(
         },
     };
 
-    // OpenWritr's own local model server is started on demand.
+    // HouWritr's own local model server is started on demand.
     if let Some(endpoint) = prepared.target.endpoint() {
         let model = prepared.body.get("model").and_then(|model| model.as_str());
         if let Err(error) = crate::local_llm::ensure_running(endpoint, model) {
@@ -2192,7 +2192,7 @@ mod long_form_tests {
         hybrid.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid".into();
         assert_eq!(
             cleanup_engine_label(&hybrid),
-            "Qwen3-4B-Instruct-2507-GGUF · this PC (NPU + CPU)"
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (hybrid mode)"
         );
     }
 
@@ -2239,7 +2239,7 @@ mod long_form_tests {
                 s.enhance.model = "ai-hub-models/Qwen3-4B-Instruct-2507".into();
                 s
             }),
-            "Qwen3-4B-Instruct-2507 · this PC (NPU + CPU)"
+            "Qwen3-4B-Instruct-2507 · this PC (hybrid mode)"
         );
         assert_eq!(
             cleanup_engine_label(&openai_settings("http://localhost:11434/v1")),

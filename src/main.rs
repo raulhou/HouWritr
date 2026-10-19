@@ -185,7 +185,7 @@ fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blockin
         cfg!(debug_assertions).then(|| tracing_subscriber::fmt::layer().with_ansi(false));
 
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "openwritr=info".into()))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "houwritr=info".into()))
         .with(file_layer)
         .with(recording_layer)
         .with(console_layer)
