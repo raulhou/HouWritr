@@ -19,7 +19,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -165,6 +165,25 @@ impl Repair {
             });
         }
     }
+}
+
+/// "Transcribing 3/12" and the fraction done, for the Jobs window.
+fn progress_text(progress: Option<&(JobStage, usize, usize)>) -> (String, Option<f32>) {
+    let Some(&(stage, done, total)) = progress else {
+        return ("Starting…".into(), None);
+    };
+    let label = match stage {
+        JobStage::Diarizing => "Identifying speakers",
+        JobStage::Transcribing => "Transcribing",
+        JobStage::CleaningUp => "Cleaning up with AI",
+    };
+    if total == 0 {
+        return (label.into(), None);
+    }
+    (
+        format!("{label} {done}/{total}"),
+        Some((done as f32 / total as f32).clamp(0.0, 1.0)),
+    )
 }
 
 /// `120` seconds as `2 min`, for the popup.
@@ -467,6 +486,11 @@ struct State {
     /// Long-form jobs (imported files, meetings) mapped to their output file.
     file_jobs: HashMap<u64, FileJob>,
     file_import_running: bool,
+    /// The Jobs window, while it is open.
+    jobs_window: Option<crate::jobs_window::JobsWindow>,
+    /// Jobs the worker has started, and the latest progress of each.
+    running_jobs: HashSet<u64>,
+    job_progress: HashMap<u64, (JobStage, usize, usize)>,
 }
 
 pub fn run() -> Result<()> {
@@ -567,6 +591,9 @@ pub fn run() -> Result<()> {
         next_repair_id: 1,
         file_jobs: HashMap::new(),
         file_import_running: false,
+        jobs_window: None,
+        running_jobs: HashSet::new(),
+        job_progress: HashMap::new(),
     };
 
     // Wait mode: loop sleeps until a message arrives (tray click, user event,
@@ -752,6 +779,28 @@ impl AppHandler {
             }
         }
         while let Some(event) = self.state.worker.try_recv() {
+            // What the Jobs window shows.
+            match &event {
+                WorkerEvent::JobStarted { id } => {
+                    self.state.running_jobs.insert(*id);
+                }
+                WorkerEvent::JobProgress {
+                    id,
+                    stage,
+                    done,
+                    total,
+                } => {
+                    self.state.running_jobs.insert(*id);
+                    self.state.job_progress.insert(*id, (*stage, *done, *total));
+                }
+                WorkerEvent::JobCompleted { id, .. }
+                | WorkerEvent::JobFailed { id, .. }
+                | WorkerEvent::JobDiscarded { id } => {
+                    self.state.running_jobs.remove(id);
+                    self.state.job_progress.remove(id);
+                }
+                _ => {}
+            }
             let finished = match &event {
                 WorkerEvent::JobCompleted { id, .. }
                 | WorkerEvent::JobFailed { id, .. }
@@ -766,6 +815,7 @@ impl AppHandler {
         }
         self.sync_overlay();
         self.sync_meeting_indicator();
+        self.update_jobs_window();
 
         let meeting_status = self
             .state
@@ -869,6 +919,23 @@ impl AppHandler {
             }
             if ev.id == self.state.tray.menu_transcribe_file_id {
                 self.start_file_import();
+                continue;
+            }
+            if ev.id == self.state.tray.menu_jobs_id {
+                if self
+                    .state
+                    .jobs_window
+                    .as_ref()
+                    .is_some_and(|window| window.is_open())
+                {
+                    info!("jobs window already open");
+                } else {
+                    match crate::jobs_window::JobsWindow::open() {
+                        Ok(window) => self.state.jobs_window = Some(window),
+                        Err(error) => warn!(error = %error, "could not open the jobs window"),
+                    }
+                    self.update_jobs_window();
+                }
                 continue;
             }
             if ev.id == self.state.tray.menu_meeting_id {
@@ -2260,6 +2327,129 @@ impl AppHandler {
             .file_jobs
             .get(&id)
             .is_some_and(FileJob::overlay_free)
+    }
+
+    /// Act on Stop presses in the Jobs window and show it the current list.
+    fn update_jobs_window(&mut self) {
+        let Some(window) = &self.state.jobs_window else {
+            return;
+        };
+        if !window.is_open() {
+            self.state.jobs_window = None;
+            return;
+        }
+        for key in window.take_stops() {
+            self.stop_from_jobs_window(&key);
+        }
+        let rows = self.job_rows();
+        if let Some(window) = self.state.jobs_window.as_mut() {
+            window.show(rows);
+        }
+    }
+
+    fn stop_from_jobs_window(&mut self, key: &str) {
+        if let Some(id) = key
+            .strip_prefix("job:")
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            // The same path as Stop in the job's own window (see `tick`).
+            if let Some(stop) = self
+                .state
+                .file_jobs
+                .get(&id)
+                .and_then(|job| job.stop.as_ref())
+            {
+                stop.store(true, Ordering::Release);
+            }
+        } else if let Some(repair_id) = key
+            .strip_prefix("retry:")
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            let Some(index) = self
+                .state
+                .repairs
+                .iter()
+                .position(|repair| repair.id == repair_id)
+            else {
+                return;
+            };
+            let repair = self.state.repairs.remove(index);
+            if let Some(job_id) = repair.in_flight {
+                self.state.worker.stop_job(job_id);
+            }
+            info!(file = %repair.output.display(), "background cleanup cancelled from the jobs window");
+            repair.tell(
+                "Retry cancelled; the file keeps the recognised text.".into(),
+                false,
+                true,
+            );
+        }
+    }
+
+    /// Everything running or waiting, for the Jobs window.
+    fn job_rows(&self) -> Vec<crate::jobs_window::JobRow> {
+        use crate::jobs_window::JobRow;
+        let mut rows = Vec::new();
+        if let Some(meeting) = &self.state.meeting {
+            rows.push(JobRow {
+                key: "meeting".into(),
+                kind: "Meeting".into(),
+                name: "Recording".into(),
+                state: format!(
+                    "Recording for {} · stop it from the tray menu",
+                    transcript_window::format_clock(meeting.elapsed().as_secs())
+                ),
+                fraction: None,
+                stop_label: None,
+            });
+        }
+        let mut ids: Vec<u64> = self.state.file_jobs.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let job = &self.state.file_jobs[&id];
+            let kind = match &job.session {
+                Some((part, _)) if part.last => "Meeting (last part)",
+                Some(_) => "Meeting part",
+                None => "File",
+            };
+            let (state, fraction) = if job.stop_sent {
+                ("Stopping…".to_string(), None)
+            } else if self.state.running_jobs.contains(&id) {
+                progress_text(self.state.job_progress.get(&id))
+            } else {
+                ("Queued".to_string(), None)
+            };
+            rows.push(JobRow {
+                key: format!("job:{id}"),
+                kind: kind.into(),
+                name: job.title.clone(),
+                state,
+                fraction,
+                stop_label: (job.stop.is_some() && !job.stop_sent).then(|| "Stop".into()),
+            });
+        }
+        let now = Instant::now();
+        for repair in &self.state.repairs {
+            let (state, fraction) = match repair.in_flight {
+                Some(job_id) => progress_text(self.state.job_progress.get(&job_id)),
+                None => (
+                    format!(
+                        "Next try in about {}",
+                        minutes(repair.next_attempt.saturating_duration_since(now).as_secs())
+                    ),
+                    None,
+                ),
+            };
+            rows.push(JobRow {
+                key: format!("retry:{}", repair.id),
+                kind: format!("{} retry", repair.what()),
+                name: repair.name.clone(),
+                state,
+                fraction,
+                stop_label: Some("Cancel".into()),
+            });
+        }
+        rows
     }
 
     fn tell_job_window(&self, id: u64, message: WindowMsg) {

@@ -77,10 +77,11 @@ HouWritr lives in the system tray. Right click the icon:
 
 | Tray menu | What it does |
 |---|---|
-| **Transcribe audio or video file…** | Pick a file; a window shows progress and the result. |
+| **Transcribe audio or video file…** | Pick a file; a window shows progress and the result, with **Stop** while it runs (nothing is saved). |
 | **Start / Stop meeting recording** | Record your microphone and the PC's sound, transcribed while you record. |
 | **Pause / Resume meeting recording** | Stop capturing for a while without ending the meeting. |
 | **Hide / Show recording indicator** | Toggle the meeting pill for this session only. |
+| **Jobs…** | Everything running or waiting: the meeting being recorded, files and meeting parts with their progress, and background cleanup retries with their next try. Files can be stopped and retries cancelled from here. |
 | **Settings** | Engine, speaker labels, AI cleanup, output format, startup. |
 | **Open logs / Export diagnostics…** | See [Logs and diagnostics](#logs-and-diagnostics). |
 | **Retry model / engine, Cancel model download** | Recover from a failed or unwanted download. |

@@ -11,6 +11,7 @@ mod copilot_auth;
 mod credentials;
 mod diagnostics;
 mod enhance;
+mod jobs_window;
 mod local_llm;
 mod log_files;
 mod media;
@@ -36,6 +37,20 @@ fn main() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if is_self_check_mode(arguments.iter()) {
         return self_check::run();
+    }
+    if arguments
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(OsStr::new("--jobs-window")))
+    {
+        let _log_guard = init_tracing("jobs-window", false)?;
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            mode = "jobs-window",
+            build = build_id(),
+            "process starting"
+        );
+        return jobs_window::run_window();
     }
     if is_transcript_window_mode(arguments.iter()) {
         let _log_guard = init_tracing("transcript-window", false)?;

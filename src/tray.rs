@@ -17,6 +17,7 @@ pub struct Tray {
     pub menu_meeting_id: MenuId,
     pub menu_meeting_pause_id: MenuId,
     pub menu_meeting_indicator_id: MenuId,
+    pub menu_jobs_id: MenuId,
     meeting_item: MenuItem,
     meeting_pause_item: MenuItem,
     meeting_indicator_item: MenuItem,
@@ -52,6 +53,7 @@ impl Tray {
         let meeting = MenuItem::new("Start meeting recording", true, None);
         let meeting_pause = MenuItem::new("Pause meeting recording", false, None);
         let meeting_indicator = MenuItem::new("Hide recording indicator", true, None);
+        let jobs = MenuItem::new("Jobs…", true, None);
         let transcribe_sep = PredefinedMenuItem::separator();
         let open_logs = MenuItem::new("Open logs", true, None);
         let export_diagnostics = MenuItem::new("Export diagnostics…", true, None);
@@ -69,6 +71,7 @@ impl Tray {
         menu.append(&meeting)?;
         menu.append(&meeting_pause)?;
         menu.append(&meeting_indicator)?;
+        menu.append(&jobs)?;
         menu.append(&transcribe_sep)?;
         menu.append(&open_logs)?;
         menu.append(&export_diagnostics)?;
@@ -87,6 +90,7 @@ impl Tray {
         Ok(Self {
             _icon: tray,
             menu_quit_id: quit.id().clone(),
+            menu_jobs_id: jobs.id().clone(),
             menu_settings_id: settings.id().clone(),
             menu_about_id: about.id().clone(),
             menu_open_logs_id: open_logs.id().clone(),
