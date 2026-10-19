@@ -72,6 +72,11 @@ pub enum WindowMsg {
         chars: usize,
         preview: String,
         warning: Option<String>,
+        /// How AI cleanup went when it is not a failure but not complete
+        /// either (some sections kept their recognised text); shown calmly,
+        /// not as an error.
+        #[serde(default)]
+        notice: Option<String>,
         /// Number of labelled speakers; `None` when not labelled.
         #[serde(default)]
         speakers: Option<usize>,
@@ -133,6 +138,7 @@ pub struct Finished {
     pub chars: usize,
     pub preview: String,
     pub warning: Option<String>,
+    pub notice: Option<String>,
     pub speakers: Option<usize>,
 }
 
@@ -196,6 +202,7 @@ impl WindowState {
                 chars,
                 preview,
                 warning,
+                notice,
                 speakers,
             } => {
                 self.output_path = output_path;
@@ -204,6 +211,7 @@ impl WindowState {
                     chars,
                     preview,
                     warning,
+                    notice,
                     speakers,
                 });
                 self.error = None;
@@ -610,6 +618,16 @@ impl eframe::App for TranscriptWindow {
                     }
                 });
 
+            if let Some(notice) = self
+                .state
+                .finished
+                .as_ref()
+                .and_then(|done| done.notice.clone())
+            {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(235, 190, 90), notice);
+            }
+
             if let Some(warning) = self
                 .state
                 .finished
@@ -683,6 +701,7 @@ mod tests {
                 chars: 1,
                 preview: String::new(),
                 warning: None,
+                notice: None,
                 speakers: None,
             },
             now,
@@ -743,6 +762,7 @@ mod tests {
                 chars: 55,
                 preview: "line\nbreak".into(),
                 warning: Some("no cleanup".into()),
+                notice: None,
                 speakers: Some(2),
             },
             WindowMsg::Failed {
@@ -809,6 +829,7 @@ mod tests {
                 chars: 11,
                 preview: "a b c".into(),
                 warning: None,
+                notice: None,
                 speakers: None,
             },
             base,

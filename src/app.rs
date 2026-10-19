@@ -260,6 +260,37 @@ fn cleanup_summary(report: &crate::enhance::CleanupReport) -> Option<String> {
         .then(|| format!("cleaned {} of {} sections", report.cleaned, report.total))
 }
 
+/// What the transcript window says when AI cleanup finished but not every
+/// section was cleaned. Not an error: the file is complete and the sections
+/// that were not cleaned keep exactly what was recognised.
+fn cleanup_notice(report: &crate::enhance::CleanupReport) -> Option<String> {
+    if report.total == 0 || report.cleaned >= report.total {
+        return None;
+    }
+    // Neither cleaned nor unreachable: the cleaned version failed the safety
+    // checks (a number or a speaker label changed), or was empty.
+    let kept = report
+        .total
+        .saturating_sub(report.cleaned)
+        .saturating_sub(report.unreachable);
+    let mut notice = format!(
+        "AI cleanup finished: {} of {} sections cleaned.",
+        report.cleaned, report.total
+    );
+    if kept > 0 {
+        notice.push_str(&format!(
+            " {kept} kept the recognised text because the cleaned version failed the safety checks (a number or speaker label changed); they are not retried."
+        ));
+    }
+    if report.unreachable > 0 {
+        notice.push_str(&format!(
+            " {} could not be sent to the model.",
+            report.unreachable
+        ));
+    }
+    Some(notice)
+}
+
 /// A meeting being recorded: its parts are transcribed as they are cut.
 struct MeetingSession {
     id: u64,
@@ -1630,9 +1661,12 @@ impl AppHandler {
                 "Saved without {missing}: {}.",
                 cleanup_failure_text(reason)
             ));
-        } else if let Some(summary) = &summary {
-            warnings.push(format!("AI cleanup incomplete: {summary}."));
         }
+        let notice = if cleanup_warning.is_none() {
+            cleanup.as_ref().and_then(cleanup_notice)
+        } else {
+            None
+        };
         if retrying {
             warnings.push("HouWritr will retry automatically and update the file.".into());
         }
@@ -1652,6 +1686,7 @@ impl AppHandler {
             chars,
             preview,
             warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+            notice,
             speakers,
         });
         // The popup has "Show in folder"; only pop Explorer open ourselves
@@ -2785,6 +2820,24 @@ mod tests {
             session: None,
             partial: None,
         }
+    }
+
+    #[test]
+    fn partly_cleaned_text_gets_a_calm_notice_that_counts_what_was_kept() {
+        let report = |total, cleaned, unreachable| crate::enhance::CleanupReport {
+            total,
+            cleaned,
+            unreachable,
+        };
+        assert_eq!(super::cleanup_notice(&report(48, 48, 0)), None);
+        assert_eq!(super::cleanup_notice(&report(0, 0, 0)), None);
+        let notice = super::cleanup_notice(&report(48, 39, 0)).unwrap();
+        assert!(notice.starts_with("AI cleanup finished: 39 of 48 sections cleaned."));
+        assert!(notice.contains("9 kept the recognised text"));
+        assert!(!notice.contains("could not be sent"));
+        let notice = super::cleanup_notice(&report(48, 30, 8)).unwrap();
+        assert!(notice.contains("10 kept"));
+        assert!(notice.contains("8 could not be sent"));
     }
 
     #[test]
