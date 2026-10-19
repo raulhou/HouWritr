@@ -774,7 +774,8 @@ fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
     // (distance from the middle, end of the left piece, start of the right).
     let mut best: Option<(usize, usize, usize)> = None;
     for (position, &(byte, c)) in characters.iter().enumerate() {
-        let (left_end, left_chars) = if c == '\n' && slice[byte..].starts_with("\n\n") {
+        let block_boundary = c == '\n' && slice[byte..].starts_with("\n\n");
+        let (left_end, left_chars) = if block_boundary {
             (byte, position)
         } else if matches!(c, '。' | '！' | '？' | '；') {
             (byte + c.len_utf8(), position + 1)
@@ -790,7 +791,10 @@ fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
         let rest = &slice[left_end..];
         let right_start = left_end + (rest.len() - rest.trim_start().len());
         let right_chars = slice[right_start..].chars().count();
-        if left_chars < MIN_PIECE_CHARS || right_chars < MIN_PIECE_CHARS {
+        // A block boundary is structure, not style: it may leave a short
+        // piece (an interjection); other cuts may not.
+        let smallest = if block_boundary { 1 } else { MIN_PIECE_CHARS };
+        if left_chars < smallest || right_chars < smallest {
             continue;
         }
         let distance = left_chars.abs_diff(middle);
@@ -909,7 +913,8 @@ fn clean_slice_keeping_labels(
         .iter()
         .map(|block| speaker_prefix(block).unwrap_or(""))
         .collect();
-    if prefixes.iter().all(|prefix| prefix.is_empty()) {
+    let labelled = prefixes.iter().any(|prefix| !prefix.is_empty());
+    if !labelled && blocks.len() > 1 {
         return enhance_outcome_with(slice, settings, extra_instruction, before_validate);
     }
     let bare = blocks
@@ -921,13 +926,19 @@ fn clean_slice_keeping_labels(
     let outcome = enhance_outcome_with(&bare, settings, extra_instruction, before_validate)?;
     Some(match outcome {
         EnhanceOutcome::Enhanced { text, warnings } => {
-            let cleaned: Vec<&str> = text.split("\n\n").collect();
-            if cleaned.len() != blocks.len() {
+            let cleaned: Vec<String> = if text.split("\n\n").count() == blocks.len() {
+                text.split("\n\n").map(str::to_string).collect()
+            } else if blocks.len() == 1 {
+                // One block going in: the paragraph breaks the model added
+                // (seen on long runs where Whisper wrote no punctuation) are
+                // joined up again, so the block count stays what it was.
+                vec![collapse_paragraphs(&text)]
+            } else {
                 return Some(EnhanceOutcome::raw_fallback(
                     slice,
                     FallbackReason::IntegrityRejected(vec![ViolationKind::SpeakerLabelsChanged]),
                 ));
-            }
+            };
             let joined = cleaned
                 .iter()
                 .zip(&prefixes)
@@ -940,6 +951,26 @@ fn clean_slice_keeping_labels(
         EnhanceOutcome::Skipped { reason, .. } => EnhanceOutcome::skipped(slice, reason),
         EnhanceOutcome::RawFallback { reason, .. } => EnhanceOutcome::raw_fallback(slice, reason),
     })
+}
+
+/// Join the paragraphs of `text` into one block: nothing between two wide
+/// (Chinese, Japanese, Korean) characters, one space otherwise.
+fn collapse_paragraphs(text: &str) -> String {
+    let wide = |c: char| c as u32 >= 0x2E80;
+    let mut joined = String::new();
+    for part in text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let (Some(last), Some(first)) = (joined.chars().last(), part.chars().next()) {
+            if !wide(last) && !wide(first) {
+                joined.push(' ');
+            }
+        }
+        joined.push_str(part);
+    }
+    joined
 }
 
 /// How many requests cleaning up `text` takes, for progress across several
@@ -2030,6 +2061,31 @@ mod long_form_tests {
         assert!(split_in_two(&"1.5 ".repeat(5)).is_none());
         assert!(split_in_two(&"x".repeat(200)).is_none());
         assert!(split_in_two("short。text。").is_none());
+    }
+
+    #[test]
+    fn paragraphs_a_model_made_of_one_block_are_joined_again() {
+        assert_eq!(collapse_paragraphs("你好。\n\n再见。"), "你好。再见。");
+        assert_eq!(collapse_paragraphs("Hello\n\nworld"), "Hello world");
+        assert_eq!(collapse_paragraphs("a\n\n\n\nb"), "a b");
+        assert_eq!(
+            collapse_paragraphs("中文\n\nand English"),
+            "中文and English"
+        );
+        assert_eq!(collapse_paragraphs("one block"), "one block");
+    }
+
+    #[test]
+    fn a_long_block_is_cut_from_the_short_interjections_after_it() {
+        let text = format!(
+            "Speaker 1: {}。\n\nSpeaker 2: 嗯。\n\nSpeaker 3: 对。",
+            "甲".repeat(90)
+        );
+        let (left, gap, right) = split_in_two(&text).unwrap();
+        assert!(left.starts_with("Speaker 1:") && left.ends_with('。'));
+        assert_eq!(gap, "\n\n");
+        assert!(right.starts_with("Speaker 2:"));
+        assert_eq!(format!("{left}{gap}{right}"), text);
     }
 
     fn rejected() -> EnhanceOutcome {
