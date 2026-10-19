@@ -37,8 +37,9 @@ use crate::cleanup::EndpointScope;
 /// default (18181) so it never collides with a server the user runs.
 pub const MANAGED_PORT: u16 = 18651;
 pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
-/// The built-in choice a fresh setup starts with.
-pub const DEFAULT_MODEL: &str = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu";
+/// The built-in choice a fresh setup starts with: the faster one, which
+/// peaked below 50% CPU on the test PC with other work in the foreground.
+pub const DEFAULT_MODEL: &str = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid";
 
 /// Models from before the list was cut to the two llama.cpp choices:
 /// uninstalling GenieX still removes them if they are on disk.
@@ -105,19 +106,17 @@ pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
     BuiltInModel {
         id: DEFAULT_MODEL,
         name: QWEN3_4B_GGUF,
-        label: "Qwen3 4B on the NPU (llama.cpp)",
-        detail:
-            "About 2.4 GB from Hugging Face. Runs on the NPU; steady speed and light on the CPU.",
-        runtime: Runtime::NpuLlama,
+        label: "Qwen3 4B on the NPU and CPU",
+        detail: "About 2.4 GB from Hugging Face. Split between the NPU and the processor by llama.cpp: the faster choice (about 18 tokens a second on a Snapdragon X Elite).",
+        runtime: Runtime::Hybrid,
         download_bytes: Some(QWEN3_4B_GGUF_BYTES),
     },
     BuiltInModel {
-        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid",
+        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu",
         name: QWEN3_4B_GGUF,
-        label: "Qwen3 4B on the NPU and CPU",
-        detail:
-            "The same file, split between the NPU and the processor: faster, but it uses more CPU.",
-        runtime: Runtime::Hybrid,
+        label: "Qwen3 4B on the NPU only (llama.cpp)",
+        detail: "The same file on the NPU alone: about 13 tokens a second, the lightest on the CPU.",
+        runtime: Runtime::NpuLlama,
         download_bytes: Some(QWEN3_4B_GGUF_BYTES),
     },
 ];
@@ -1412,8 +1411,8 @@ mod tests {
         let mut old = serde_json::json!({"model": "x"});
         add_request_options(&mut old, "ai-hub-models/Qwen3-4B-Instruct-2507");
         assert_eq!(old["model"], QWEN3_4B_GGUF);
-        assert_eq!(old["compute"], "npu");
-        assert_eq!(runtime("something-else"), Runtime::NpuLlama);
+        assert_eq!(old["compute"], "hybrid");
+        assert_eq!(runtime("something-else"), Runtime::Hybrid);
         // Every choice is unique and shares one file.
         let mut ids: Vec<&str> = BUILT_IN_MODELS.iter().map(|model| model.id).collect();
         ids.sort();

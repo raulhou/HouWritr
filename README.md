@@ -260,10 +260,12 @@ meetings.
     it writes. One Qwen3 4B file (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
     about 2.4 GB from Hugging Face), run two ways through GenieX's llama.cpp
     runtime:
-    * *Qwen3 4B on the NPU (llama.cpp)*: all layers on the NPU. Steady speed
-      (about 13 tokens a second on a Snapdragon X Elite) and light on the CPU.
-    * *Qwen3 4B on the NPU and CPU*: split between the two. Faster (about 18
-      tokens a second) but it uses more CPU.
+    * *Qwen3 4B on the NPU and CPU* (the default): split between the two by
+      llama.cpp. The faster choice (about 18 tokens a second on a Snapdragon
+      X Elite); on the test PC the CPU stayed below 50% with other work in
+      the foreground.
+    * *Qwen3 4B on the NPU only*: all layers on the NPU. Steady (about 13
+      tokens a second) and the lightest on the CPU.
 
     Earlier versions also offered Qualcomm's precompiled NPU bundle (about
     one token a second on the test PC), the CPU alone, and Qwen2.5 7B. Their

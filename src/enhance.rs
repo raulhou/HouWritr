@@ -2183,7 +2183,7 @@ mod long_form_tests {
                 s.enhance.model = "ai-hub-models/Qwen3-4B-Instruct-2507".into();
                 s
             }),
-            "Qwen3-4B-Instruct-2507 · this PC (NPU, llama.cpp)"
+            "Qwen3-4B-Instruct-2507 · this PC (NPU + CPU)"
         );
         assert_eq!(
             cleanup_engine_label(&openai_settings("http://localhost:11434/v1")),
