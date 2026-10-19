@@ -118,12 +118,15 @@ pub fn finalize(source: &str, raw_content: &str) -> EnhanceOutcome {
                     ViolationKind::FactualDigitChanged | ViolationKind::SpeakerLabelsChanged
                 )
             }) {
-                // Counts only: why numbers were judged changed, without them.
+                // Why numbers were judged changed: counts, and the first few
+                // digit numbers (never any words).
                 let changes = integrity::number_changes(source, &normalized);
                 tracing::info!(
                     ?kinds,
                     lost = changes.lost,
                     gained = changes.gained,
+                    lost_numbers = ?changes.lost_numbers,
+                    gained_numbers = ?changes.gained_numbers,
                     labels_before = changes.speaker_labels_source,
                     labels_after = changes.speaker_labels_candidate,
                     chinese_numerals_before = changes.chinese_numerals_source,

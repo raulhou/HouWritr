@@ -274,9 +274,14 @@ fn split_speaker_labels(text: &str) -> (Vec<u32>, String) {
     (labels, rest)
 }
 
-/// What changed in the numbers of a rejected cleanup, as counts only (the
-/// numbers themselves are transcript content and are never logged).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How many numbers of each kind [`NumberChanges`] lists at most.
+const LISTED_NUMBERS: usize = 6;
+
+/// What changed in the numbers of a rejected cleanup: counts, and the first
+/// few numbers themselves, so a log shows whether the model dropped a figure
+/// or only wrote it another way (those are transcript content, but only
+/// digits, never words).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NumberChanges {
     /// Digit numbers of the source missing from the candidate.
     pub lost: usize,
@@ -288,6 +293,9 @@ pub struct NumberChanges {
     /// place of digits.
     pub chinese_numerals_source: usize,
     pub chinese_numerals_candidate: usize,
+    /// The first of the numbers counted in `lost`, and in `gained`.
+    pub lost_numbers: Vec<String>,
+    pub gained_numbers: Vec<String>,
 }
 
 /// Count how the numbers differ between `source` and `candidate`, for the
@@ -297,19 +305,26 @@ pub fn number_changes(source: &str, candidate: &str) -> NumberChanges {
     let (candidate_labels, candidate_text) = split_speaker_labels(candidate);
     let source_counts = multiset(numeric_tokens(&source_text));
     let candidate_counts = multiset(numeric_tokens(&candidate_text));
-    let missing = |from: &BTreeMap<String, usize>, to: &BTreeMap<String, usize>| {
+    let missing = |from: &BTreeMap<String, usize>, to: &BTreeMap<String, usize>| -> Vec<String> {
         from.iter()
-            .map(|(token, count)| count.saturating_sub(to.get(token).copied().unwrap_or(0)))
-            .sum()
+            .flat_map(|(token, count)| {
+                let short = count.saturating_sub(to.get(token).copied().unwrap_or(0));
+                std::iter::repeat(token.clone()).take(short)
+            })
+            .collect()
     };
+    let lost = missing(&source_counts, &candidate_counts);
+    let gained = missing(&candidate_counts, &source_counts);
     let chinese = |text: &str| {
         text.chars()
             .filter(|c| "零一二三四五六七八九十百千万亿两".contains(*c))
             .count()
     };
     NumberChanges {
-        lost: missing(&source_counts, &candidate_counts),
-        gained: missing(&candidate_counts, &source_counts),
+        lost: lost.len(),
+        gained: gained.len(),
+        lost_numbers: lost.into_iter().take(LISTED_NUMBERS).collect(),
+        gained_numbers: gained.into_iter().take(LISTED_NUMBERS).collect(),
         speaker_labels_source: source_labels.len(),
         speaker_labels_candidate: candidate_labels.len(),
         chinese_numerals_source: chinese(source),
@@ -738,6 +753,8 @@ mod tests {
                 speaker_labels_candidate: 2,
                 chinese_numerals_source: 0,
                 chinese_numerals_candidate: 1,
+                lost_numbers: vec!["3".to_string()],
+                gained_numbers: Vec::new(),
             }
         );
     }
