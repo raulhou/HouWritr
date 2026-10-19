@@ -7,7 +7,7 @@
 
 use crate::cleanup::{
     adapter, pipeline, EndpointScope, EnhanceOutcome, EnhanceProvider, FallbackReason,
-    PromptTarget, SkipReason, Transcript,
+    PromptTarget, SkipReason, Transcript, ViolationKind,
 };
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
@@ -752,6 +752,73 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// The `Speaker N: ` at the start of a block, if it has one.
+fn speaker_prefix(block: &str) -> Option<&str> {
+    let rest = block.strip_prefix("Speaker ")?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || digits > 3 {
+        return None;
+    }
+    let after = &rest[digits..];
+    let colon = after.chars().next().filter(|c| matches!(c, ':' | '：'))?;
+    let mut end = "Speaker ".len() + digits + colon.len_utf8();
+    if block[end..].starts_with(' ') {
+        end += 1;
+    }
+    Some(&block[..end])
+}
+
+/// Clean one slice of a speaker-labelled transcript with its `Speaker N:`
+/// labels held out of what the model sees, as the `[m:ss]` times are: left in
+/// the text, local models dropped them (seen on 7 to 9 of 48 slices of a
+/// four speaker recording, the same ones every time), and the slice was
+/// rejected for it. The labels go back in front of the blocks of the answer;
+/// if the model changed the number of blocks they cannot be matched, and the
+/// slice keeps its text.
+fn clean_slice_keeping_labels(
+    slice: &str,
+    settings: &Settings,
+    extra_instruction: Option<&str>,
+    before_validate: impl FnOnce() -> bool,
+) -> Option<EnhanceOutcome> {
+    let blocks: Vec<&str> = slice.split("\n\n").collect();
+    let prefixes: Vec<&str> = blocks
+        .iter()
+        .map(|block| speaker_prefix(block).unwrap_or(""))
+        .collect();
+    if prefixes.iter().all(|prefix| prefix.is_empty()) {
+        return enhance_outcome_with(slice, settings, extra_instruction, before_validate);
+    }
+    let bare = blocks
+        .iter()
+        .zip(&prefixes)
+        .map(|(block, prefix)| &block[prefix.len()..])
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let outcome = enhance_outcome_with(&bare, settings, extra_instruction, before_validate)?;
+    Some(match outcome {
+        EnhanceOutcome::Enhanced { text, warnings } => {
+            let cleaned: Vec<&str> = text.split("\n\n").collect();
+            if cleaned.len() != blocks.len() {
+                return Some(EnhanceOutcome::raw_fallback(
+                    slice,
+                    FallbackReason::IntegrityRejected(vec![ViolationKind::SpeakerLabelsChanged]),
+                ));
+            }
+            let joined = cleaned
+                .iter()
+                .zip(&prefixes)
+                .map(|(block, prefix)| format!("{prefix}{}", block.trim_start()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            EnhanceOutcome::enhanced(joined, warnings)
+        }
+        // Nothing was changed: the slice goes on as it was.
+        EnhanceOutcome::Skipped { reason, .. } => EnhanceOutcome::skipped(slice, reason),
+        EnhanceOutcome::RawFallback { reason, .. } => EnhanceOutcome::raw_fallback(slice, reason),
+    })
+}
+
 /// How many requests cleaning up `text` takes, for progress across several
 /// texts.
 pub fn cleanup_slice_count(text: &str, settings: &Settings) -> usize {
@@ -1188,14 +1255,14 @@ pub fn enhance_long_form(
         return clean_slices(
             slices,
             &joins,
-            |slice| enhance_outcome_with(slice, settings, instruction, || !interrupted()),
+            |slice| clean_slice_keeping_labels(slice, settings, instruction, || !interrupted()),
             &give_up,
             &interrupted,
             progress,
         );
     }
     // Workers cannot see `interrupted`; it is checked as results are taken.
-    let clean = |slice: &str| enhance_outcome_with(slice, settings, instruction, || true);
+    let clean = |slice: &str| clean_slice_keeping_labels(slice, settings, instruction, || true);
     let all: Vec<&str> = slices.clone();
     with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, &clean, |take| {
         clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
@@ -1798,6 +1865,24 @@ mod long_form_tests {
         settings.enhance.base_url = base_url.into();
         settings.enhance.model = "some-model".into();
         settings
+    }
+
+    #[test]
+    fn speaker_labels_are_found_and_kept_out_of_the_text_sent_to_a_model() {
+        assert_eq!(speaker_prefix("Speaker 3: 好的。"), Some("Speaker 3: "));
+        assert_eq!(speaker_prefix("Speaker 12：好的。"), Some("Speaker 12："));
+        assert_eq!(speaker_prefix("Speaker : no number"), None);
+        assert_eq!(speaker_prefix("Speaker 1234: too many digits"), None);
+        assert_eq!(speaker_prefix("Speakers 1: plural"), None);
+        assert_eq!(speaker_prefix("no label"), None);
+
+        // With cleanup off nothing is sent; the slice comes back as it was,
+        // labels included.
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+        let slice = "Speaker 1: 你好。\n\nSpeaker 2: 好的。";
+        let outcome = clean_slice_keeping_labels(slice, &settings, None, || true).unwrap();
+        assert_eq!(outcome.text(), slice);
     }
 
     #[test]
