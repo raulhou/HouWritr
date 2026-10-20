@@ -1064,6 +1064,21 @@ fn worker_main(
                     });
                 };
 
+                // The speech engine is finished with this job. When a model on
+                // this PC cleans the transcript next, the engine leaves the
+                // NPU first, so the two never hold it together (nor compute
+                // at the same time, which jobs on this one thread never do
+                // anyway); the next job loads it again, about two seconds.
+                if unload_when_idle
+                    && frees_engine_before_cleanup(&job.config, transcription_failed)
+                {
+                    engine = None;
+                    info!(
+                        engine = engine_name.as_deref().unwrap_or_default(),
+                        "speech engine unloaded before the cleanup on this PC"
+                    );
+                }
+
                 // `raw_text` is what was recognised; it is kept so a failed
                 // cleanup can be redone later.
                 let raw_text = text;
@@ -1341,6 +1356,16 @@ fn recording_kind(config: &JobConfig) -> crate::log_files::RecordingKind {
 /// that may have used it (AI cleanup, notes, a background retry), each
 /// meeting part included. It is started again only when the next job needs
 /// it, so it never sits idle in memory.
+/// Whether the job is about to be cleaned by a model on this PC, so the speech
+/// engine can leave the NPU first. For a meeting that is the last part only:
+/// the earlier parts are cleaned once, after Stop.
+fn frees_engine_before_cleanup(config: &JobConfig, transcription_failed: bool) -> bool {
+    config.should_enhance()
+        && !transcription_failed
+        && enhance::uses_local_model(&config.settings)
+        && config.session.map_or(true, |part| part.last)
+}
+
 fn releases_local_model(config: &JobConfig) -> bool {
     config.rerun.is_some() || config.should_enhance() || config.notes
 }
@@ -3645,5 +3670,50 @@ mod tests {
         off.enhance.mode = crate::settings::EnhanceMode::Never;
         assert!(!releases_local_model(&JobConfig::long_form(off.clone())));
         assert!(releases_local_model(&JobConfig::meeting_notes(off)));
+    }
+
+    #[test]
+    fn the_speech_engine_leaves_the_npu_before_a_local_cleanup() {
+        let mut local = Settings::default();
+        local.enhance.mode = crate::settings::EnhanceMode::Always;
+        local.enhance.provider = "openai_compatible".into();
+        local.enhance.base_url = "http://127.0.0.1:18651/v1".into();
+        local.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid".into();
+        assert!(frees_engine_before_cleanup(
+            &JobConfig::long_form(local.clone()),
+            false
+        ));
+        // Nothing to clean, or the transcription failed: no reason to.
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(local.clone()),
+            true
+        ));
+        let mut off = local.clone();
+        off.enhance.mode = crate::settings::EnhanceMode::Never;
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(off),
+            false
+        ));
+        // A hosted provider does not use the NPU.
+        let mut hosted = local.clone();
+        hosted.enhance.provider = "github_copilot".into();
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(hosted),
+            false
+        ));
+        // A meeting is cleaned once, after its last part.
+        let part = |last| SessionPart {
+            id: 1,
+            offset_samples: 0,
+            last,
+        };
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::meeting_part(local.clone(), part(false), false),
+            false
+        ));
+        assert!(frees_engine_before_cleanup(
+            &JobConfig::meeting_part(local, part(true), false),
+            false
+        ));
     }
 }
