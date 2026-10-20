@@ -149,16 +149,18 @@ impl Tray {
         self.power_saving_item.is_checked()
     }
 
-    /// Show the power saving mode: ticked or not, and when Windows' power
-    /// saving mode decides (`automatic`) the item is a read only display.
-    pub fn set_power_saving(&self, on: bool, automatic: bool) {
+    /// Show the power saving mode: ticked or not. When Windows' power saving
+    /// mode decides (`automatic`) the item still works: a click overrides
+    /// Windows until its mode changes (`overridden`).
+    pub fn set_power_saving(&self, on: bool, automatic: bool, overridden: bool) {
         self.power_saving_item.set_checked(on);
-        self.power_saving_item.set_enabled(!automatic);
-        self.power_saving_item.set_text(if automatic {
-            "Power saving (follows Windows power saving mode)"
-        } else {
-            POWER_SAVING_TEXT
-        });
+        self.power_saving_item.set_enabled(true);
+        self.power_saving_item
+            .set_text(match (automatic, overridden) {
+                (false, _) => POWER_SAVING_TEXT,
+                (true, false) => "Power saving (following Windows, click to override)",
+                (true, true) => "Power saving (overriding Windows until it changes)",
+            });
     }
 
     /// Menu text for the meeting recording indicator toggle.

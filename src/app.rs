@@ -120,6 +120,13 @@ struct RepairRecord {
     failed_rounds: u32,
 }
 
+/// The tray overrode Windows' power saving mode.
+struct PowerOverride {
+    on: bool,
+    /// Windows' own mode when it was overridden; a change ends the override.
+    windows_was: bool,
+}
+
 /// A job waiting for power saving to end. Its audio is only on disk.
 struct HeldJob {
     spool_id: u64,
@@ -584,7 +591,10 @@ struct State {
     power: power::PowerStatus,
     power_checked_at: Instant,
     /// What the tray's power saving item shows: (on, follows battery saver).
-    power_mode_shown: Option<(bool, bool)>,
+    power_mode_shown: Option<(bool, bool, bool)>,
+    /// The tray item was clicked while following Windows: power saving is
+    /// this until Windows' own power saving mode next changes (session only).
+    power_override: Option<PowerOverride>,
     /// Fingerprint of the retries last written to disk.
     repairs_saved: u64,
 }
@@ -695,6 +705,7 @@ pub fn run() -> Result<()> {
         power: power::status(),
         power_checked_at: Instant::now(),
         power_mode_shown: None,
+        power_override: None,
         repairs_saved: fingerprint(&[]),
     };
 
@@ -1291,13 +1302,17 @@ impl AppHandler {
     }
 
     /// Power saving is on: the saved toggle, or Windows' battery saver when
-    /// the setting says to follow it.
+    /// the setting says to follow it, unless the tray overrode that.
     fn power_saving_on(&self) -> bool {
-        power::saving_on(
-            self.state.settings.power_saving,
-            self.state.settings.power_saving_auto,
-            self.state.power,
-        )
+        let following = self.state.settings.power_saving_auto;
+        match &self.state.power_override {
+            Some(over) if following => over.on,
+            _ => power::saving_on(
+                self.state.settings.power_saving,
+                following,
+                self.state.power,
+            ),
+        }
     }
 
     /// Work waits: power saving is on.
@@ -1517,13 +1532,23 @@ impl AppHandler {
         self.sync_repairs_to_disk();
         let held_before = self.hold_for_power();
         self.state.power = power::status();
+        // The override ends when Windows' own mode changes, or when the
+        // setting no longer follows Windows.
+        if self.state.power_override.as_ref().is_some_and(|over| {
+            !self.state.settings.power_saving_auto
+                || over.windows_was != self.state.power.battery_saver
+        }) {
+            self.state.power_override = None;
+            info!("power saving follows Windows again");
+        }
         let shown = (
             self.power_saving_on(),
             self.state.settings.power_saving_auto,
+            self.state.power_override.is_some(),
         );
         if self.state.power_mode_shown != Some(shown) {
             self.state.power_mode_shown = Some(shown);
-            self.state.tray.set_power_saving(shown.0, shown.1);
+            self.state.tray.set_power_saving(shown.0, shown.1, shown.2);
         }
         let holding = self.hold_for_power();
         if holding != held_before {
@@ -1572,27 +1597,41 @@ impl AppHandler {
         }
     }
 
-    /// The tray toggle was clicked: keep the choice in settings.json.
+    /// The tray toggle was clicked. Normally the choice is kept in
+    /// settings.json. While following Windows it only overrides Windows'
+    /// power saving mode, until that changes.
     fn toggle_power_saving(&mut self) {
         let on = self.state.tray.power_saving_checked();
-        match Settings::load().and_then(|mut saved| {
-            saved.power_saving = on;
-            saved.save().map(|()| saved)
-        }) {
-            Ok(_) => info!(on, "power saving changed from the tray"),
-            Err(error) => warn!(error = %error, "could not save the power saving choice"),
+        if self.state.settings.power_saving_auto {
+            self.state.power = power::status();
+            self.state.power_override = Some(PowerOverride {
+                on,
+                windows_was: self.state.power.battery_saver,
+            });
+            info!(on, "power saving overridden from the tray");
+        } else {
+            match Settings::load().and_then(|mut saved| {
+                saved.power_saving = on;
+                saved.save().map(|()| saved)
+            }) {
+                Ok(_) => info!(on, "power saving changed from the tray"),
+                Err(error) => warn!(error = %error, "could not save the power saving choice"),
+            }
+            self.state.settings.power_saving = on;
         }
-        self.state.settings.power_saving = on;
         self.state.power_mode_shown = None;
         self.state.power_checked_at = Instant::now()
             .checked_sub(POWER_CHECK_INTERVAL)
             .unwrap_or_else(Instant::now);
         self.show_overlay_notice(
             NoticeKind::Info,
-            if on {
-                "Power saving on: recordings wait before transcription until you turn it off"
-            } else {
-                "Power saving off"
+            match (on, self.state.settings.power_saving_auto) {
+                (true, true) => "Power saving on until Windows' power saving mode changes",
+                (false, true) => "Power saving off until Windows' power saving mode changes",
+                (true, false) => {
+                    "Power saving on: recordings wait before transcription until you turn it off"
+                }
+                (false, false) => "Power saving off",
             },
         );
     }
