@@ -879,9 +879,16 @@ fn combined_instruction(first: Option<&str>, second: Option<&str>) -> Option<Str
 }
 
 /// Cut `slice` in two at the block or sentence end nearest its middle:
-/// `(left, gap, right)`, where the gap is the whitespace between them. `None`
+/// `(left, gap, right)`, where the gap is the whitespace between them. When
+/// the slice has no sentence end that leaves both pieces long enough (some
+/// speech runs on for a whole slice), it is cut at a comma instead. `None`
 /// when no cut leaves both pieces at least [`MIN_PIECE_CHARS`] long.
 fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
+    split_at_breaks(slice, false).or_else(|| split_at_breaks(slice, true))
+}
+
+/// [`split_in_two`] cutting at sentence ends, or with `commas` at commas.
+fn split_at_breaks(slice: &str, commas: bool) -> Option<(&str, &str, &str)> {
     let total = slice.chars().count();
     if total < MIN_PIECE_CHARS * 2 {
         return None;
@@ -897,6 +904,15 @@ fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
         } else if matches!(c, '。' | '！' | '？' | '；') {
             (byte + c.len_utf8(), position + 1)
         } else if matches!(c, '.' | '!' | '?' | ';')
+            && characters
+                .get(position + 1)
+                .map_or(true, |&(_, next)| next.is_whitespace())
+        {
+            (byte + c.len_utf8(), position + 1)
+        } else if commas && matches!(c, '，' | '、' | '：') {
+            (byte + c.len_utf8(), position + 1)
+        } else if commas
+            && matches!(c, ',' | ':')
             && characters
                 .get(position + 1)
                 .map_or(true, |&(_, next)| next.is_whitespace())
@@ -2388,6 +2404,11 @@ mod long_form_tests {
         assert!(split_in_two(&"1.5 ".repeat(5)).is_none());
         assert!(split_in_two(&"x".repeat(200)).is_none());
         assert!(split_in_two("short。text。").is_none());
+        // Without a sentence end it is cut at a comma, never inside a number.
+        let run_on = format!("{}，{}", "说".repeat(60), "话".repeat(60));
+        let (left, _, right) = split_in_two(&run_on).unwrap();
+        assert!(left.ends_with('，') && right.starts_with('话'));
+        assert!(split_in_two(&format!("{},{}", "1".repeat(60), "2".repeat(60))).is_none());
     }
 
     #[test]
