@@ -1314,7 +1314,7 @@ impl SettingsApp {
         self.dirty |= ui
             .checkbox(
                 &mut self.settings.power_saving_auto,
-                "Turn power saving on and off with Windows battery saver",
+                "Follow Windows: power saving is on exactly while Windows' power saving mode (battery saver) is on",
             )
             .changed();
         ui.add_space(6.0);

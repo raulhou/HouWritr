@@ -167,9 +167,12 @@ unplug the PC finishes.
   kept in `repairs.json` in the same folder.
 * **Turning it on or off never loses anything.** Switching modes only decides
   whether waiting jobs start now.
-* **Let Windows decide.** Settings has *Turn power saving on and off with
-  Windows battery saver*: power saving is then on exactly while Windows'
-  battery saver is on, and the tray item shows that and cannot be changed.
+* **Let Windows decide.** Settings has *Follow Windows*: work then waits
+  exactly while Windows' power saving mode (battery saver, called energy saver
+  on newer Windows) is on, whether the PC is plugged in or not, and runs
+  as soon as it is off, even on battery. The tray item shows that and cannot be
+  changed. (The "Power mode" slider in Windows, such as Best power efficiency,
+  is a different setting and is not read.)
 * The tray tooltip and the Jobs window list what is waiting ("Waiting for the
   PC to be plugged in").
 * Files are decoded to audio when you choose them, which uses a little

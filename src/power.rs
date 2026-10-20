@@ -87,10 +87,16 @@ pub fn saving_on(manual: bool, automatic: bool, status: PowerStatus) -> bool {
     }
 }
 
-/// Whether work waits right now: power saving is on and the PC runs on its
-/// battery.
+/// Whether work waits right now. Following Windows (`automatic`), exactly
+/// while Windows' power saving mode (battery saver, called energy saver on
+/// newer Windows) is on, plugged in or not. With the toggle, while it is on
+/// and the PC runs on its battery.
 pub fn holds_work(manual: bool, automatic: bool, status: PowerStatus) -> bool {
-    saving_on(manual, automatic, status) && status.on_battery
+    if automatic {
+        status.battery_saver
+    } else {
+        manual && status.on_battery
+    }
 }
 
 /// `ACLineStatus`: 0 offline (on battery), 1 online, 255 unknown.
@@ -125,9 +131,12 @@ mod tests {
         assert!(holds_work(true, false, battery));
         assert!(!holds_work(false, false, battery));
         assert!(!holds_work(true, false, plugged));
-        // Automatic: only Windows' battery saver counts, not the toggle.
+        // Automatic: only Windows' power saving mode counts, not the toggle
+        // and not whether the PC is plugged in.
         assert!(!holds_work(true, true, battery));
         assert!(holds_work(false, true, saver));
+        assert!(holds_work(false, true, status_from(1, 1)));
+        assert!(!holds_work(false, true, plugged));
         assert!(saving_on(false, true, saver));
         assert!(!saving_on(true, true, battery));
     }

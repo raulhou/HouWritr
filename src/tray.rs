@@ -155,7 +155,7 @@ impl Tray {
         self.power_saving_item.set_checked(on);
         self.power_saving_item.set_enabled(!automatic);
         self.power_saving_item.set_text(if automatic {
-            "Power saving (follows Windows battery saver)"
+            "Power saving (follows Windows power saving mode)"
         } else {
             POWER_SAVING_TEXT
         });

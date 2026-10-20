@@ -1340,10 +1340,12 @@ impl AppHandler {
                     kind: kind.to_string(),
                 });
                 if first {
-                    self.show_overlay_notice(
-                        NoticeKind::Info,
-                        "Power saving: transcription waits until the PC is plugged in",
-                    );
+                    let message = if self.state.settings.power_saving_auto {
+                        "Windows power saving is on: transcription waits until it is off"
+                    } else {
+                        "Power saving: transcription waits until the PC is plugged in"
+                    };
+                    self.show_overlay_notice(NoticeKind::Info, message);
                 }
                 self.update_job_status();
                 Ok(())
@@ -1364,7 +1366,7 @@ impl AppHandler {
         }
         info!(
             count = held.len(),
-            "plugged in or power saving off: starting the waiting jobs"
+            "power saving ended: starting the waiting jobs"
         );
         for HeldJob {
             spool_id,
@@ -1540,7 +1542,7 @@ impl AppHandler {
                 self.show_overlay_notice(
                     NoticeKind::Info,
                     format!(
-                        "Plugged in: starting {count} waiting job{}",
+                        "Power saving ended: starting {count} waiting job{}",
                         if count == 1 { "" } else { "s" }
                     ),
                 );
@@ -2874,7 +2876,11 @@ impl AppHandler {
                 key: format!("held:{}", held.spool_id),
                 kind: kind.into(),
                 name,
-                state: "Waiting for the PC to be plugged in (saved on disk)".into(),
+                state: if self.state.settings.power_saving_auto {
+                    "Waiting for Windows power saving to end (saved on disk)".into()
+                } else {
+                    "Waiting for the PC to be plugged in (saved on disk)".into()
+                },
                 fraction: None,
                 stop_label: None,
             });
