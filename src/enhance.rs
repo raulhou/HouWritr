@@ -2158,7 +2158,7 @@ fn clean_slices(
     }
 
     let failed = report.total - report.cleaned - report.partly;
-    if failed > 0 {
+    if failed > 0 || report.partly > 0 {
         warn!(
             failed,
             total,
