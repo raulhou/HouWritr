@@ -357,6 +357,7 @@ HouWritr/
 │   ├── copilot_auth.rs      GitHub Copilot sign-in lookup
 │   ├── local_llm.rs         GenieX install, model download, private `geniex serve`
 │   ├── log_files.rs         session and recording logs
+│   ├── memory.rs            hands memory back to Windows when idle
 │   ├── diagnostics.rs       log pruning, diagnostics export, Explorer helpers
 │   └── bin/                 `package` (release zip) and `cleanup_eval`
 └── Cargo.toml
@@ -380,6 +381,12 @@ Key design decisions:
 * **Power.** HouWritr and its GenieX server opt out of Windows power
   throttling, so long background jobs are not slowed when no window is in
   front.
+* **Idle in the tray.** With nothing to do, HouWritr does not wake up: the
+  tray loop, the pills and the settings reload run on events (a menu click,
+  a worker result, a change notification for the settings folder), not on
+  timers. The speech engine is unloaded a minute after the last job, which
+  gives its memory and the NPU back; starting a meeting or picking a file
+  loads it again in the background.
 
 ## NPU pipeline
 

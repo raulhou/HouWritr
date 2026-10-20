@@ -133,6 +133,11 @@ are cut to one copy.
 * **No clipboard, no keystrokes.** Results only ever go to files.
 * **Power.** The app and its GenieX server opt out of Windows power throttling,
   so background jobs keep their speed with no window in front.
+* **Idle in the tray.** HouWritr is meant to run all day, so with nothing to do
+  it sleeps: no polling timers (the tray loop, the pills and the settings
+  reload wait for events), and the speech engine is unloaded a minute after
+  the last job, giving its memory and the NPU back. A meeting or a picked file
+  loads it again in the background.
 * **Observable.** One log per app session and one per transcript, with the
   build commit on the first line and a crash log.
 
