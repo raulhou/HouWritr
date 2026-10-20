@@ -402,6 +402,10 @@ struct OverlayReducer {
     active_job: Option<u64>,
     notice: Option<OverlayNotice>,
     last_view: OverlayViewState,
+    /// Whether the queued / writing / polishing pill may be shown. It follows
+    /// the recording indicator: hidden there, hidden here. Notices (errors,
+    /// warnings) are not progress and still show.
+    progress_visible: bool,
 }
 
 impl Default for OverlayReducer {
@@ -411,6 +415,7 @@ impl Default for OverlayReducer {
             active_job: None,
             notice: None,
             last_view: OverlayViewState::Hidden,
+            progress_visible: true,
         }
     }
 }
@@ -481,7 +486,7 @@ impl OverlayReducer {
         {
             self.notice = None;
         }
-        if let Some(id) = self.active_job {
+        if let Some(id) = self.active_job.filter(|_| self.progress_visible) {
             if let Some(phase) = self.jobs.get(&id) {
                 let queued = self
                     .jobs
@@ -497,7 +502,7 @@ impl OverlayReducer {
             .filter(|(_, phase)| **phase == ProcessingPhase::Queued)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        if let Some(id) = queued.first() {
+        if let Some(id) = queued.first().filter(|_| self.progress_visible) {
             return OverlayViewState::processing(
                 *id,
                 ProcessingPhase::Queued,
@@ -755,6 +760,7 @@ struct AppHandler {
 
 impl AppHandler {
     fn sync_overlay(&mut self) {
+        self.state.overlay_state.progress_visible = self.meeting_indicator_visible();
         self.state
             .overlay_state
             .sync(&self.state.overlay, Instant::now());
@@ -1124,6 +1130,7 @@ impl AppHandler {
                                 if self.state.settings.show_meeting_indicator != old_indicator {
                                     // A saved change replaces any tray toggle.
                                     self.state.meeting_indicator_override = None;
+                                    self.sync_overlay();
                                     self.sync_meeting_indicator();
                                 }
                                 if self.state.settings.overlay != old_overlay {
@@ -1682,6 +1689,7 @@ impl AppHandler {
         let show = !self.meeting_indicator_visible();
         self.state.meeting_indicator_override = Some(show);
         self.state.tray.set_meeting_indicator_visible(show);
+        self.sync_overlay();
         self.sync_meeting_indicator();
         if self.state.meeting.is_some() {
             // Hiding must never be silent while a recording is running.
@@ -3456,6 +3464,28 @@ mod tests {
         assert_eq!(
             reducer.desired_view(now),
             OverlayViewState::notice(NoticeKind::Warning, "old notice")
+        );
+    }
+
+    #[test]
+    fn progress_follows_the_recording_indicator_but_notices_still_show() {
+        let now = Instant::now();
+        let mut reducer = OverlayReducer::default();
+        reducer.job_queued(1);
+        assert!(reducer.job_started(1));
+        assert!(reducer.enhancement_started(1));
+        reducer.job_queued(2);
+        reducer.progress_visible = false;
+        assert_eq!(reducer.desired_view(now), OverlayViewState::Hidden);
+        reducer.show_notice(NoticeKind::Error, "something failed", now);
+        assert_eq!(
+            reducer.desired_view(now),
+            OverlayViewState::notice(NoticeKind::Error, "something failed")
+        );
+        reducer.progress_visible = true;
+        assert_eq!(
+            reducer.desired_view(now),
+            OverlayViewState::processing(1, ProcessingPhase::Enhancing, 1)
         );
     }
 

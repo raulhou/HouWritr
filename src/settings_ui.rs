@@ -1285,7 +1285,7 @@ impl SettingsApp {
         self.dirty |= ui
             .checkbox(
                 &mut self.settings.overlay,
-                "Show transcription progress and status messages",
+                "Show transcription progress and status messages (progress is hidden while the recording indicator is hidden)",
             )
             .changed();
         self.dirty |= ui
