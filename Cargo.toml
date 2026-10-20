@@ -112,6 +112,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
     "Win32_System_Threading",
 ] }
 

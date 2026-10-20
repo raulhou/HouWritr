@@ -170,6 +170,7 @@ fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blockin
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
+        .with_timer(log_files::LocalTime)
         .with_ansi(false)
         .with_thread_ids(true)
         .with_thread_names(true);
@@ -178,12 +179,16 @@ fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blockin
     let recording_layer = owner.then(|| {
         tracing_subscriber::fmt::layer()
             .with_writer(log_files::RecordingWriter)
+            .with_timer(log_files::LocalTime)
             .with_ansi(false)
             .with_thread_ids(true)
             .with_thread_names(true)
     });
-    let console_layer =
-        cfg!(debug_assertions).then(|| tracing_subscriber::fmt::layer().with_ansi(false));
+    let console_layer = cfg!(debug_assertions).then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_timer(log_files::LocalTime)
+            .with_ansi(false)
+    });
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "houwritr=info".into()))

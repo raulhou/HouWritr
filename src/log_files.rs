@@ -18,6 +18,48 @@ use tracing::{info, warn};
 
 use crate::paths;
 
+/// Log time stamps in the PC's own time zone (with its offset), so a line can
+/// be matched against the clock the user sees. Lines from the local model's
+/// server already use local time.
+pub struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        let mut now = std::mem::MaybeUninit::<windows_sys::Win32::Foundation::SYSTEMTIME>::zeroed();
+        // SAFETY: both calls only fill the structures passed to them.
+        let (now, zone, id) = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetLocalTime(now.as_mut_ptr());
+            let mut zone: TIME_ZONE_INFORMATION = std::mem::zeroed();
+            let id = GetTimeZoneInformation(&mut zone);
+            (now.assume_init(), zone, id)
+        };
+        // Windows reports the offset as minutes to add to local time to get
+        // UTC; 2 means daylight saving time is in effect.
+        let behind_utc = zone.Bias
+            + if id == 2 {
+                zone.DaylightBias
+            } else {
+                zone.StandardBias
+            };
+        let ahead = -behind_utc;
+        write!(
+            w,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{}{:02}:{:02}",
+            now.wYear,
+            now.wMonth,
+            now.wDay,
+            now.wHour,
+            now.wMinute,
+            now.wSecond,
+            now.wMilliseconds,
+            if ahead < 0 { '-' } else { '+' },
+            ahead.abs() / 60,
+            ahead.abs() % 60,
+        )
+    }
+}
+
 /// Set by the tray for the windows it opens, so they log into its file.
 const SESSION_LOG_VARIABLE: &str = "HOUWRITR_SESSION_LOG";
 
