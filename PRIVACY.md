@@ -55,6 +55,20 @@ HouWritr connects to the internet only for:
    the model from Qualcomm AI Hub (several GB). Only loopback addresses are
    accepted for a local model.
 
+## Audio kept on disk while work waits
+
+Normally audio is only held in memory while it is transcribed. With **power
+saving** turned on (tray menu or Settings) and the PC running on its battery,
+HouWritr only records, and the audio that is waiting for the PC to be plugged
+in is saved as files under `%LOCALAPPDATA%\HouWritr\pending\` (raw 16 kHz
+audio, uncompressed, not encrypted), together with a small file saying where
+the transcript goes. Each job's files are deleted when its transcript is
+done. Jobs that were not finished when HouWritr was closed, or the battery ran
+out, stay there and are picked up the next time the app starts. Unfinished
+AI cleanup retries (the text of the transcript) are kept in the same folder in
+`repairs.json` until they finish. Nothing in this folder is sent anywhere. You
+can delete the folder to discard everything that is waiting.
+
 ## Data stored on your device
 
 Settings, downloaded models, and a local diagnostic log are stored under

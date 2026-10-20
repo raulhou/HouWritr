@@ -323,6 +323,7 @@ impl SpeakerBook {
     /// clustering threshold are matched first and each known speaker is used
     /// at most once per part, since two different people talking in the same
     /// part must stay different. Everyone left over becomes a new speaker.
+    #[cfg(test)]
     pub fn assign(&mut self, centroids: &[Vec<f32>]) -> Vec<usize> {
         let speech = vec![NEW_SPEAKER_MIN_SAMPLES; centroids.len()];
         self.assign_with_speech(centroids, &speech)

@@ -24,6 +24,7 @@ mod self_check;
 mod settings;
 mod settings_ui;
 mod single_instance;
+mod spool;
 mod transcript_window;
 mod tray;
 mod worker;

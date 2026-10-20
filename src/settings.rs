@@ -330,6 +330,12 @@ pub struct Settings {
     /// Keep a "Recording 12:34" pill on screen for the whole meeting
     /// recording (independent of the status pill).
     pub show_meeting_indicator: bool,
+    /// Power saving: on battery, meetings are only recorded (and files only
+    /// queued); transcription and cleanup wait until the PC is plugged in.
+    pub power_saving: bool,
+    /// Let Windows decide: power saving is on while Windows' battery saver is
+    /// on, and the tray toggle shows that instead of changing it.
+    pub power_saving_auto: bool,
     /// Whether stopping a meeting recording creates AI notes: ask, always
     /// or never.
     pub meeting_notes: MeetingNotesMode,
@@ -349,6 +355,8 @@ impl Default for Settings {
             engine: "parakeet_cpu".into(),
             overlay: true,
             show_meeting_indicator: true,
+            power_saving: false,
+            power_saving_auto: false,
             meeting_notes: MeetingNotesMode::Ask,
             markdown_transcripts: false,
             diarize_speakers: false,

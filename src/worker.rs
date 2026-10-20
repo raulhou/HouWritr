@@ -121,7 +121,7 @@ pub enum JobStage {
 /// recording continues. All parts of a meeting share an `id`; the worker
 /// keeps their texts and speaker identities until the `last` part arrives
 /// and stitches everything together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionPart {
     pub id: u64,
     /// Where this part starts on the meeting's timeline (16 kHz samples), so
@@ -132,7 +132,7 @@ pub struct SessionPart {
 
 /// One stretch of a delivered transcript. `raw` is the text as recognised,
 /// kept only for pieces whose AI cleanup is worth trying again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepairPiece {
     pub text: String,
     pub raw: Option<String>,
@@ -141,7 +141,7 @@ pub struct RepairPiece {
 /// What a delivered transcript still lacks, and how to put it together again
 /// once it is fixed: the app retries in the background (a connection that was
 /// down, say) and rewrites the saved files when cleanup or notes succeed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepairPlan {
     pub pieces: Vec<RepairPiece>,
     /// Put between pieces: a blank line for labelled blocks, a space for

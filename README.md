@@ -146,6 +146,38 @@ playing, only the microphone contributes).
   <time>.txt`, named after when the meeting started. Quitting while recording
   saves what was recorded.
 
+### Power saving
+
+Turn on **Power saving: transcribe only when plugged in** in the tray menu (or
+in Settings → Output and feedback). While it is on and the PC runs on its
+battery, a meeting is **only recorded**, files you choose are **only queued**,
+and no transcription, speaker detection or AI cleanup runs (retries of cleanup
+wait too). When the PC is plugged in (checked every two seconds), or you turn
+the mode off, everything that waited is done in the order it came, then the
+engine and the model unload as usual. A job that has already started when you
+unplug the PC finishes.
+
+* **Nothing waits only in memory.** Each cut part of a meeting, and each
+  queued file, is saved first as files under `%LOCALAPPDATA%\HouWritr\pending\`
+  (the audio is uncompressed 16 kHz, about 115 MB an hour) and deleted when
+  its transcript is done. If the battery runs out, HouWritr is closed or the PC
+  restarts, they are picked up on the next start (and still wait for power if
+  power saving is on). The audio of the part being recorded at that moment
+  (up to five minutes) is only in memory. Unfinished AI cleanup retries are
+  kept in `repairs.json` in the same folder.
+* **Turning it on or off never loses anything.** Switching modes only decides
+  whether waiting jobs start now.
+* **Let Windows decide.** Settings has *Turn power saving on and off with
+  Windows battery saver*: power saving is then on exactly while Windows'
+  battery saver is on, and the tray item shows that and cannot be changed.
+* The tray tooltip and the Jobs window list what is waiting ("Waiting for the
+  PC to be plugged in").
+* Files are decoded to audio when you choose them, which uses a little
+  power; the heavy work (speech recognition, speaker detection, cleanup)
+  waits. If a meeting was split across a restart, the part of it that was
+  finished before the restart is only in its "(in progress)" file, so the
+  final transcript after the restart holds the parts that were waiting.
+
 For in person meetings, use the best microphone available (a conference or
 USB microphone beats a laptop's), keep it near the speakers, and expect quiet
 or distant voices and overlapping speech to be missed.
@@ -345,8 +377,9 @@ Tray icon → right click → **Settings**:
   are not using (it downloads again if you select it later).
 * **Output and feedback**: save transcripts as Markdown (`.md` with a title,
   details line and paragraphs; added by HouWritr, not the AI) or plain text;
-  show the status pill; show the meeting recording indicator; and what to do
-  about meeting notes.
+  show the status pill; show the meeting recording indicator; power saving
+  (and whether Windows' battery saver switches it); and what to do about
+  meeting notes.
 * **Speaker labels**: on or off, model status and management, and **Remove
   models** (see above).
 * **Text enhancement**: **Off** or **On**, the provider, model and prompt.
@@ -367,6 +400,7 @@ options are ignored, and cleanup that used to need Shift is simply on.
 | Meeting transcripts and notes | `Documents\HouWritr\Meetings\` |
 | Transcripts that could not be saved where they belong | `Documents\HouWritr\` |
 | Settings, models, logs | `%LOCALAPPDATA%\HouWritr\` |
+| Jobs waiting for power or unfinished at exit | `%LOCALAPPDATA%\HouWritr\pending\` (deleted when done) |
 | API keys | Windows Credential Manager |
 
 The data folders were called OpenWritr before the rename. HouWritr moves them

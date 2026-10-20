@@ -1296,6 +1296,29 @@ impl SettingsApp {
             .changed();
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
+            let manual = !self.settings.power_saving_auto;
+            self.dirty |= ui
+                .add_enabled(
+                    manual,
+                    egui::Checkbox::new(
+                        &mut self.settings.power_saving,
+                        "Power saving: on battery only record; transcribe and clean up once plugged in",
+                    ),
+                )
+                .changed();
+            info_button(
+                ui,
+                "While this is on and the PC runs on its battery, meetings are only recorded and files are only queued. Everything waits, saved on disk, until the PC is plugged in, and is then done in order. Work that has already started finishes. Also in the tray menu.",
+            );
+        });
+        self.dirty |= ui
+            .checkbox(
+                &mut self.settings.power_saving_auto,
+                "Turn power saving on and off with Windows battery saver",
+            )
+            .changed();
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
             ui.label("When a meeting recording stops, create AI meeting notes:");
             info_button(
                 ui,
