@@ -151,7 +151,7 @@ impl Tray {
 
     /// Show the power saving mode: ticked or not. When Windows' power saving
     /// mode decides (`automatic`) the item still works: a click overrides
-    /// Windows until its mode changes (`overridden`).
+    /// Windows for the session (`overridden`).
     pub fn set_power_saving(&self, on: bool, automatic: bool, overridden: bool) {
         self.power_saving_item.set_checked(on);
         self.power_saving_item.set_enabled(true);
@@ -159,7 +159,7 @@ impl Tray {
             .set_text(match (automatic, overridden) {
                 (false, _) => POWER_SAVING_TEXT,
                 (true, false) => "Power saving (following Windows, click to override)",
-                (true, true) => "Power saving (overriding Windows until it changes)",
+                (true, true) => "Power saving (overriding Windows, this session)",
             });
     }
 

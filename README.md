@@ -171,7 +171,8 @@ makes no difference; for that, use *Follow Windows* below.
   exactly while Windows' power saving mode (battery saver, called energy saver
   on newer Windows) is on, and runs as soon as it is off. Windows decides when
   that is, for example at a low battery level. The tray item shows that, and a click on it overrides
-  Windows until Windows' own mode next changes (for this session only). (The "Power mode" slider in Windows, such as Best power efficiency,
+  Windows for the rest of the session only; click it back, or restart HouWritr,
+  and it follows Windows again. (The "Power mode" slider in Windows, such as Best power efficiency,
   is a different setting and is not read.)
 * The tray tooltip and the Jobs window list what is waiting ("Waiting for
   power saving to be turned off").
