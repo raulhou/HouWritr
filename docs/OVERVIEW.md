@@ -51,7 +51,7 @@ notes and reports.
   is sent in slices to GitHub Copilot, an OpenAI compatible API, or a model on
   this PC (Qwen3 4B on the NPU, alone or with the CPU, through Qualcomm
   GenieX's llama.cpp runtime; or a local server you run).
-  Hosted providers get five slices at a time. Every slice is checked by an
+  Hosted providers get three slices at a time. Every slice is checked by an
   integrity validator, and a slice that fails or cannot be sent keeps its
   recognised text and is retried in the background later.
 * **Meeting notes** (optional): summary, key points, decisions, action items

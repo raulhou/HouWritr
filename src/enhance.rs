@@ -75,15 +75,66 @@ fn send_cancellable(
         }
         let response = result?;
         let status = response.status();
+        if matches!(status.as_u16(), 429 | 503) {
+            let advised = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            RETRY_AFTER_SECONDS.store(advised, Ordering::Release);
+        }
         Ok((status, response.text()?))
     })
 }
 
-/// Pauses before asking again after "busy" (429) or "unavailable" (503).
+/// What the last "busy" answer said to wait (`Retry-After`, in seconds), 0
+/// when it said nothing.
+static RETRY_AFTER_SECONDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Until when a hosted provider that said "too many requests" is left alone.
+/// Every slice worker (and every later retry of the transcript) looks at it
+/// before asking, so a rate limit is waited out once, not tested by each
+/// request in turn.
+static COOLDOWN_UNTIL: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+fn cool_down(pause: Duration) {
+    let until = Instant::now() + pause;
+    let mut shared = COOLDOWN_UNTIL.lock();
+    if shared.map_or(true, |current| current < until) {
+        *shared = Some(until);
+    }
+}
+
+fn cooldown_left() -> Duration {
+    COOLDOWN_UNTIL.lock().map_or(Duration::ZERO, |until| {
+        until.saturating_duration_since(Instant::now())
+    })
+}
+
+/// A request that would have to wait longer than this for the cooldown is not
+/// sent now: the slice keeps its text and is retried in the background.
+const MAX_WAIT_FOR_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// How long to leave the provider alone after it kept saying "too many
+/// requests" through every pause.
+const COOLDOWN_AFTER_GIVING_UP: Duration = Duration::from_secs(300);
+
+/// The pause after the `attempt`th "busy" answer: the provider's own
+/// `Retry-After` when it is longer than ours (at most 5 minutes).
+fn busy_pause(attempt: usize, advised_seconds: u64) -> Duration {
+    let ours = BUSY_PAUSES[attempt.min(BUSY_PAUSES.len() - 1)];
+    ours.max(Duration::from_secs(advised_seconds.min(300)))
+}
+
+/// Pauses before asking again after "busy" (429) or "unavailable" (503). A
+/// rate limit lasts for the better part of a minute or more (GitHub Copilot
+/// said "exceeded your rate limit for utility models" for over 15 minutes
+/// after a burst of requests), so short pauses only add requests to it.
 const BUSY_PAUSES: [Duration; 3] = [
-    Duration::from_secs(4),
-    Duration::from_secs(10),
-    Duration::from_secs(25),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
 ];
 
 /// Wait `pause`, ending early when [`cancel_requests`] is called. `false`
@@ -1310,6 +1361,19 @@ fn request_content(
     if managed {
         crate::local_llm::add_request_options(&mut body, &configured);
     }
+    if !local && !managed {
+        let left = cooldown_left();
+        if left > MAX_WAIT_FOR_COOLDOWN {
+            warn!(
+                ?left,
+                "the cleanup provider is rate limiting; not asking now"
+            );
+            return Err(FallbackReason::RequestFailed);
+        }
+        if !pause_unless_cancelled(left) {
+            return Err(FallbackReason::RequestFailed);
+        }
+    }
     let sent = Instant::now();
     let mut result = match send_cancellable(build(&body, &route), !local) {
         Ok(result) => result,
@@ -1395,13 +1459,16 @@ fn request_content(
     // again after a pause: with several slices in flight at once it will
     // say so now and then, and a slice should not lose its cleanup for it.
     if !local && !managed {
-        for pause in BUSY_PAUSES {
-            let busy = matches!(&result, Ok((status, _)) if matches!(status.as_u16(), 429 | 503));
-            if !busy {
+        let is_busy = |result: &reqwest::Result<(reqwest::StatusCode, String)>| matches!(result, Ok((status, _)) if matches!(status.as_u16(), 429 | 503));
+        for attempt in 0..BUSY_PAUSES.len() {
+            if !is_busy(&result) {
                 break;
             }
+            let pause = busy_pause(attempt, RETRY_AFTER_SECONDS.swap(0, Ordering::AcqRel));
             warn!(?pause, "the cleanup provider is busy; asking again");
-            if !pause_unless_cancelled(pause) {
+            cool_down(pause);
+            // Others may have asked for a longer wait meanwhile.
+            if !pause_unless_cancelled(cooldown_left()) {
                 return Err(FallbackReason::RequestFailed);
             }
             result = match send_cancellable(build(&body, &route), true) {
@@ -1411,6 +1478,9 @@ fn request_content(
                     return Err(FallbackReason::RequestFailed);
                 }
             };
+        }
+        if is_busy(&result) {
+            cool_down(COOLDOWN_AFTER_GIVING_UP);
         }
     }
     let (status, body) = match result {
@@ -1701,7 +1771,7 @@ fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> WarmUp {
 }
 
 /// Slices a hosted provider cleans at the same time.
-const HOSTED_PARALLEL_SLICES: usize = 5;
+const HOSTED_PARALLEL_SLICES: usize = 3;
 
 /// Work shared between the slice workers and the thread putting the
 /// transcript back together.
@@ -3247,5 +3317,18 @@ mod long_form_tests {
         ];
         let order = order_fallbacks("claude-haiku-4.5", &tried, &narrower);
         assert_eq!(order[0].0, "gpt-4.1");
+    }
+
+    #[test]
+    fn a_busy_provider_is_given_long_pauses_and_its_own_advice() {
+        assert_eq!(busy_pause(0, 0), Duration::from_secs(30));
+        assert_eq!(busy_pause(1, 0), Duration::from_secs(60));
+        assert_eq!(busy_pause(2, 0), Duration::from_secs(120));
+        // More attempts than pauses stay at the last one.
+        assert_eq!(busy_pause(9, 0), Duration::from_secs(120));
+        // Its own Retry-After wins when it is longer, up to five minutes.
+        assert_eq!(busy_pause(0, 90), Duration::from_secs(90));
+        assert_eq!(busy_pause(0, 10), Duration::from_secs(30));
+        assert_eq!(busy_pause(0, 9_999), Duration::from_secs(300));
     }
 }
