@@ -949,9 +949,24 @@ fn worker_main(
                                         &result.turns,
                                         result.centroids.len(),
                                     );
+                                    let appearances = asr::diarize::appearances_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    for (speaker, (samples, stretches)) in
+                                        speech.iter().zip(&appearances).enumerate()
+                                    {
+                                        info!(
+                                            speaker,
+                                            seconds = (*samples as f32 / 16_000.0).round(),
+                                            stretches,
+                                            "speaker heard in this file"
+                                        );
+                                    }
                                     let merges = asr::diarize::weak_speaker_merges(
                                         &result.centroids,
                                         &speech,
+                                        &appearances,
                                     );
                                     let turns =
                                         asr::diarize::merge_speakers(&result.turns, &merges);
@@ -1694,6 +1709,15 @@ impl SessionState {
         for part in self.parts.iter_mut().chain(std::iter::once(own)) {
             part.text = relabel_blocks(&part.text, &mut number);
             part.raw = relabel_blocks(&part.raw, &mut number);
+        }
+        for (speaker, (seconds, parts)) in self.speakers.heard().into_iter().enumerate() {
+            info!(
+                speaker,
+                seconds = seconds.round(),
+                parts,
+                counted_as = merges.get(speaker).copied().unwrap_or(speaker),
+                "speaker heard in this meeting"
+            );
         }
         info!(
             found = self.speakers.len(),
