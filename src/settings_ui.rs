@@ -1302,13 +1302,13 @@ impl SettingsApp {
                     manual,
                     egui::Checkbox::new(
                         &mut self.settings.power_saving,
-                        "Power saving: on battery only record; transcribe and clean up once plugged in",
+                        "Power saving: only record, and transcribe and clean up once it is turned off",
                     ),
                 )
                 .changed();
             info_button(
                 ui,
-                "While this is on and the PC runs on its battery, meetings are only recorded and files are only queued. Everything waits, saved on disk, until the PC is plugged in, and is then done in order. Work that has already started finishes. Also in the tray menu.",
+                "While this is on, meetings are only recorded and files are only queued. Everything waits, saved on disk, until you turn it off, and is then done in order. It does not depend on whether the PC is plugged in. Work that has already started finishes. Also in the tray menu.",
             );
         });
         self.dirty |= ui

@@ -25,7 +25,7 @@ pub struct Tray {
     meeting_indicator_item: MenuItem,
 }
 
-const POWER_SAVING_TEXT: &str = "Power saving: transcribe only when plugged in";
+const POWER_SAVING_TEXT: &str = "Power saving: only record, transcribe later";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeetingMenuState {
@@ -149,8 +149,8 @@ impl Tray {
         self.power_saving_item.is_checked()
     }
 
-    /// Show the power saving mode: ticked or not, and when Windows' battery
-    /// saver decides (`automatic`) the item is a read only display.
+    /// Show the power saving mode: ticked or not, and when Windows' power
+    /// saving mode decides (`automatic`) the item is a read only display.
     pub fn set_power_saving(&self, on: bool, automatic: bool) {
         self.power_saving_item.set_checked(on);
         self.power_saving_item.set_enabled(!automatic);

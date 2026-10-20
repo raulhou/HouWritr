@@ -148,14 +148,14 @@ playing, only the microphone contributes).
 
 ### Power saving
 
-Turn on **Power saving: transcribe only when plugged in** in the tray menu (or
-in Settings → Output and feedback). While it is on and the PC runs on its
-battery, a meeting is **only recorded**, files you choose are **only queued**,
-and no transcription, speaker detection or AI cleanup runs (retries of cleanup
-wait too). When the PC is plugged in (checked every two seconds), or you turn
-the mode off, everything that waited is done in the order it came, then the
-engine and the model unload as usual. A job that has already started when you
-unplug the PC finishes.
+Turn on **Power saving: only record, transcribe later** in the tray menu (or in
+Settings → Output and feedback). While it is on, a meeting is **only
+recorded**, files you choose are **only queued**, and no transcription,
+speaker detection or AI cleanup runs (retries of cleanup wait too). When you
+turn the mode off (checked every two seconds), everything that waited is done
+in the order it came, then the engine and the model unload as usual. A job that
+has already started when you turn it on finishes. Whether the PC is plugged in
+makes no difference; for that, use *Follow Windows* below.
 
 * **Nothing waits only in memory.** Each cut part of a meeting, and each
   queued file, is saved first as files under `%LOCALAPPDATA%\HouWritr\pending\`
@@ -169,12 +169,12 @@ unplug the PC finishes.
   whether waiting jobs start now.
 * **Let Windows decide.** Settings has *Follow Windows*: work then waits
   exactly while Windows' power saving mode (battery saver, called energy saver
-  on newer Windows) is on, whether the PC is plugged in or not, and runs
-  as soon as it is off, even on battery. The tray item shows that and cannot be
+  on newer Windows) is on, and runs as soon as it is off. Windows decides when
+  that is, for example at a low battery level. The tray item shows that and cannot be
   changed. (The "Power mode" slider in Windows, such as Best power efficiency,
   is a different setting and is not read.)
-* The tray tooltip and the Jobs window list what is waiting ("Waiting for the
-  PC to be plugged in").
+* The tray tooltip and the Jobs window list what is waiting ("Waiting for
+  power saving to be turned off").
 * Files are decoded to audio when you choose them, which uses a little
   power; the heavy work (speech recognition, speaker detection, cleanup)
   waits. If a meeting was split across a restart, the part of it that was

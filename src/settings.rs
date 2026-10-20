@@ -330,11 +330,11 @@ pub struct Settings {
     /// Keep a "Recording 12:34" pill on screen for the whole meeting
     /// recording (independent of the status pill).
     pub show_meeting_indicator: bool,
-    /// Power saving: on battery, meetings are only recorded (and files only
-    /// queued); transcription and cleanup wait until the PC is plugged in.
+    /// Power saving: meetings are only recorded (and files only queued);
+    /// transcription and cleanup wait until it is turned off.
     pub power_saving: bool,
     /// Let Windows decide: work waits exactly while Windows' power saving mode
-    /// (battery saver, energy saver) is on, plugged in or not, and the tray
+    /// (battery saver, energy saver) is on, and the tray
     /// toggle shows that instead of changing it.
     pub power_saving_auto: bool,
     /// Whether stopping a meeting recording creates AI notes: ask, always

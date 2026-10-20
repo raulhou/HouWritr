@@ -50,17 +50,16 @@ pub fn opt_out_for_this_process() {
     }
 }
 
-/// What Windows reports about the power supply.
+/// What Windows reports about its power saving mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PowerStatus {
-    /// Running on the battery (not plugged in).
-    pub on_battery: bool,
-    /// Windows' battery saver is on.
+    /// Windows' power saving mode (battery saver, called energy saver on
+    /// newer Windows) is on.
     pub battery_saver: bool,
 }
 
-/// Read the power status. A desktop, or a status Windows does not know, counts
-/// as plugged in with battery saver off.
+/// Read the power status. A status Windows does not report counts as power
+/// saving off.
 pub fn status() -> PowerStatus {
     let mut raw = SYSTEM_POWER_STATUS {
         ACLineStatus: 255,
@@ -74,7 +73,7 @@ pub fn status() -> PowerStatus {
     if unsafe { GetSystemPowerStatus(&mut raw) } == 0 {
         return PowerStatus::default();
     }
-    status_from(raw.ACLineStatus, raw.SystemStatusFlag)
+    status_from(raw.SystemStatusFlag)
 }
 
 /// Whether power saving is on: the toggle, or Windows' battery saver when
@@ -87,23 +86,11 @@ pub fn saving_on(manual: bool, automatic: bool, status: PowerStatus) -> bool {
     }
 }
 
-/// Whether work waits right now. Following Windows (`automatic`), exactly
-/// while Windows' power saving mode (battery saver, called energy saver on
-/// newer Windows) is on, plugged in or not. With the toggle, while it is on
-/// and the PC runs on its battery.
-pub fn holds_work(manual: bool, automatic: bool, status: PowerStatus) -> bool {
-    if automatic {
-        status.battery_saver
-    } else {
-        manual && status.on_battery
-    }
-}
-
-/// `ACLineStatus`: 0 offline (on battery), 1 online, 255 unknown.
-/// `SystemStatusFlag`: 1 when battery saver is on.
-fn status_from(line: u8, system_flag: u8) -> PowerStatus {
+/// `SystemStatusFlag`: 1 when battery saver is on. Whether the PC is plugged
+/// in does not matter: Windows itself decides when its power saving mode is
+/// on.
+fn status_from(system_flag: u8) -> PowerStatus {
     PowerStatus {
-        on_battery: line == 0,
         battery_saver: system_flag == 1,
     }
 }
@@ -113,31 +100,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_offline_ac_line_means_battery_and_flag_one_means_saver() {
-        assert!(status_from(0, 0).on_battery);
-        assert!(!status_from(1, 0).on_battery);
-        assert!(!status_from(255, 0).on_battery);
-        assert!(status_from(0, 1).battery_saver);
-        assert!(!status_from(0, 0).battery_saver);
-        assert_eq!(status_from(255, 0), PowerStatus::default());
+    fn only_flag_one_means_windows_power_saving_is_on() {
+        assert!(status_from(1).battery_saver);
+        assert!(!status_from(0).battery_saver);
+        assert!(!status_from(255).battery_saver);
+        assert_eq!(status_from(0), PowerStatus::default());
     }
 
     #[test]
-    fn work_waits_only_with_power_saving_on_and_on_battery() {
-        let battery = status_from(0, 0);
-        let saver = status_from(0, 1);
-        let plugged = status_from(1, 0);
-        // The toggle decides when it is not automatic.
-        assert!(holds_work(true, false, battery));
-        assert!(!holds_work(false, false, battery));
-        assert!(!holds_work(true, false, plugged));
-        // Automatic: only Windows' power saving mode counts, not the toggle
-        // and not whether the PC is plugged in.
-        assert!(!holds_work(true, true, battery));
-        assert!(holds_work(false, true, saver));
-        assert!(holds_work(false, true, status_from(1, 1)));
-        assert!(!holds_work(false, true, plugged));
+    fn the_toggle_decides_unless_following_windows() {
+        let saver = status_from(1);
+        let normal = status_from(0);
+        assert!(saving_on(true, false, normal));
+        assert!(saving_on(true, false, saver));
+        assert!(!saving_on(false, false, saver));
+        // Following Windows: only its power saving mode counts, not the
+        // toggle.
         assert!(saving_on(false, true, saver));
-        assert!(!saving_on(true, true, battery));
+        assert!(!saving_on(true, true, normal));
     }
 }

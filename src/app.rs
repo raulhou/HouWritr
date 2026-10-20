@@ -120,7 +120,7 @@ struct RepairRecord {
     failed_rounds: u32,
 }
 
-/// A job waiting for the PC to be plugged in. Its audio is only on disk.
+/// A job waiting for power saving to end. Its audio is only on disk.
 struct HeldJob {
     spool_id: u64,
     job: FileJob,
@@ -577,7 +577,7 @@ struct State {
     /// Jobs the worker has started, and the latest progress of each.
     running_jobs: HashSet<u64>,
     job_progress: HashMap<u64, (JobStage, usize, usize)>,
-    /// Jobs kept on disk until the PC is plugged in (power saving).
+    /// Jobs kept on disk until power saving ends.
     spool: Spool,
     held: Vec<HeldJob>,
     /// What Windows said about the power supply at the last check.
@@ -1270,8 +1270,8 @@ impl AppHandler {
             return;
         }
         self.state.power = power::status();
-        // Jobs go to the worker in the order they came: when the PC has just
-        // been plugged in, the waiting ones start before this one.
+        // Jobs go to the worker in the order they came: when power saving has
+        // just ended, the waiting ones start before this one.
         if !self.hold_for_power() && self.engine_ready() {
             self.release_held_jobs();
         }
@@ -1300,16 +1300,12 @@ impl AppHandler {
         )
     }
 
-    /// Work waits: power saving is on and the PC runs on its battery.
+    /// Work waits: power saving is on.
     fn hold_for_power(&self) -> bool {
-        power::holds_work(
-            self.state.settings.power_saving,
-            self.state.settings.power_saving_auto,
-            self.state.power,
-        )
+        self.power_saving_on()
     }
 
-    /// Keep the job and its audio on disk until the PC is plugged in. The job
+    /// Keep the job and its audio on disk until power saving ends. The job
     /// comes back when it could not be saved: it is then done at once rather
     /// than lost.
     fn hold_job(
@@ -1340,7 +1336,7 @@ impl AppHandler {
                     done: 0,
                     total: 0,
                 });
-                info!(id, kind, "job kept on disk until the PC is plugged in");
+                info!(id, kind, "job kept on disk until power saving ends");
                 self.state.held.push(HeldJob {
                     spool_id: id,
                     job,
@@ -1350,7 +1346,7 @@ impl AppHandler {
                     let message = if self.state.settings.power_saving_auto {
                         "Windows power saving is on: transcription waits until it is off"
                     } else {
-                        "Power saving: transcription waits until the PC is plugged in"
+                        "Power saving is on: transcription waits until you turn it off"
                     };
                     self.show_overlay_notice(NoticeKind::Info, message);
                 }
@@ -1511,8 +1507,8 @@ impl AppHandler {
     }
 
     /// Every couple of seconds: look at the power supply, show the power
-    /// saving mode in the tray, and start the waiting jobs once the PC is
-    /// plugged in (or power saving is off) and the engine is ready.
+    /// saving mode in the tray, and start the waiting jobs once power saving
+    /// is off and the engine is ready.
     fn poll_power(&mut self) {
         if self.state.power_checked_at.elapsed() < POWER_CHECK_INTERVAL {
             return;
@@ -1533,7 +1529,6 @@ impl AppHandler {
         if holding != held_before {
             info!(
                 holding,
-                on_battery = self.state.power.on_battery,
                 battery_saver = self.state.power.battery_saver,
                 "power state changed"
             );
@@ -1595,7 +1590,7 @@ impl AppHandler {
         self.show_overlay_notice(
             NoticeKind::Info,
             if on {
-                "Power saving on: on battery, recordings wait for power before transcription"
+                "Power saving on: recordings wait before transcription until you turn it off"
             } else {
                 "Power saving off"
             },
@@ -2887,7 +2882,7 @@ impl AppHandler {
                 state: if self.state.settings.power_saving_auto {
                     "Waiting for Windows power saving to end (saved on disk)".into()
                 } else {
-                    "Waiting for the PC to be plugged in (saved on disk)".into()
+                    "Waiting for power saving to be turned off (saved on disk)".into()
                 },
                 fraction: None,
                 stop_label: None,

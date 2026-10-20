@@ -1,8 +1,8 @@
 //! Jobs waiting on disk.
 //!
-//! With power saving on and the PC on its battery, a meeting is only
-//! recorded and files are only queued: the work waits until the PC is plugged
-//! in. Everything that waits is kept as files in `%LOCALAPPDATA%\HouWritr\pending`
+//! With power saving on, a meeting is only recorded and files are only
+//! queued: the work waits until power saving is turned off. Everything that
+//! waits is kept as files in `%LOCALAPPDATA%\HouWritr\pending`
 //! so that nothing is lost when the battery runs out, HouWritr is closed, or
 //! the setting is switched: every held job is a small JSON file (what to do
 //! with the audio and where the transcript goes) and the audio itself as raw
