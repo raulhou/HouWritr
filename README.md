@@ -198,13 +198,12 @@ text and never as audio, to the provider you chose, which fixes punctuation
 and recognition slips:
 
 * The transcript is sent in slices: about 3,000 characters for a hosted
-  provider (half of that for Chinese and Japanese, which take more tokens per
-  character, so more slices can run together) and 1,200 for a model on this PC
+  provider and 1,200 for a model on this PC
   (a third of that for Chinese and Japanese). Slices are cut at sentence ends
   and never split a speaker's block.
 * With a hosted provider one tiny request first finds a working model, then
-  three slices are cleaned at a time; the results are put back in order. A
-  provider that answers "busy" (429) or "unavailable" (503) is asked again
+  one slice at a time is cleaned (a rate limit costs more than the minutes
+  this takes). A provider that answers "busy" (429) or "unavailable" (503) is asked again
   after 30, 60 and 120 seconds (or what its Retry-After says, if longer), and
   all slices and later retries wait out that pause together; if it still
   refuses, it is left alone for 5 minutes and the slices are retried in the

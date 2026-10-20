@@ -1205,24 +1205,7 @@ fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
     if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
-        scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, text)
-    }
-}
-
-/// Chinese, Japanese and Korean cost about one token a character, so a hosted
-/// model writes the answer to a 3,000 character slice in 45 to 75 seconds.
-/// Shorter slices let more of them run at the same time and keep the last
-/// ones from waiting on one long reply.
-fn scaled_for_hosted(base_chars: usize, text: &str) -> usize {
-    let total = text.chars().filter(|c| !c.is_whitespace()).count();
-    if total == 0 {
-        return base_chars;
-    }
-    let cjk = text.chars().filter(|&c| is_cjk(c)).count();
-    match cjk * 100 / total {
-        0..=9 => base_chars,
-        10..=29 => base_chars * 3 / 4,
-        _ => base_chars / 2,
+        LONG_FORM_CLEANUP_CHARS
     }
 }
 
@@ -1770,8 +1753,13 @@ fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> WarmUp {
     WarmUp::Down
 }
 
-/// Slices a hosted provider cleans at the same time.
-const HOSTED_PARALLEL_SLICES: usize = 3;
+/// Slices a hosted provider cleans at the same time. One: GitHub Copilot
+/// refused every request for over 15 minutes ("exceeded your rate limit for
+/// utility models") after bursts of five at a time, and a failed cleanup costs
+/// more than the minutes a sequential one takes. Raising it again means
+/// sending more requests per minute (and the 3,000 character slices of
+/// Chinese about 2,000 tokens each).
+const HOSTED_PARALLEL_SLICES: usize = 1;
 
 /// Work shared between the slice workers and the thread putting the
 /// transcript back together.
@@ -3110,20 +3098,6 @@ mod long_form_tests {
         assert_eq!(result.report.cleaned, 6);
         // Without the first slice finishing alone, three ran together.
         assert_eq!(most.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn hosted_slices_are_shorter_for_chinese() {
-        let english = "word ".repeat(200);
-        let chinese = "我们这个时候说的话还是对的。".repeat(50);
-        assert_eq!(
-            scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, &english),
-            LONG_FORM_CLEANUP_CHARS
-        );
-        assert_eq!(
-            scaled_for_hosted(LONG_FORM_CLEANUP_CHARS, &chinese),
-            LONG_FORM_CLEANUP_CHARS / 2
-        );
     }
 
     #[test]
