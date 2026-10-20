@@ -205,7 +205,12 @@ and recognition slips:
 * With a hosted provider one tiny request first finds a working model, then
   five slices are cleaned at a time; the results are put back in order. A
   provider that answers "busy" (429) or "unavailable" (503) is asked again
-  after 4, 10 and 25 seconds. A model on this PC gets one slice at a time.
+  after 4, 10 and 25 seconds. If that first request is not answered twice in a
+  row, the provider is treated as down: no slice waits out its own timeout,
+  and all of them are left for the retry in the background. With GitHub
+  Copilot, a model the account's sign-in is refused is tried under the other
+  app identity before a different model is used. A model on this PC gets one
+  slice at a time.
 * `[m:ss]` markers are held back from the request and put back afterwards.
 * Speaker labels are held back too. When a section holds several speakers,
   each speaker's block is sent with a tag (`[A]`, `[B]`, ...) that the model

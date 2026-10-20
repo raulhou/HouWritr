@@ -395,18 +395,40 @@ fn copilot_fallbacks(
     token: &str,
     source: TokenSource,
 ) -> Vec<(String, &'static str)> {
-    let mut pairs = Vec::new();
-    for integration in copilot_integrations(source) {
-        let Some(available) = copilot_models(wanted, token, integration) else {
-            continue;
-        };
-        pairs.extend(
-            rank_copilot_models(wanted, &available)
-                .into_iter()
-                .map(|model| (model, integration))
-                .filter(|pair| pair.0 != tried.0 || pair.1 != tried.1)
-                .take(COPILOT_TRIES_PER_IDENTITY),
-        );
+    let offers: Vec<(&'static str, Vec<String>)> = copilot_integrations(source)
+        .into_iter()
+        .filter_map(|integration| {
+            copilot_models(wanted, token, integration).map(|available| (integration, available))
+        })
+        .collect();
+    order_fallbacks(wanted, tried, &offers)
+}
+
+/// What to try after `tried` was refused, given the models each identity
+/// offers: the configured model under the other identity first (a model that
+/// one identity refuses is often allowed under the other, and the user chose
+/// it), then the closest models of each identity.
+fn order_fallbacks(
+    wanted: &str,
+    tried: &(String, &'static str),
+    offers: &[(&'static str, Vec<String>)],
+) -> Vec<(String, &'static str)> {
+    let mut pairs: Vec<(String, &'static str)> = Vec::new();
+    let is_tried = |pair: &(String, &'static str)| pair.0 == tried.0 && pair.1 == tried.1;
+    for (integration, available) in offers {
+        let pair = (wanted.to_string(), *integration);
+        if available.iter().any(|id| id == wanted) && !is_tried(&pair) {
+            pairs.push(pair);
+        }
+    }
+    for (integration, available) in offers {
+        let ranked: Vec<(String, &'static str)> = rank_copilot_models(wanted, available)
+            .into_iter()
+            .map(|model| (model, *integration))
+            .filter(|pair| !is_tried(pair) && !pairs.contains(pair))
+            .take(COPILOT_TRIES_PER_IDENTITY)
+            .collect();
+        pairs.extend(ranked);
     }
     pairs
 }
@@ -1567,27 +1589,62 @@ pub fn enhance_long_form(
     // Finding a working model takes the first request; waiting for a whole
     // slice to come back first cost the time of one slice (45 to 75 seconds
     // for Chinese) before the others started.
-    let ready = warm_up_hosted(settings, instruction);
+    let warm_up = warm_up_hosted(settings, instruction);
+    if warm_up == WarmUp::Down {
+        warn!("the cleanup provider did not answer; the slices are left for a retry later");
+        return clean_slices(
+            slices,
+            &joins,
+            |slice| {
+                Some(EnhanceOutcome::raw_fallback(
+                    slice,
+                    FallbackReason::RequestFailed,
+                ))
+            },
+            &give_up,
+            &interrupted,
+            progress,
+        );
+    }
+    let ready = warm_up == WarmUp::Working;
     with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, ready, &clean, |take| {
         clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
     })
 }
 
+/// What the first tiny request to a hosted provider showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarmUp {
+    /// It answered: the slices can start together.
+    Working,
+    /// It did not answer, twice: it is down or stalled.
+    Down,
+    /// Something else (a refusal, say): start one slice at a time as before.
+    Unclear,
+}
+
 /// One tiny request that finds the working model and checks the provider
-/// answers, so the slices can start together. `false` when it did not clearly
-/// work; the slices then start one at a time as before.
-fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> bool {
-    matches!(
-        enhance_outcome_with("OK", settings, instruction, || true),
-        Some(
-            EnhanceOutcome::Enhanced { .. }
+/// answers, so the slices can start together. When the provider does not
+/// answer it is asked once more; two silences in a row mean every slice would
+/// wait out its own timeout (about 150 seconds each, three of them in a row,
+/// seen when Copilot stalled for a quarter of an hour), so the job leaves
+/// the slices for the background retry at once.
+fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> WarmUp {
+    for _ in 0..2 {
+        match enhance_outcome_with("OK", settings, instruction, || true) {
+            Some(
+                EnhanceOutcome::Enhanced { .. }
                 | EnhanceOutcome::Skipped { .. }
                 | EnhanceOutcome::RawFallback {
                     reason: FallbackReason::IntegrityRejected(_),
                     ..
-                }
-        )
-    )
+                },
+            ) => return WarmUp::Working,
+            Some(EnhanceOutcome::RawFallback { reason, .. }) if is_unreachable(&reason) => {}
+            _ => return WarmUp::Unclear,
+        }
+    }
+    WarmUp::Down
 }
 
 /// Slices a hosted provider cleans at the same time.
@@ -3041,5 +3098,40 @@ mod long_form_tests {
         assert_eq!(split_tagged("Here you go: [A] a [B] b", 2), None);
         // A block that came back empty is a change.
         assert_eq!(split_tagged("[A] a [B] [C] c", 3), None);
+    }
+
+    #[test]
+    fn the_configured_model_is_tried_under_the_other_identity_first() {
+        let offered = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let offers = vec![
+            (
+                COPILOT_CLI,
+                offered(&["claude-haiku-4.5", "gpt-4.1", "gpt-4o-mini"]),
+            ),
+            (
+                COPILOT_VSCODE,
+                offered(&["claude-haiku-4.5", "gpt-4.1", "gpt-4o"]),
+            ),
+        ];
+        let tried = ("claude-haiku-4.5".to_string(), COPILOT_CLI);
+        let order = order_fallbacks("claude-haiku-4.5", &tried, &offers);
+        assert_eq!(
+            order.first(),
+            Some(&("claude-haiku-4.5".to_string(), COPILOT_VSCODE))
+        );
+        // Nothing is listed twice and the refused pair is not asked again.
+        assert!(!order.contains(&tried));
+        let mut seen = order.clone();
+        seen.dedup();
+        assert_eq!(seen, order);
+        // The other models follow.
+        assert!(order.contains(&("gpt-4.1".to_string(), COPILOT_CLI)));
+        // A model the other identity does not offer is not tried under it.
+        let narrower = vec![
+            (COPILOT_CLI, offered(&["claude-haiku-4.5", "gpt-4.1"])),
+            (COPILOT_VSCODE, offered(&["gpt-4.1"])),
+        ];
+        let order = order_fallbacks("claude-haiku-4.5", &tried, &narrower);
+        assert_eq!(order[0].0, "gpt-4.1");
     }
 }
