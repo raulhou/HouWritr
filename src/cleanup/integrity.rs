@@ -298,6 +298,19 @@ pub struct NumberChanges {
     pub gained_numbers: Vec<String>,
 }
 
+/// The digit numbers written in `text` (not those of speaker labels), in
+/// order of first appearance, each once.
+pub fn numbers_in(text: &str) -> Vec<String> {
+    let (_, without_labels) = split_speaker_labels(text);
+    let mut numbers: Vec<String> = Vec::new();
+    for number in numeric_tokens(&without_labels) {
+        if !numbers.contains(&number) {
+            numbers.push(number);
+        }
+    }
+    numbers
+}
+
 /// Count how the numbers differ between `source` and `candidate`, for the
 /// log of a rejected cleanup.
 pub fn number_changes(source: &str, candidate: &str) -> NumberChanges {

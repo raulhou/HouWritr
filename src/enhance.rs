@@ -803,6 +803,30 @@ fn is_splittable(reason: &FallbackReason) -> bool {
     )
 }
 
+/// The instruction that names the numbers of `slice`, for a second try after
+/// the model changed one. `None` when the slice holds no digits.
+fn number_hint(slice: &str) -> Option<String> {
+    let numbers = crate::cleanup::integrity::numbers_in(slice);
+    if numbers.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = numbers.into_iter().take(12).collect();
+    Some(format!(
+        "The transcript contains these numbers written in digits: {}. Keep each one exactly as written: do not drop it, do not change it, do not complete a short year (23 stays 23), and do not merge or split numbers.",
+        listed.join(", ")
+    ))
+}
+
+/// Two optional instructions as one.
+fn combined_instruction(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Cut `slice` in two at the block or sentence end nearest its middle:
 /// `(left, gap, right)`, where the gap is the whitespace between them. `None`
 /// when no cut leaves both pieces at least [`MIN_PIECE_CHARS`] long.
@@ -863,12 +887,37 @@ fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
 fn clean_splitting(
     slice: &str,
     depth: usize,
-    clean: &mut dyn FnMut(&str) -> Option<EnhanceOutcome>,
+    clean: &mut dyn FnMut(&str, Option<&str>) -> Option<EnhanceOutcome>,
 ) -> Option<EnhanceOutcome> {
-    let outcome = clean(slice)?;
+    let outcome = clean(slice, None)?;
     let EnhanceOutcome::RawFallback { reason, .. } = &outcome else {
         return Some(outcome);
     };
+    // The model changed a number (dropped it, or completed a short year): ask
+    // once more, naming the numbers it has to keep. That is one request, and
+    // it often works where cutting the slice in two does not (the same input
+    // gives the same answer, and some slices cannot be cut).
+    if matches!(reason, FallbackReason::IntegrityRejected(kinds)
+        if kinds.contains(&ViolationKind::FactualDigitChanged))
+    {
+        if let Some(hint) = number_hint(slice) {
+            info!(
+                chars = slice.chars().count(),
+                depth, "cleanup slice changed a number; asking again with the numbers named"
+            );
+            let again = clean(slice, Some(&hint))?;
+            match &again {
+                EnhanceOutcome::Enhanced { .. } => {
+                    info!("cleanup slice recovered with its numbers named");
+                    return Some(again);
+                }
+                EnhanceOutcome::RawFallback { reason, .. } if !is_splittable(reason) => {
+                    return Some(again);
+                }
+                _ => {}
+            }
+        }
+    }
     if depth >= MAX_SPLITS || !is_splittable(reason) {
         return Some(outcome);
     }
@@ -1570,8 +1619,11 @@ pub fn enhance_long_form(
             slices,
             &joins,
             |slice| {
-                clean_splitting(slice, 0, &mut |piece| {
-                    clean_slice_keeping_labels(piece, settings, instruction, || !interrupted())
+                clean_splitting(slice, 0, &mut |piece, hint| {
+                    let instruction = combined_instruction(instruction, hint);
+                    clean_slice_keeping_labels(piece, settings, instruction.as_deref(), || {
+                        !interrupted()
+                    })
                 })
             },
             &give_up,
@@ -1581,8 +1633,9 @@ pub fn enhance_long_form(
     }
     // Workers cannot see `interrupted`; it is checked as results are taken.
     let clean = |slice: &str| {
-        clean_splitting(slice, 0, &mut |piece| {
-            clean_slice_keeping_labels(piece, settings, instruction, || true)
+        clean_splitting(slice, 0, &mut |piece, hint| {
+            let instruction = combined_instruction(instruction, hint);
+            clean_slice_keeping_labels(piece, settings, instruction.as_deref(), || true)
         })
     };
     let all: Vec<&str> = slices.clone();
@@ -2321,7 +2374,7 @@ mod long_form_tests {
         );
         let mut calls = 0;
         // The model "cleans" by upper-casing, and always garbles text with BAD.
-        let mut clean = |piece: &str| {
+        let mut clean = |piece: &str, _hint: Option<&str>| {
             calls += 1;
             Some(if piece.contains("BAD") {
                 EnhanceOutcome::raw_fallback(
@@ -2347,7 +2400,7 @@ mod long_form_tests {
         assert!(calls > 1 && calls <= 1 + 2 + 4, "{calls}");
 
         // Every piece fails: the slice keeps its text and the first reason.
-        let mut always = |piece: &str| {
+        let mut always = |piece: &str, _hint: Option<&str>| {
             Some(EnhanceOutcome::raw_fallback(
                 piece,
                 FallbackReason::IntegrityRejected(vec![ViolationKind::NegationChanged]),
@@ -2359,7 +2412,7 @@ mod long_form_tests {
         ));
         // A provider failure is not retried in halves.
         let mut calls = 0;
-        let mut down = |piece: &str| {
+        let mut down = |piece: &str, _hint: Option<&str>| {
             calls += 1;
             Some(EnhanceOutcome::raw_fallback(
                 piece,
@@ -2369,8 +2422,69 @@ mod long_form_tests {
         clean_splitting(&text, 0, &mut down);
         assert_eq!(calls, 1);
         // Interrupted: stops at once.
-        assert!(clean_splitting(&text, 0, &mut |_| None).is_none());
+        assert!(clean_splitting(&text, 0, &mut |_, _| None).is_none());
         let _ = rejected();
+    }
+
+    #[test]
+    fn a_changed_number_is_asked_again_with_the_numbers_named() {
+        let text = "Speaker 2: 在23年和24年，我们有578个人。";
+        let digits = FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]);
+        // The first answer changes a number; the answer with the hint is good.
+        let mut hints: Vec<Option<String>> = Vec::new();
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            hints.push(hint.map(str::to_string));
+            Some(if hint.is_some() {
+                EnhanceOutcome::enhanced(piece.to_string(), Vec::new())
+            } else {
+                EnhanceOutcome::raw_fallback(piece, digits.clone())
+            })
+        };
+        let outcome = clean_splitting(text, 0, &mut clean).unwrap();
+        assert!(matches!(outcome, EnhanceOutcome::Enhanced { .. }));
+        assert_eq!(hints.len(), 2);
+        let hint = hints[1].as_deref().unwrap();
+        assert!(hint.contains("23, 24, 578"), "{hint}");
+        assert!(!hint.contains("Speaker 2"));
+        assert_eq!(
+            crate::cleanup::integrity::numbers_in("Speaker 12: 3 and 3 and 7.5"),
+            vec!["3".to_string(), "7.5".to_string()]
+        );
+
+        // Not a number: no hint, and the slice is cut in two as before.
+        let labels = FallbackReason::IntegrityRejected(vec![ViolationKind::SpeakerLabelsChanged]);
+        let mut hinted = false;
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            hinted |= hint.is_some();
+            Some(EnhanceOutcome::raw_fallback(piece, labels.clone()))
+        };
+        clean_splitting(text, 0, &mut clean);
+        assert!(!hinted);
+
+        // No digits in the slice: nothing to name.
+        assert!(number_hint("没有数字。").is_none());
+        // A provider failure on the second ask is passed on, not cut in two.
+        let mut calls = 0;
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            calls += 1;
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                if hint.is_some() {
+                    FallbackReason::RequestFailed
+                } else {
+                    digits.clone()
+                },
+            ))
+        };
+        let outcome = clean_splitting(text, 0, &mut clean).unwrap();
+        assert!(matches!(
+            outcome,
+            EnhanceOutcome::RawFallback {
+                reason: FallbackReason::RequestFailed,
+                ..
+            }
+        ));
+        assert_eq!(calls, 2);
     }
 
     #[test]

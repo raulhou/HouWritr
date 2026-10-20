@@ -225,9 +225,14 @@ and recognition slips:
   text, and the log says why. If no slice can be cleaned, the raw transcript is
   saved with a warning that names the reason.
 
-**Changes the safety checks refuse.** When the cleaned version of a section
-changes a number or a speaker label, that section is not discarded at once:
-it is cut in two at the sentence or block boundary nearest its middle, each
+**Changes the number and label checks refuse.** The cleaned version of a
+section is compared with the original: every number written in digits and
+every speaker label has to be the same (a model that "completes" 23 to 2023,
+drops a figure or merges two speakers' turns changes what was said). This is
+not a content filter and nothing is blocked: a section that fails keeps its
+recognised text. When it failed on a number, the model is first asked once
+more with the numbers of that section named. If that does not help, or it
+was a speaker label, the section is cut in two at the sentence or block boundary nearest its middle, each
 half is cleaned on its own (and cut again if it fails too, down to about a
 quarter of the section), and the pieces are put back together with the gaps
 they had. Only the smallest piece that keeps failing keeps its recognised

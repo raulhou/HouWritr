@@ -270,8 +270,8 @@ fn cleanup_notice(report: &crate::enhance::CleanupReport) -> Option<String> {
         }
     }
     // Neither cleaned, cleaned in part nor unreachable: the cleaned version
-    // failed the safety checks (a number or speaker label changed) even for
-    // the smallest piece, or was empty.
+    // changed a number or a speaker label even for the smallest piece, or
+    // was empty.
     let kept = report
         .total
         .saturating_sub(report.cleaned)
@@ -283,13 +283,13 @@ fn cleanup_notice(report: &crate::enhance::CleanupReport) -> Option<String> {
     );
     if report.partly > 0 {
         notice.push_str(&format!(
-            " {} more in part: the pieces that failed the safety checks kept the recognised text.",
+            " {} more in part: a piece of each kept the recognised text because the cleaned version changed a number or a speaker label.",
             report.partly
         ));
     }
     if kept > 0 {
         notice.push_str(&format!(
-            " {kept} kept the recognised text because the cleaned version failed the safety checks (a number or speaker label changed), even in smaller pieces; they are not retried."
+            " {kept} kept the recognised text because the cleaned version changed a number or a speaker label, even in smaller pieces and when asked again; they are not retried."
         ));
     }
     if report.unreachable > 0 {

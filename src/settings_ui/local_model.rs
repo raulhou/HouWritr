@@ -407,7 +407,7 @@ impl SettingsApp {
         status_label(
             ui,
             "Built-in models are smaller than hosted ones: cleanup of long recordings takes longer, \
-             and changes it makes that fail HouWritr's safety checks fall back to the original text.",
+             and a cleaned section that changes a number or a speaker label is discarded: the original text stays.",
             secondary_text(),
         );
     }
