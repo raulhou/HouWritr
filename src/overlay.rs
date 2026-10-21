@@ -16,8 +16,8 @@
 //! wave shimmer.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc::{self, Receiver, Sender, TryRecvError},
+    atomic::{AtomicU32, Ordering},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     Arc,
 };
 use std::thread;
@@ -53,10 +53,13 @@ const WAVEFORM_LABEL_PADDING: i32 = 4;
 /// Hard cap on notice text so a runaway error message can never blow up
 /// layout or `DrawTextW`; longer text is truncated with an ellipsis.
 const MAX_NOTICE_CHARS: usize = 160;
+/// Time between animation frames while moving bars are on screen.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Shortest bar drawn, in pixels.
+const MIN_BAR_HEIGHT: i32 = 6;
 
 pub struct OverlayHandles {
     pub level_x10000: Arc<AtomicU32>,
-    pub stop: Arc<AtomicBool>,
 }
 
 /// Stage of a queued transcription/enhancement job, used by
@@ -127,6 +130,16 @@ impl OverlayViewState {
     pub fn is_hidden(&self) -> bool {
         matches!(self, OverlayViewState::Hidden)
     }
+
+    /// Whether the bars move, so the pill needs new frames while it is on
+    /// screen. Notices are plain text, and a paused meeting's bars are all
+    /// at their minimum height (see `paused_bars_do_not_move`).
+    fn is_animated(&self) -> bool {
+        matches!(
+            self,
+            OverlayViewState::Processing { .. } | OverlayViewState::Meeting { paused: false, .. }
+        )
+    }
 }
 
 /// Commands accepted by the overlay's dedicated thread.
@@ -134,6 +147,8 @@ impl OverlayViewState {
 pub enum OverlayCommand {
     SetEnabled(bool),
     SetState(OverlayViewState),
+    /// Close the pill and end its threads (HouWritr is quitting).
+    Stop,
 }
 
 #[derive(Clone)]
@@ -152,6 +167,12 @@ impl OverlayController {
         self.sender
             .send(OverlayCommand::SetState(state))
             .map_err(|_| "overlay command channel is closed")
+    }
+
+    /// Close the pill for good. Its thread may be asleep waiting for a
+    /// command, so this is a command too.
+    pub fn stop(&self) {
+        let _ = self.sender.send(OverlayCommand::Stop);
     }
 }
 
@@ -221,7 +242,6 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
         SHARED.with(|slot| *slot.borrow_mut() = Some(shared.clone()));
 
         let level = handles.level_x10000.clone();
-        let stop = handles.stop.clone();
         let hwnd_u = hwnd.0 as usize;
         thread::Builder::new()
             .name("overlay-tick".into())
@@ -233,14 +253,43 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
                 // the live RMS atomic — never of recorder/app lifecycle bits.
                 let mut state = TickState::new(enabled);
                 let started = Instant::now();
-                'tick: while !stop.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(33));
-                    loop {
+                'tick: loop {
+                    // Moving bars get a frame per interval; `sleep` keeps
+                    // that even (a timed channel wait rounds to the system
+                    // timer tick), and commands are read at the next frame.
+                    // Otherwise sleep until a command arrives or a notice
+                    // expires: a hidden pill (most of the time) never wakes
+                    // up on its own.
+                    let mut next = if state.is_animating() {
+                        thread::sleep(FRAME_INTERVAL);
                         match commands.try_recv() {
-                            Ok(command) => state.apply_command(command, Instant::now()),
-                            Err(TryRecvError::Empty) => break,
+                            Ok(command) => Some(command),
+                            Err(TryRecvError::Empty) => None,
                             Err(TryRecvError::Disconnected) => break 'tick,
                         }
+                    } else {
+                        match state.next_wake(Instant::now()) {
+                            None => match commands.recv() {
+                                Ok(command) => Some(command),
+                                Err(_) => break 'tick,
+                            },
+                            Some(wait) => match commands.recv_timeout(wait) {
+                                Ok(command) => Some(command),
+                                Err(RecvTimeoutError::Timeout) => None,
+                                Err(RecvTimeoutError::Disconnected) => break 'tick,
+                            },
+                        }
+                    };
+                    while let Some(command) = next.take() {
+                        if matches!(command, OverlayCommand::Stop) {
+                            break 'tick;
+                        }
+                        state.apply_command(command, Instant::now());
+                        next = match commands.try_recv() {
+                            Ok(command) => Some(command),
+                            Err(TryRecvError::Empty) => None,
+                            Err(TryRecvError::Disconnected) => break 'tick,
+                        };
                     }
                     let hwnd = HWND(hwnd_u as *mut _);
                     let visible = state.tick(Instant::now());
@@ -456,18 +505,7 @@ unsafe fn draw_waveform_bars(mem_dc: HDC, layout: &WaveformLayout, color: u32, a
     let old_pen = SelectObject(mem_dc, pen.into());
 
     for i in 0..NBARS {
-        let t = i as f32 / (NBARS - 1) as f32;
-        let centered = (t - 0.5).abs() * 2.0;
-        let envelope = (-centered * centered * 2.2).exp();
-        let w1 = (phase * 5.5 + t * 7.0).sin();
-        let w2 = (phase * 3.2 - t * 4.0).sin();
-        let wobble = (w1 * 0.6 + w2 * 0.4) * 0.5 + 0.5;
-        let mixed = envelope * (0.35 + 0.65 * wobble) * amp;
-        // Round to even so the bar is symmetric around the center line.
-        let mut bar_h = (mixed * layout.max_bar_height as f32).max(6.0) as i32;
-        if bar_h % 2 != 0 {
-            bar_h += 1;
-        }
+        let bar_h = bar_height(i, phase, amp, layout.max_bar_height);
         let x = layout.bars_left + i as i32 * (BAR_W + BAR_GAP);
         let top = layout.bars_center_y - bar_h / 2;
         let bot = top + bar_h;
@@ -478,6 +516,24 @@ unsafe fn draw_waveform_bars(mem_dc: HDC, layout: &WaveformLayout, color: u32, a
     let _ = DeleteObject(pen.into());
     SelectObject(mem_dc, old_brush);
     let _ = DeleteObject(bar_brush.into());
+}
+
+/// Height in pixels of bar `index` at animation time `phase` (seconds):
+/// a Gaussian envelope with a wobble of two waves, scaled by `amplitude`.
+fn bar_height(index: usize, phase: f32, amplitude: f32, max_bar_height: i32) -> i32 {
+    let t = index as f32 / (NBARS - 1) as f32;
+    let centered = (t - 0.5).abs() * 2.0;
+    let envelope = (-centered * centered * 2.2).exp();
+    let w1 = (phase * 5.5 + t * 7.0).sin();
+    let w2 = (phase * 3.2 - t * 4.0).sin();
+    let wobble = (w1 * 0.6 + w2 * 0.4) * 0.5 + 0.5;
+    let mixed = envelope * (0.35 + 0.65 * wobble) * amplitude;
+    // Round to even so the bar is symmetric around the center line.
+    let mut bar_h = (mixed * max_bar_height as f32).max(MIN_BAR_HEIGHT as f32) as i32;
+    if bar_h % 2 != 0 {
+        bar_h += 1;
+    }
+    bar_h
 }
 
 /// Small single-line caption beside the waveform bars (e.g. "Recording 1:05",
@@ -587,7 +643,25 @@ impl TickState {
                 };
                 self.view = view;
             }
+            // Handled by the thread loop, which ends.
+            OverlayCommand::Stop => {}
         }
+    }
+
+    /// How long the thread may sleep when no command arrives: one frame
+    /// while moving bars are on screen, otherwise until a pending notice
+    /// expires. `None` means nothing changes until the next command.
+    fn next_wake(&self, now: Instant) -> Option<Duration> {
+        if self.is_animating() {
+            return Some(FRAME_INTERVAL);
+        }
+        self.notice_deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    /// Moving bars are on screen.
+    fn is_animating(&self) -> bool {
+        self.is_visible() && self.view.is_animated()
     }
 
     /// Called every tick: expires a stale notice (collapsing it to
@@ -1117,6 +1191,93 @@ mod tests {
         assert!(!state.tick(now), "hidden by setting");
         state.apply_command(OverlayCommand::SetEnabled(true), now);
         assert!(state.tick(now), "shown again once enabled");
+    }
+
+    // --- waking only when something changes ------------------------------
+
+    #[test]
+    fn a_hidden_pill_sleeps_until_a_command_arrives() {
+        let now = Instant::now();
+        assert_eq!(TickState::new(true).next_wake(now), None);
+        assert_eq!(TickState::new(false).next_wake(now), None);
+
+        let mut state = TickState::new(false);
+        state.apply_command(
+            OverlayCommand::SetState(OverlayViewState::processing(1, ProcessingPhase::Queued, 0)),
+            now,
+        );
+        assert_eq!(state.next_wake(now), None, "turned off: nothing to draw");
+    }
+
+    #[test]
+    fn moving_bars_get_frames_while_on_screen() {
+        let now = Instant::now();
+        for view in [
+            OverlayViewState::processing(1, ProcessingPhase::Transcribing, 0),
+            OverlayViewState::meeting(5, false),
+        ] {
+            let mut state = TickState::new(true);
+            state.apply_command(OverlayCommand::SetState(view), now);
+            assert!(state.tick(now));
+            assert_eq!(state.next_wake(now), Some(FRAME_INTERVAL));
+        }
+    }
+
+    #[test]
+    fn a_paused_meeting_and_notices_are_drawn_once_not_animated() {
+        let now = Instant::now();
+        let mut state = TickState::new(true);
+        state.apply_command(
+            OverlayCommand::SetState(OverlayViewState::meeting(5, true)),
+            now,
+        );
+        assert!(state.tick(now));
+        assert_eq!(state.next_wake(now), None);
+
+        state.apply_command(
+            OverlayCommand::SetState(notice(NoticeKind::Info, "Saved")),
+            now,
+        );
+        assert!(state.tick(now));
+        let later = now + Duration::from_secs(1);
+        assert_eq!(
+            state.next_wake(later),
+            Some(notice_duration(NoticeKind::Info) - Duration::from_secs(1)),
+            "wakes only to take the notice down"
+        );
+        let expired = now + notice_duration(NoticeKind::Info);
+        assert_eq!(state.next_wake(expired), Some(Duration::ZERO));
+        assert!(!state.tick(expired));
+        assert_eq!(state.next_wake(expired), None);
+    }
+
+    #[test]
+    fn paused_bars_do_not_move() {
+        let layout = waveform_layout(WIN_W, WIN_H, 80);
+        let amplitude = waveform_amplitude(&OverlayViewState::meeting(5, true), 9_000);
+        for step in 0..500 {
+            let phase = step as f32 * 0.033;
+            for bar in 0..NBARS {
+                assert_eq!(
+                    bar_height(bar, phase, amplitude, layout.max_bar_height),
+                    MIN_BAR_HEIGHT
+                );
+            }
+        }
+        // A recording meeting does move, which is why it is animated.
+        let amplitude = waveform_amplitude(&OverlayViewState::meeting(5, false), 0);
+        let middle = NBARS / 2;
+        let heights: std::collections::HashSet<i32> = (0..100)
+            .map(|step| {
+                bar_height(
+                    middle,
+                    step as f32 * 0.033,
+                    amplitude,
+                    layout.max_bar_height,
+                )
+            })
+            .collect();
+        assert!(heights.len() > 1);
     }
 
     // --- long notice text robustness -------------------------------------

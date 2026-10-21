@@ -33,7 +33,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use tray_icon::menu::MenuEvent;
+use tray_icon::menu::{MenuEvent, MenuId};
+use tray_icon::TrayIconEvent;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -58,7 +59,14 @@ pub enum UserEvent {
     FileImportEnded(Option<String>),
     /// Answer to "also create meeting notes?" after a recording stopped.
     MeetingNotesChoice(bool),
-    Tick,
+    /// A tray menu item was clicked.
+    Menu(MenuId),
+    /// The worker sent events (see [`Worker::spawn`]).
+    WorkerActivity,
+    /// Something changed in the folder that holds settings.json.
+    SettingsChanged,
+    /// The settings folder can no longer be watched; fall back to polling.
+    SettingsWatchStopped,
 }
 
 // DETACHED_PROCESS | CREATE_NO_WINDOW — child fully decoupled from parent
@@ -231,6 +239,18 @@ fn minutes(seconds: u64) -> String {
 const REPAIR_BACKOFF_SECONDS: [u64; 5] = [120, 300, 600, 1_200, 1_800];
 /// Pause between steps of one productive round.
 const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
+/// Settings are read this long after the first change notification, so the
+/// burst of notifications one save causes is handled with one read.
+const SETTINGS_SETTLE: Duration = Duration::from_millis(150);
+/// How often settings.json is read when its folder cannot be watched.
+const SETTINGS_POLL_FALLBACK: Duration = Duration::from_secs(2);
+/// How often the tray loop looks for a Stop press while a transcript window
+/// or the Jobs window is open: those run on threads of their own and do not
+/// wake it.
+const STOP_POLL: Duration = Duration::from_millis(250);
+/// Shortest sleep of the tray loop, so a deadline that has just passed can
+/// never make it spin.
+const MIN_WAIT: Duration = Duration::from_millis(20);
 /// A cheap fingerprint to tell whether saved bytes changed.
 fn fingerprint(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -241,8 +261,6 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 
 /// How often the power supply is looked at.
 const POWER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
-/// How often the main loop looks for a changed settings file.
-const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long to wait before the next round after `failed_rounds` fruitless
 /// ones, or `None` to give up.
@@ -547,11 +565,13 @@ struct State {
     active_job: Option<u64>,
     shutting_down: bool,
     discarding_jobs: bool,
-    hk_stop: Arc<AtomicBool>,
     settings_revision: Option<SettingsRevision>,
-    /// When the settings file was last checked for changes (see
-    /// [`SETTINGS_CHECK_INTERVAL`]).
-    settings_checked_at: Instant,
+    /// When to read settings.json next: soon after a change notification,
+    /// or on the fallback poll when the folder cannot be watched.
+    settings_check_at: Option<Instant>,
+    /// Whether a change notification watches the settings folder.
+    settings_watched: bool,
+    /// When to unload the speech engine.
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
     meeting: Option<MeetingRecorder>,
@@ -631,23 +651,33 @@ pub fn run() -> Result<()> {
         overlay = settings.overlay,
         "settings loaded"
     );
-    let tray = tray::Tray::new(&settings)?;
-    tray.set_meeting_indicator_visible(settings.show_meeting_indicator);
-    let worker = Worker::spawn()?;
-
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    // Tells the status pills' threads to stop when HouWritr quits.
-    let hk_stop = Arc::new(AtomicBool::new(false));
-    spawn_tick_thread(proxy.clone());
+    // The tray loop sleeps until something happens; everything that needs it
+    // wakes it through the proxy. Menu clicks arrive as events of their own.
+    let menu_proxy = parking_lot::Mutex::new(proxy.clone());
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let _ = menu_proxy.lock().send_event(UserEvent::Menu(event.id));
+    }));
+    // Clicks on and moves over the icon itself are not used. Without a
+    // handler they would pile up in a channel nobody reads, for as long as
+    // HouWritr runs.
+    TrayIconEvent::set_event_handler(Some(|_event: TrayIconEvent| {}));
+
+    let tray = tray::Tray::new(&settings)?;
+    tray.set_meeting_indicator_visible(settings.show_meeting_indicator);
+    let worker_proxy = parking_lot::Mutex::new(proxy.clone());
+    let worker = Worker::spawn(Arc::new(move || {
+        let _ = worker_proxy.lock().send_event(UserEvent::WorkerActivity);
+    }))?;
+    let settings_watched = spawn_settings_watcher(proxy.clone());
 
     // Status pill (job progress and notices) on its own thread and Win32
     // message loop, so it can never stall the tray loop.
     let overlay = overlay::spawn(
         overlay::OverlayHandles {
             level_x10000: Arc::new(AtomicU32::new(0)),
-            stop: hk_stop.clone(),
         },
         settings.overlay,
     )?;
@@ -656,7 +686,6 @@ pub fn run() -> Result<()> {
     let meeting_overlay = overlay::spawn(
         overlay::OverlayHandles {
             level_x10000: meeting_level.clone(),
-            stop: hk_stop.clone(),
         },
         settings.show_meeting_indicator,
     )?;
@@ -677,9 +706,11 @@ pub fn run() -> Result<()> {
         active_job: None,
         shutting_down: false,
         discarding_jobs: false,
-        hk_stop,
         settings_revision,
-        settings_checked_at: Instant::now(),
+        // Once at start: a save made between the first read above and the
+        // watcher starting would otherwise go unseen until the next one.
+        settings_check_at: Some(Instant::now()),
+        settings_watched,
         proxy,
         diagnostics_exporting: false,
         meeting: None,
@@ -708,9 +739,9 @@ pub fn run() -> Result<()> {
         repairs_saved: fingerprint(&[]),
     };
 
-    // Wait mode: loop sleeps until a message arrives (tray click, user event,
-    // window event). The tick thread wakes it via EventLoopProxy.
-    // No more thread::sleep inside the message pump → tray stays responsive.
+    // The loop sleeps until a message arrives (menu click, worker event,
+    // settings change) or until the next deadline it set itself (see
+    // `next_deadline`). Idle, it does not wake at all.
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = AppHandler { state };
@@ -721,19 +752,109 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn spawn_tick_thread(proxy: EventLoopProxy<UserEvent>) {
-    // Tick the event loop every 100 ms so periodic tasks (tray menu poll,
-    // staged engine, settings reload, transcribe-done flag) get serviced
-    // even when no input is happening.
-    thread::Builder::new()
-        .name("tick".into())
-        .spawn(move || loop {
-            thread::sleep(Duration::from_millis(100));
-            if proxy.send_event(UserEvent::Tick).is_err() {
-                break;
+/// Watch the folder that holds settings.json and send
+/// [`UserEvent::SettingsChanged`] for every change, so settings are read
+/// when they change instead of on a timer. Saves replace the file through a
+/// temporary file in the same folder, so every save and every deletion is
+/// seen. Returns false if the folder cannot be watched.
+fn spawn_settings_watcher(proxy: EventLoopProxy<UserEvent>) -> bool {
+    let settings_path = crate::paths::settings_path();
+    let Some(folder) = settings_path.parent() else {
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(folder) {
+        warn!(error = %error, "could not create the settings folder; polling settings instead");
+        return false;
+    }
+    let stopped = proxy.clone();
+    watch_folder(
+        folder.to_path_buf(),
+        move || proxy.send_event(UserEvent::SettingsChanged).is_ok(),
+        move || {
+            let _ = stopped.send_event(UserEvent::SettingsWatchStopped);
+        },
+    )
+}
+
+/// Call `changed` on a thread of its own after changes to files directly in
+/// `folder` (not in its subfolders), until it returns false; `stopped` runs
+/// when watching ends. Returns false if the folder cannot be watched.
+fn watch_folder(
+    folder: PathBuf,
+    changed: impl Fn() -> bool + Send + 'static,
+    stopped: impl FnOnce() + Send + 'static,
+) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    };
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+
+    let wide = folder
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `wide` is a NUL terminated path that lives for the call.
+    let handle = unsafe {
+        FindFirstChangeNotificationW(
+            wide.as_ptr(),
+            0,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        warn!(
+            error = %std::io::Error::last_os_error(),
+            folder = %folder.display(),
+            "could not watch the folder; polling settings instead"
+        );
+        return false;
+    }
+    // A HANDLE is a raw pointer; pass it to the thread as a number.
+    let raw = handle as usize;
+    let spawned = thread::Builder::new()
+        .name("settings-watch".into())
+        .spawn(move || {
+            let handle = raw as HANDLE;
+            loop {
+                // SAFETY: `handle` is a valid change notification handle,
+                // closed only after this loop.
+                if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
+                    break;
+                }
+                // One save causes several notifications; changes made until
+                // the handle is armed again are kept by Windows, so a short
+                // pause loses nothing and can never let this loop spin.
+                thread::sleep(Duration::from_millis(100));
+                if !folder.is_dir() {
+                    // Renamed or deleted: nothing left to watch.
+                    break;
+                }
+                // Arm it again before telling the app, so a change made while it
+                // reads the file is reported again rather than missed.
+                if unsafe { FindNextChangeNotification(handle) } == 0 {
+                    break;
+                }
+                if !changed() {
+                    break;
+                }
             }
-        })
-        .ok();
+            // SAFETY: closed exactly once, after the last use.
+            unsafe { FindCloseChangeNotification(handle) };
+            stopped();
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(error = %error, "could not start the folder watcher; polling settings instead");
+            // SAFETY: the thread did not start, so nothing else uses it.
+            unsafe { FindCloseChangeNotification(handle) };
+            false
+        }
+    }
 }
 
 /// Why AI cleanup gave no output, in words for the transcript window and
@@ -810,6 +931,81 @@ impl AppHandler {
             }
         }
     }
+
+    /// While a transcript window, the Jobs window or a waiting job could have
+    /// its Stop pressed: Stop is set from threads that do not wake the loop.
+    fn stop_poll_deadline(&self, now: Instant) -> Option<Instant> {
+        let watching = self.state.jobs_window.is_some()
+            || !self.state.held.is_empty()
+            || self
+                .state
+                .file_jobs
+                .values()
+                .any(|job| job.stop.is_some() && !job.stop_sent);
+        watching.then(|| now + STOP_POLL)
+    }
+
+    /// When the power supply is next looked at. Only while following Windows'
+    /// power saving mode: that can change without any event reaching us. Every
+    /// other change (the tray toggle, the settings) wakes the loop itself.
+    fn power_check_deadline(&self) -> Option<Instant> {
+        self.state
+            .settings
+            .power_saving_auto
+            .then(|| self.state.power_checked_at + POWER_CHECK_INTERVAL)
+    }
+
+    /// The earliest moment the tray loop has something to do without being
+    /// woken by an event: a notice to take down, the meeting clock, a cleanup
+    /// retry, the power supply check or the settings fallback poll. `None` means
+    /// it can sleep until the next event.
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let notice = self
+            .state
+            .overlay_state
+            .notice
+            .as_ref()
+            .map(|notice| notice.expires_at);
+        let meeting_clock = self
+            .state
+            .meeting
+            .as_ref()
+            .filter(|recorder| !recorder.is_paused())
+            .map(|recorder| next_clock_tick(now, recorder.elapsed()));
+        let repair = if self.state.shutting_down {
+            None
+        } else {
+            next_repair_attempt(&self.state.repairs)
+        };
+        [
+            notice,
+            meeting_clock,
+            repair,
+            self.power_check_deadline(),
+            self.stop_poll_deadline(now),
+            self.state.settings_check_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
+/// When the meeting clock, at `elapsed` recorded time now, shows its next
+/// second. A little late rather than early, so the label has changed.
+fn next_clock_tick(now: Instant, elapsed: Duration) -> Instant {
+    let into_second = Duration::from_nanos(u64::from(elapsed.subsec_nanos()));
+    now + (Duration::from_secs(1) - into_second) + Duration::from_millis(10)
+}
+
+/// The earliest background cleanup retry still waiting for its time (those
+/// in flight report back through the worker).
+fn next_repair_attempt(repairs: &[Repair]) -> Option<Instant> {
+    repairs
+        .iter()
+        .filter(|repair| repair.in_flight.is_none() && next_repair_step(&repair.plan).is_some())
+        .map(|repair| repair.next_attempt)
+        .min()
 }
 
 impl ApplicationHandler<UserEvent> for AppHandler {
@@ -854,6 +1050,21 @@ impl ApplicationHandler<UserEvent> for AppHandler {
             UserEvent::MeetingNotesChoice(create_notes) => {
                 self.finish_pending_meeting(create_notes);
             }
+            UserEvent::Menu(id) => self.handle_menu(el, id),
+            // Drained in `about_to_wait`, which runs after every wake.
+            UserEvent::WorkerActivity => {}
+            UserEvent::SettingsChanged => {
+                if self.state.settings_check_at.is_none() {
+                    self.state.settings_check_at = Some(Instant::now() + SETTINGS_SETTLE);
+                }
+            }
+            UserEvent::SettingsWatchStopped => {
+                if self.state.settings_watched {
+                    warn!("the settings folder is no longer watched; polling settings instead");
+                    self.state.settings_watched = false;
+                    self.state.settings_check_at = Some(Instant::now());
+                }
+            }
             UserEvent::FileImportEnded(error) => {
                 self.state.file_import_running = false;
                 if let Some(error) = error {
@@ -867,14 +1078,18 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                     self.update_job_status();
                 }
             }
-            UserEvent::Tick => self.tick(el),
         }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // Wait mode: don't sleep here; tick thread + user events wake us.
+        // Runs after every batch of events and at every deadline; then the
+        // loop sleeps until the next event or deadline, if there is one.
         self.tick(el);
-        el.set_control_flow(ControlFlow::Wait);
+        let now = Instant::now();
+        el.set_control_flow(match self.next_deadline(now) {
+            Some(deadline) => ControlFlow::WaitUntil(deadline.max(now + MIN_WAIT)),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
@@ -931,6 +1146,7 @@ impl AppHandler {
         self.sync_overlay();
         self.sync_meeting_indicator();
         self.update_jobs_window();
+        self.sync_repairs_to_disk();
         self.poll_power();
 
         let meeting_status = self
@@ -963,221 +1179,225 @@ impl AppHandler {
             self.roll_meeting_part();
         }
 
-        // Drain tray menu events.
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.state.tray.menu_quit_id {
-                self.request_shutdown(el);
-                return;
+        // Read settings.json once its folder reported a change (or on the
+        // fallback poll), not on a timer.
+        let now = Instant::now();
+        if self.state.settings_check_at.is_some_and(|at| now >= at) {
+            self.state.settings_check_at =
+                (!self.state.settings_watched).then(|| now + SETTINGS_POLL_FALLBACK);
+            self.check_settings();
+        }
+    }
+
+    /// One click on a tray menu item.
+    fn handle_menu(&mut self, el: &ActiveEventLoop, id: MenuId) {
+        if id == self.state.tray.menu_quit_id {
+            self.request_shutdown(el);
+            return;
+        }
+        if id == self.state.tray.menu_cancel_model_id {
+            if matches!(self.state.engine_state, EngineState::Loading) {
+                self.state.load_generation = self.state.worker.cancel_load();
+                self.state.engine_state = EngineState::NotStarted;
+                self.state.model_state = Some(ModelState::Cancelled);
+                self.state.tray.set_status(
+                    tray::IconColor::Error,
+                    "HouWritr — model download cancelled; choose Retry",
+                );
+                info!("model acquisition cancelled by user");
             }
-            if ev.id == self.state.tray.menu_cancel_model_id {
-                if matches!(self.state.engine_state, EngineState::Loading) {
-                    self.state.load_generation = self.state.worker.cancel_load();
-                    self.state.engine_state = EngineState::NotStarted;
-                    self.state.model_state = Some(ModelState::Cancelled);
-                    self.state.tray.set_status(
-                        tray::IconColor::Error,
-                        "HouWritr — model download cancelled; choose Retry",
-                    );
-                    info!("model acquisition cancelled by user");
-                }
-                continue;
+            return;
+        }
+        if id == self.state.tray.menu_retry_engine_id {
+            self.start_engine_load();
+            return;
+        }
+        if id == self.state.tray.menu_open_logs_id {
+            if let Err(e) = diagnostics::open_logs_dir() {
+                warn!(error = %e, "failed to open logs directory");
+                self.state.tray.set_status(
+                    tray::IconColor::Error,
+                    "HouWritr — could not open logs (see log)",
+                );
             }
-            if ev.id == self.state.tray.menu_retry_engine_id {
-                self.start_engine_load();
-                continue;
-            }
-            if ev.id == self.state.tray.menu_open_logs_id {
-                if let Err(e) = diagnostics::open_logs_dir() {
-                    warn!(error = %e, "failed to open logs directory");
-                    self.state.tray.set_status(
-                        tray::IconColor::Error,
-                        "HouWritr — could not open logs (see log)",
-                    );
-                }
-                continue;
-            }
-            if ev.id == self.state.tray.menu_export_diagnostics_id {
-                if !self.state.diagnostics_exporting {
-                    self.state.diagnostics_exporting = true;
-                    self.state
-                        .tray
-                        .set_tooltip("HouWritr — exporting diagnostics…");
-                    let settings = self.state.settings.clone();
-                    let proxy = self.state.proxy.clone();
-                    let spawn = thread::Builder::new()
-                        .name("diagnostics-export".into())
-                        .spawn(move || {
-                            let event = match diagnostics::export_bundle(&settings) {
-                                Ok(path) => {
-                                    info!(file = %path.display(), "diagnostics exported");
-                                    if let Err(e) = diagnostics::reveal(&path) {
-                                        warn!(error = %e, "failed to reveal diagnostics bundle");
-                                    }
-                                    UserEvent::DiagnosticsExported
+            return;
+        }
+        if id == self.state.tray.menu_export_diagnostics_id {
+            if !self.state.diagnostics_exporting {
+                self.state.diagnostics_exporting = true;
+                self.state
+                    .tray
+                    .set_tooltip("HouWritr — exporting diagnostics…");
+                let settings = self.state.settings.clone();
+                let proxy = self.state.proxy.clone();
+                let spawn = thread::Builder::new()
+                    .name("diagnostics-export".into())
+                    .spawn(move || {
+                        let event = match diagnostics::export_bundle(&settings) {
+                            Ok(path) => {
+                                info!(file = %path.display(), "diagnostics exported");
+                                if let Err(e) = diagnostics::reveal(&path) {
+                                    warn!(error = %e, "failed to reveal diagnostics bundle");
                                 }
-                                Err(e) => UserEvent::DiagnosticsExportFailed(e.to_string()),
-                            };
-                            let _ = proxy.send_event(event);
-                        });
-                    if let Err(e) = spawn {
-                        self.state.diagnostics_exporting = false;
-                        warn!(error = %e, "failed to start diagnostics export");
-                        self.state
-                            .tray
-                            .set_tooltip("HouWritr — diagnostics export failed (see log)");
-                    }
-                } else {
+                                UserEvent::DiagnosticsExported
+                            }
+                            Err(e) => UserEvent::DiagnosticsExportFailed(e.to_string()),
+                        };
+                        let _ = proxy.send_event(event);
+                    });
+                if let Err(e) = spawn {
+                    self.state.diagnostics_exporting = false;
+                    warn!(error = %e, "failed to start diagnostics export");
                     self.state
                         .tray
-                        .set_tooltip("HouWritr — diagnostics export already running");
+                        .set_tooltip("HouWritr — diagnostics export failed (see log)");
                 }
-                continue;
+            } else {
+                self.state
+                    .tray
+                    .set_tooltip("HouWritr — diagnostics export already running");
             }
-            if ev.id == self.state.tray.menu_transcribe_file_id {
-                self.start_file_import();
-                continue;
+            return;
+        }
+        if id == self.state.tray.menu_transcribe_file_id {
+            self.start_file_import();
+            return;
+        }
+        if id == self.state.tray.menu_meeting_id {
+            if self.state.meeting.is_some() {
+                self.stop_meeting(true);
+            } else {
+                self.start_meeting();
             }
-            if ev.id == self.state.tray.menu_jobs_id {
-                if self
-                    .state
-                    .jobs_window
-                    .as_ref()
-                    .is_some_and(|window| window.is_open())
-                {
-                    info!("jobs window already open");
-                } else {
-                    match crate::jobs_window::JobsWindow::open() {
-                        Ok(window) => self.state.jobs_window = Some(window),
-                        Err(error) => warn!(error = %error, "could not open the jobs window"),
-                    }
-                    self.update_jobs_window();
+            return;
+        }
+        if id == self.state.tray.menu_jobs_id {
+            if self
+                .state
+                .jobs_window
+                .as_ref()
+                .is_some_and(|window| window.is_open())
+            {
+                info!("jobs window already open");
+            } else {
+                match crate::jobs_window::JobsWindow::open() {
+                    Ok(window) => self.state.jobs_window = Some(window),
+                    Err(error) => warn!(error = %error, "could not open the jobs window"),
                 }
-                continue;
+                self.update_jobs_window();
             }
-            if ev.id == self.state.tray.menu_meeting_id {
-                if self.state.meeting.is_some() {
-                    self.stop_meeting(true);
-                } else {
-                    self.start_meeting();
-                }
-                continue;
+            return;
+        }
+        if id == self.state.tray.menu_power_saving_id {
+            self.toggle_power_saving();
+            return;
+        }
+        if id == self.state.tray.menu_meeting_pause_id {
+            self.toggle_meeting_pause();
+            return;
+        }
+        if id == self.state.tray.menu_meeting_indicator_id {
+            self.toggle_meeting_indicator();
+            return;
+        }
+        if id == self.state.tray.menu_settings_id {
+            info!("opening settings UI subprocess");
+            // CRITICAL: spawn from a background thread. CreateProcessW on
+            // Windows ARM64 (especially with Defender real-time scanning)
+            // can block for several seconds. If we call it from inside the
+            // winit pump, the tray's message queue stalls → app goes
+            // "Not Responding" → meeting capture stalls. From a worker thread the
+            // main pump keeps draining messages while the child boots.
+            if let Ok(exe) = std::env::current_exe() {
+                thread::spawn(move || {
+                    let _ = std::process::Command::new(exe)
+                        .arg("--settings")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+                        .spawn();
+                });
             }
-            if ev.id == self.state.tray.menu_meeting_pause_id {
-                self.toggle_meeting_pause();
-                continue;
-            }
-            if ev.id == self.state.tray.menu_meeting_indicator_id {
-                self.toggle_meeting_indicator();
-                continue;
-            }
-            if ev.id == self.state.tray.menu_power_saving_id {
-                self.toggle_power_saving();
-                continue;
-            }
-            if ev.id == self.state.tray.menu_settings_id {
-                info!("opening settings UI subprocess");
-                // CRITICAL: spawn from a background thread. CreateProcessW on
-                // Windows ARM64 (especially with Defender real-time scanning)
-                // can block for several seconds. If we call it from inside the
-                // winit pump, the tray's message queue stalls → app goes
-                // "Not Responding" → meeting capture stalls. From a worker thread the
-                // main pump keeps draining messages while the child boots.
-                if let Ok(exe) = std::env::current_exe() {
-                    thread::spawn(move || {
-                        let _ = std::process::Command::new(exe)
-                            .arg("--settings")
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-                            .spawn();
-                    });
-                }
-                continue;
-            }
-            if ev.id == self.state.tray.menu_about_id {
-                info!("opening About UI subprocess");
-                if let Ok(exe) = std::env::current_exe() {
-                    thread::spawn(move || {
-                        let _ = std::process::Command::new(exe)
-                            .arg("--about")
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-                            .spawn();
-                    });
-                }
+            return;
+        }
+        if id == self.state.tray.menu_about_id {
+            info!("opening About UI subprocess");
+            if let Ok(exe) = std::env::current_exe() {
+                thread::spawn(move || {
+                    let _ = std::process::Command::new(exe)
+                        .arg("--about")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+                        .spawn();
+                });
             }
         }
+    }
 
-        // Settings hot-reload compares content revisions so deletion is a
-        // first-class change and both loops return to the same defaults.
-        // Reading and hashing the file on every pass of the loop (at least 10
-        // times a second, and on every event) cost disk reads and virus scans
-        // all day; twice a second is as prompt as anyone notices.
-        if self.state.settings_checked_at.elapsed() >= SETTINGS_CHECK_INTERVAL {
-            self.state.settings_checked_at = Instant::now();
-            match Settings::revision() {
-                Ok(revision) if self.state.settings_revision.as_ref() != Some(&revision) => {
-                    match Settings::load_runtime() {
-                        Ok(loaded) => {
-                            self.state.settings_revision = Some(loaded.revision.clone());
-                            self.state.credential_health = loaded.credential_health;
-                            if let Some(message) = &self.state.credential_health.message {
-                                warn!(message, "credential migration needs attention");
-                            }
-                            if let Some(error) = loaded.settings_error {
-                                warn!(error, "settings reload failed validation; keeping the last valid settings");
-                                self.state.settings_error = Some(error);
-                                self.update_job_status();
-                            } else {
-                                let old_engine = self.state.settings.engine.clone();
-                                let old_overlay = self.state.settings.overlay;
-                                let old_indicator = self.state.settings.show_meeting_indicator;
-                                self.state.settings = loaded.settings;
-                                self.state.settings_error = None;
-                                if self.state.settings.show_meeting_indicator != old_indicator {
-                                    // A saved change replaces any tray toggle.
-                                    self.state.meeting_indicator_override = None;
-                                    self.sync_overlay();
-                                    self.sync_meeting_indicator();
-                                }
-                                if self.state.settings.overlay != old_overlay {
-                                    if let Err(error) =
-                                        self.state.overlay.set_enabled(self.state.settings.overlay)
-                                    {
-                                        warn!(error, "failed to update overlay setting");
-                                    }
-                                    self.sync_overlay();
-                                }
-                                let new_engine = self.state.settings.engine.clone();
-                                if new_engine != old_engine {
-                                    info!(
-                                        "engine changed: {old_engine} -> {new_engine}; reloading"
-                                    );
-                                    self.start_engine_load();
-                                } else {
-                                    self.update_job_status();
-                                }
-                            }
+    /// Settings hot reload. Content revisions are compared, so a deletion is
+    /// a change like any other and the tray and Settings fall back to the
+    /// same defaults.
+    fn check_settings(&mut self) {
+        match Settings::revision() {
+            Ok(revision) if self.state.settings_revision.as_ref() != Some(&revision) => {
+                match Settings::load_runtime() {
+                    Ok(loaded) => {
+                        self.state.settings_revision = Some(loaded.revision.clone());
+                        self.state.credential_health = loaded.credential_health;
+                        if let Some(message) = &self.state.credential_health.message {
+                            warn!(message, "credential migration needs attention");
                         }
-                        Err(error) => {
-                            warn!(error = %error, "settings reload failed; keeping the last valid settings");
-                            self.state.settings_error =
-                                Some(format!("settings could not be reloaded: {error}"));
+                        if let Some(error) = loaded.settings_error {
+                            warn!(error, "settings reload failed validation; keeping the last valid settings");
+                            self.state.settings_error = Some(error);
                             self.update_job_status();
+                        } else {
+                            let old_engine = self.state.settings.engine.clone();
+                            let old_overlay = self.state.settings.overlay;
+                            let old_indicator = self.state.settings.show_meeting_indicator;
+                            self.state.settings = loaded.settings;
+                            self.state.settings_error = None;
+                            if self.state.settings.show_meeting_indicator != old_indicator {
+                                // A saved change replaces any tray toggle.
+                                self.state.meeting_indicator_override = None;
+                                self.sync_overlay();
+                                self.sync_meeting_indicator();
+                            }
+                            if self.state.settings.overlay != old_overlay {
+                                if let Err(error) =
+                                    self.state.overlay.set_enabled(self.state.settings.overlay)
+                                {
+                                    warn!(error, "failed to update overlay setting");
+                                }
+                                self.sync_overlay();
+                            }
+                            let new_engine = self.state.settings.engine.clone();
+                            if new_engine != old_engine {
+                                info!("engine changed: {old_engine} -> {new_engine}; reloading");
+                                self.start_engine_load();
+                            } else {
+                                self.update_job_status();
+                            }
                         }
                     }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let message = format!("settings revision could not be read: {error}");
-                    if self.state.settings_error.as_deref() != Some(message.as_str()) {
-                        warn!(error = %error, "settings revision check failed; keeping the last valid settings");
-                        self.state.settings_error = Some(message);
+                    Err(error) => {
+                        warn!(error = %error, "settings reload failed; keeping the last valid settings");
+                        self.state.settings_error =
+                            Some(format!("settings could not be reloaded: {error}"));
                         self.update_job_status();
                     }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("settings revision could not be read: {error}");
+                if self.state.settings_error.as_deref() != Some(message.as_str()) {
+                    warn!(error = %error, "settings revision check failed; keeping the last valid settings");
+                    self.state.settings_error = Some(message);
+                    self.update_job_status();
                 }
             }
         }
@@ -1528,7 +1748,6 @@ impl AppHandler {
             return;
         }
         self.state.power_checked_at = Instant::now();
-        self.sync_repairs_to_disk();
         let held_before = self.hold_for_power();
         self.state.power = power::status();
         // The override ends when the setting no longer follows Windows.
@@ -3154,7 +3373,8 @@ impl AppHandler {
         }
         info!(pending_jobs = self.state.pending_jobs, "quit requested");
         self.state.shutting_down = true;
-        self.state.hk_stop.store(true, Ordering::Relaxed);
+        self.state.overlay.stop();
+        self.state.meeting_overlay.stop();
 
         let mode = if self.state.pending_jobs > 0 {
             prompt_shutdown_mode(self.state.pending_jobs)
@@ -3369,6 +3589,89 @@ mod tests {
         );
         // Round zero (nothing failed yet) behaves like the first.
         assert_eq!(super::repair_delay(0).map(|d| d.as_secs()), Some(120));
+    }
+
+    // --- sleeping until there is something to do -------------------------
+
+    use std::time::Duration;
+
+    #[test]
+    fn the_meeting_clock_wakes_just_after_each_second() {
+        let now = Instant::now();
+        let at = super::next_clock_tick(now, Duration::from_millis(12_250));
+        let wait = at - now;
+        assert!(wait >= Duration::from_millis(750), "{wait:?}");
+        assert!(wait <= Duration::from_millis(770), "{wait:?}");
+        let on_the_second = super::next_clock_tick(now, Duration::from_secs(3));
+        assert!(on_the_second - now >= Duration::from_secs(1));
+    }
+
+    fn repair(next_attempt: Instant, in_flight: Option<u64>, unfinished: bool) -> super::Repair {
+        super::Repair {
+            id: 1,
+            name: String::new(),
+            plan: crate::worker::RepairPlan {
+                pieces: vec![crate::worker::RepairPiece {
+                    text: "text".into(),
+                    raw: unfinished.then(|| "raw".into()),
+                }],
+                separator: " ".into(),
+                unlabel: false,
+                notes_failed: false,
+            },
+            output: std::path::PathBuf::new(),
+            notes_output: None,
+            markdown: false,
+            title: String::new(),
+            details: String::new(),
+            last_written: String::new(),
+            best_cleaned: vec![0],
+            failed_rounds: 0,
+            next_attempt,
+            in_flight,
+            window: None,
+        }
+    }
+
+    #[test]
+    fn a_save_in_the_watched_folder_is_reported() {
+        let folder = tempfile::tempdir().unwrap();
+        let (changes, reported) = std::sync::mpsc::channel();
+        assert!(super::watch_folder(
+            folder.path().to_path_buf(),
+            move || changes.send(()).is_ok(),
+            || {},
+        ));
+        // Written like the Settings window writes it: a temporary file
+        // that then replaces settings.json.
+        let temporary = folder.path().join(".settings.json.1.1.tmp");
+        std::fs::write(&temporary, b"{}").unwrap();
+        std::fs::rename(&temporary, folder.path().join("settings.json")).unwrap();
+        reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the save was reported");
+    }
+
+    #[test]
+    fn only_waiting_repairs_set_a_deadline() {
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(120);
+        let later = now + Duration::from_secs(300);
+        assert_eq!(super::next_repair_attempt(&[]), None);
+        assert_eq!(
+            super::next_repair_attempt(&[repair(later, None, true), repair(soon, None, true)]),
+            Some(soon)
+        );
+        // One in flight reports back through the worker; one with nothing
+        // left to retry is never run.
+        assert_eq!(
+            super::next_repair_attempt(&[
+                repair(soon, Some(7), true),
+                repair(soon, None, false),
+                repair(later, None, true),
+            ]),
+            Some(later)
+        );
     }
 
     #[test]

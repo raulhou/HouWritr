@@ -152,26 +152,26 @@ trait ArtifactSource: Send + Sync {
     fn open(&self, url: &str) -> anyhow::Result<SourceStream>;
 }
 
-struct HttpArtifactSource {
-    client: reqwest::blocking::Client,
-}
+/// Downloads over HTTPS. A blocking client runs a thread of its own for as
+/// long as it exists, and the tray keeps its model manager for its whole
+/// life, so each download builds a client and the thread ends with the
+/// download (the response keeps it alive while it is read).
+struct HttpArtifactSource;
 
 impl HttpArtifactSource {
-    fn new() -> anyhow::Result<Self> {
-        let client = reqwest::blocking::Client::builder()
+    fn client() -> anyhow::Result<reqwest::blocking::Client> {
+        reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(60 * 60))
             .user_agent(concat!("HouWritr/", env!("CARGO_PKG_VERSION")))
             .build()
-            .context("build model download client")?;
-        Ok(Self { client })
+            .context("build model download client")
     }
 }
 
 impl ArtifactSource for HttpArtifactSource {
     fn open(&self, url: &str) -> anyhow::Result<SourceStream> {
-        let response = self
-            .client
+        let response = Self::client()?
             .get(url)
             .send()
             .with_context(|| format!("request {url}"))?
@@ -237,7 +237,7 @@ impl ModelManager {
         Ok(Self {
             root,
             manifest,
-            source: Arc::new(HttpArtifactSource::new()?),
+            source: Arc::new(HttpArtifactSource),
             space_probe: Arc::new(available_space),
         })
     }

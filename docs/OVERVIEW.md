@@ -139,6 +139,10 @@ are cut to one copy.
   ends. While working, the app and its GenieX server opt out of Windows
   power throttling, so background jobs keep their speed with no window in
   front.
+* **Idle in the tray.** HouWritr is meant to run all day, so with nothing to do
+  it sleeps: no polling timers (the tray loop, the pills and the settings
+  reload wait for events), and the memory the last job used is handed back to
+  Windows when the speech engine leaves the NPU.
 * **Text size.** The Settings and transcript windows follow Windows' display
   scale and its Accessibility → Text size setting.
 * **Observable.** One log per app session and one per transcript, with the

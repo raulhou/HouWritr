@@ -258,6 +258,23 @@ pub enum WorkerEvent {
     ShutdownComplete,
 }
 
+/// Wakes the app's event loop, which sleeps until something happens.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Hands worker events to the app and wakes it up to read them.
+struct EventSink {
+    events: Sender<WorkerEvent>,
+    wake: Wake,
+}
+
+impl EventSink {
+    fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
+        self.events.send(event)?;
+        (self.wake)();
+        Ok(())
+    }
+}
+
 struct Job {
     id: u64,
     generation: u64,
@@ -283,16 +300,29 @@ trait EngineLoader: Send + 'static {
         cancellation: &CancellationToken,
         emit_model_state: &mut dyn FnMut(ModelState),
     ) -> Result<Box<dyn Engine>>;
+
+    /// Load `engine` again after it was unloaded. Its files were already
+    /// checked when it was first loaded.
+    fn reload(
+        &mut self,
+        engine: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn Engine>> {
+        self.load(engine, cancellation, &mut |_| {})
+    }
 }
 
 struct RuntimeEngineLoader {
     models: ModelManager,
+    /// Model folder each engine was loaded from after its files were hashed.
+    verified: HashMap<String, std::path::PathBuf>,
 }
 
 impl RuntimeEngineLoader {
     fn new() -> Result<Self> {
         Ok(Self {
             models: ModelManager::new().map_err(|error| anyhow!(error))?,
+            verified: HashMap::new(),
         })
     }
 }
@@ -312,7 +342,34 @@ impl EngineLoader for RuntimeEngineLoader {
         if cancellation.is_cancelled() {
             return Err(anyhow!("engine load cancelled"));
         }
+        self.verified.insert(engine.to_string(), model_dir.clone());
         asr::load_from_dir(engine, model_dir)
+    }
+
+    /// Hashing every model file again (0.7 to 2.2 GB) would cost seconds of
+    /// CPU on each reload. When the files hashed at the first load are still
+    /// in place (same sizes, same receipt), they are loaded as they are;
+    /// anything else goes through the full check, and download, again.
+    fn reload(
+        &mut self,
+        engine: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn Engine>> {
+        if let Some(model_dir) = self.verified.get(engine).cloned() {
+            let unchanged = ModelManager::inspect(engine).is_ok_and(|info| {
+                info.cache_state == crate::model_manager::ModelCacheState::Installed
+            });
+            if unchanged {
+                match asr::load_from_dir(engine, model_dir) {
+                    Ok(loaded) => return Ok(loaded),
+                    Err(error) => warn!(
+                        error = format!("{error:#}"),
+                        engine, "speech engine did not load again; checking its files"
+                    ),
+                }
+            }
+        }
+        self.load(engine, cancellation, &mut |_| {})
     }
 }
 
@@ -334,15 +391,22 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn() -> Result<Self> {
-        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?), true)
+    /// Start the inference thread. `wake` is called after every event it
+    /// sends, so the app can sleep until there is something to read.
+    pub fn spawn(wake: Wake) -> Result<Self> {
+        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?), wake, true)
     }
 
     /// `unload_when_idle`: drop the speech engine whenever no work is
     /// waiting (the app); tests that count loads keep it.
-    fn spawn_with_loader(loader: Box<dyn EngineLoader>, unload_when_idle: bool) -> Result<Self> {
+    fn spawn_with_loader(
+        loader: Box<dyn EngineLoader>,
+        wake: Wake,
+        unload_when_idle: bool,
+    ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
+        let event_tx = EventSink { events, wake };
         let latest_generation = Arc::new(AtomicU64::new(0));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let discard_requested = Arc::new(AtomicBool::new(false));
@@ -675,7 +739,7 @@ fn worker_main(
     mut loader: Box<dyn EngineLoader>,
     unload_when_idle: bool,
     command_rx: Receiver<Command>,
-    event_tx: Sender<WorkerEvent>,
+    event_tx: EventSink,
     latest_generation: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
@@ -708,6 +772,9 @@ fn worker_main(
                         engine = engine_name.as_deref().unwrap_or_default(),
                         "speech engine unloaded; the next job loads it again"
                     );
+                    // What the last job used (audio, model buffers) is free
+                    // now: hand it back to Windows rather than keep it resident.
+                    crate::memory::release_idle_memory();
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => break,
@@ -820,34 +887,15 @@ fn worker_main(
                             if let Some(part) = job.config.session {
                                 // Never lose a whole meeting because one part
                                 // met a reloading engine.
-                                let state = sessions.entry(part.id).or_default();
-                                let placeholder = failed_part_text(
-                                    part.offset_samples,
+                                let completed = part_gap(
+                                    &mut sessions,
+                                    job.id,
+                                    part,
                                     job.sample_rate,
                                     "the speech engine was not ready",
                                 );
-                                let (text, diarization, warning) = if part.last {
-                                    let state = sessions.remove(&part.id).unwrap_or_default();
-                                    let stitched = state.finish(
-                                        PartText::plain(placeholder),
-                                        None,
-                                        DiarizationOutcome::NotRequested,
-                                    );
-                                    (stitched.text, stitched.outcome, stitched.warning)
-                                } else {
-                                    state.parts.push(PartText::plain(placeholder.clone()));
-                                    (placeholder, DiarizationOutcome::NotRequested, None)
-                                };
                                 let _ = event_tx.send(WorkerEvent::JobStarted { id: job.id });
-                                let _ = event_tx.send(WorkerEvent::JobCompleted {
-                                    id: job.id,
-                                    text,
-                                    diarization,
-                                    cleanup: None,
-                                    repair: None,
-                                    notes: None,
-                                    enhancement_warning: warning,
-                                });
+                                let _ = event_tx.send(completed);
                                 continue;
                             }
                             let _ = event_tx.send(WorkerEvent::JobFailed {
@@ -864,21 +912,37 @@ fn worker_main(
                     continue;
                 }
                 if engine.is_none() {
-                    // Unloaded while idle: load it again for this job.
                     let name = engine_name.clone().unwrap_or_default();
                     let cancellation = engine_cancellation.clone().unwrap_or_default();
-                    let loading = Instant::now();
-                    match loader.load(&name, &cancellation, &mut |_| {}) {
-                        Ok(loaded) => {
-                            info!(engine = %name, took = ?loading.elapsed(), "speech engine loaded again");
-                            engine = Some(loaded);
+                    match reload_engine(&mut *loader, &name, &cancellation) {
+                        Ok(reloaded) => {
+                            engine = Some(reloaded);
                         }
                         Err(error) => {
-                            warn!(error = %error, engine = %name, "speech engine could not be loaded again");
-                            let _ = event_tx.send(WorkerEvent::JobFailed {
-                                id: job.id,
-                                error: format!("could not load the speech engine: {error}"),
-                            });
+                            let reason = format!("could not load the speech engine again: {error}");
+                            let _transition = transition_gate.lock();
+                            let event = terminal_job_event(
+                                job.id,
+                                &stopped,
+                                &discard_requested,
+                                &engine_cancellation,
+                                || match job.config.session {
+                                    // The meeting goes on; this part becomes a
+                                    // visible gap and the next part retries.
+                                    Some(part) => part_gap(
+                                        &mut sessions,
+                                        job.id,
+                                        part,
+                                        job.sample_rate,
+                                        &reason,
+                                    ),
+                                    None => WorkerEvent::JobFailed {
+                                        id: job.id,
+                                        error: reason.clone(),
+                                    },
+                                },
+                            );
+                            let _ = event_tx.send(event);
                             continue;
                         }
                     }
@@ -1346,6 +1410,35 @@ impl Drop for ReleaseLocalModel {
     fn drop(&mut self) {
         if self.0 {
             crate::local_llm::release("the transcript is finished");
+        }
+    }
+}
+
+/// Load the current engine again after it was unloaded, either to give the
+/// NPU to the text model or because HouWritr was idle.
+fn reload_engine(
+    loader: &mut dyn EngineLoader,
+    name: &str,
+    cancellation: &CancellationToken,
+) -> Result<Box<dyn Engine>> {
+    if name.ends_with("_npu") {
+        // The text model is done with the NPU for now: stop it first so the
+        // speech engine has the room it needs.
+        crate::local_llm::release("the speech engine needs the NPU again");
+    }
+    let started = Instant::now();
+    match loader.reload(name, cancellation) {
+        Ok(reloaded) => {
+            info!(
+                engine = %name,
+                took_ms = started.elapsed().as_millis() as u64,
+                "speech engine loaded again"
+            );
+            Ok(reloaded)
+        }
+        Err(error) => {
+            warn!(error = %error, engine = %name, "speech engine could not be loaded again");
+            Err(error)
         }
     }
 }
@@ -1956,7 +2049,7 @@ fn run_rerun(
     job: &Job,
     rerun: Rerun,
     gate: &mut CleanupGate,
-    event_tx: &Sender<WorkerEvent>,
+    event_tx: &EventSink,
     discard_requested: &AtomicBool,
 ) {
     let interrupted = || discard_requested.load(Ordering::Acquire);
@@ -2031,6 +2124,44 @@ fn failed_part_text(offset_samples: usize, sample_rate: u32, reason: &str) -> St
         "[The part of the recording starting at {clock} could not be transcribed: {}]",
         short_reason(reason)
     )
+}
+
+/// Record a meeting part that could not be transcribed as a visible gap and
+/// return its completion. The last part still carries the stitched text of
+/// every earlier part, so the meeting is never lost.
+fn part_gap(
+    sessions: &mut HashMap<u64, SessionState>,
+    id: u64,
+    part: SessionPart,
+    sample_rate: u32,
+    reason: &str,
+) -> WorkerEvent {
+    let placeholder = failed_part_text(part.offset_samples, sample_rate, reason);
+    let (text, diarization, enhancement_warning) = if part.last {
+        let state = sessions.remove(&part.id).unwrap_or_default();
+        let stitched = state.finish(
+            PartText::plain(placeholder),
+            None,
+            DiarizationOutcome::NotRequested,
+        );
+        (stitched.text, stitched.outcome, stitched.warning)
+    } else {
+        sessions
+            .entry(part.id)
+            .or_default()
+            .parts
+            .push(PartText::plain(placeholder.clone()));
+        (placeholder, DiarizationOutcome::NotRequested, None)
+    };
+    WorkerEvent::JobCompleted {
+        id,
+        text,
+        diarization,
+        cleanup: None,
+        repair: None,
+        notes: None,
+        enhancement_warning,
+    }
 }
 
 fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>) {
@@ -2155,6 +2286,8 @@ mod tests {
         failed: HashSet<String>,
         slow_engine: Option<String>,
         loads: Arc<Mutex<Vec<String>>>,
+        reloads: Arc<Mutex<Vec<String>>>,
+        fail_reloads: Arc<AtomicBool>,
         calls: Arc<Mutex<Vec<i32>>>,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
@@ -2182,6 +2315,18 @@ mod tests {
                 delay: Duration::from_millis(100),
             }))
         }
+
+        fn reload(
+            &mut self,
+            engine: &str,
+            cancellation: &CancellationToken,
+        ) -> Result<Box<dyn Engine>> {
+            self.reloads.lock().push(engine.to_string());
+            if self.fail_reloads.load(Ordering::SeqCst) {
+                anyhow::bail!("injected reload failure");
+            }
+            self.load(engine, cancellation, &mut |_| {})
+        }
     }
 
     struct FakeEngine {
@@ -2207,6 +2352,47 @@ mod tests {
         }
     }
 
+    /// What a test can see of, and change in, a worker's fake engine.
+    #[derive(Clone, Default)]
+    struct Probe {
+        calls: Arc<Mutex<Vec<i32>>>,
+        loads: Arc<Mutex<Vec<String>>>,
+        reloads: Arc<Mutex<Vec<String>>>,
+        fail_reloads: Arc<AtomicBool>,
+        max_active: Arc<AtomicUsize>,
+        wakes: Arc<AtomicUsize>,
+    }
+
+    fn probed_worker(failed: &[&str], slow_engine: Option<&str>) -> (Worker, Probe) {
+        probed_worker_with(failed, slow_engine, false)
+    }
+
+    fn probed_worker_with(
+        failed: &[&str],
+        slow_engine: Option<&str>,
+        unload_when_idle: bool,
+    ) -> (Worker, Probe) {
+        let probe = Probe::default();
+        let loader = FakeLoader {
+            failed: failed.iter().map(|value| value.to_string()).collect(),
+            slow_engine: slow_engine.map(str::to_string),
+            loads: probe.loads.clone(),
+            reloads: probe.reloads.clone(),
+            fail_reloads: probe.fail_reloads.clone(),
+            calls: probe.calls.clone(),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: probe.max_active.clone(),
+        };
+        let wakes = probe.wakes.clone();
+        let wake: Wake = Arc::new(move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        });
+        (
+            Worker::spawn_with_loader(Box::new(loader), wake, unload_when_idle).unwrap(),
+            probe,
+        )
+    }
+
     fn worker(
         failed: &[&str],
         slow_engine: Option<&str>,
@@ -2229,23 +2415,8 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let loads = Arc::new(Mutex::new(Vec::new()));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let loader = FakeLoader {
-            failed: failed.iter().map(|value| value.to_string()).collect(),
-            slow_engine: slow_engine.map(str::to_string),
-            loads: loads.clone(),
-            calls: calls.clone(),
-            active: Arc::new(AtomicUsize::new(0)),
-            max_active: max_active.clone(),
-        };
-        (
-            Worker::spawn_with_loader(Box::new(loader), unload_when_idle).unwrap(),
-            calls,
-            max_active,
-            loads,
-        )
+        let (worker, probe) = probed_worker_with(failed, slow_engine, unload_when_idle);
+        (worker, probe.calls, probe.max_active, probe.loads)
     }
 
     fn wait_until(
@@ -3694,6 +3865,166 @@ mod tests {
         off.enhance.mode = crate::settings::EnhanceMode::Never;
         assert!(!releases_local_model(&JobConfig::long_form(off.clone())));
         assert!(releases_local_model(&JobConfig::meeting_notes(off)));
+    }
+
+    // --- releasing the engine while idle ---------------------------------
+
+    fn no_cleanup() -> Settings {
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+        settings
+    }
+
+    fn meeting_part(index: usize, last: bool) -> JobConfig {
+        let part = SessionPart {
+            id: 9,
+            offset_samples: index * 16_000,
+            last,
+        };
+        JobConfig::meeting_part(no_cleanup(), part, false)
+    }
+
+    fn completed_text(worker: &Worker, job: u64) -> String {
+        let events = wait_until(
+            worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        match events.last() {
+            Some(WorkerEvent::JobCompleted { text, .. }) => text.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn every_event_wakes_the_app() {
+        let (mut worker, probe) = probed_worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        let events = wait_until(&worker, |event| {
+            matches!(event, WorkerEvent::EngineReady { .. })
+        });
+        assert!(probe.wakes.load(Ordering::SeqCst) >= events.len());
+    }
+
+    #[test]
+    fn a_released_engine_is_loaded_again_by_the_next_job_without_the_app_noticing() {
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        let job = worker
+            .enqueue(
+                vec![4.0; 16_000],
+                16_000,
+                JobConfig::long_form(no_cleanup()),
+            )
+            .unwrap();
+
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        assert!(matches!(
+            events.last(),
+            Some(WorkerEvent::JobCompleted { text, .. }) if text == "4"
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::EngineLoading { .. } | WorkerEvent::EngineReady { .. }
+        )));
+        assert_eq!(*probe.reloads.lock(), vec!["ready".to_string()]);
+        assert_eq!(probe.loads.lock().len(), 2, "first load plus the reload");
+    }
+
+    #[test]
+    fn a_file_job_fails_when_the_engine_cannot_be_loaded_again() {
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        probe.fail_reloads.store(true, Ordering::SeqCst);
+        let job = worker
+            .enqueue(
+                vec![1.0; 16_000],
+                16_000,
+                JobConfig::long_form(no_cleanup()),
+            )
+            .unwrap();
+
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobFailed { id, .. } if *id == job),
+        );
+        assert!(matches!(
+            events.last(),
+            Some(WorkerEvent::JobFailed { error, .. })
+                if error.contains("could not load the speech engine again")
+        ));
+    }
+
+    #[test]
+    fn a_meeting_part_that_meets_a_failed_reload_becomes_a_gap_not_a_lost_meeting() {
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        probe.fail_reloads.store(true, Ordering::SeqCst);
+        let first = worker
+            .enqueue(vec![1.0; 16_000], 16_000, meeting_part(0, false))
+            .unwrap();
+        let gap = completed_text(&worker, first);
+        assert!(
+            gap.starts_with("[The part of the recording starting at 0:00 could not be transcribed"),
+            "{gap}"
+        );
+
+        // The next part tries again and the meeting is delivered whole.
+        probe.fail_reloads.store(false, Ordering::SeqCst);
+        let last = worker
+            .enqueue(vec![2.0; 16_000], 16_000, meeting_part(1, true))
+            .unwrap();
+        assert_eq!(completed_text(&worker, last), format!("{gap} 2"));
+        assert_eq!(probe.reloads.lock().len(), 2);
+    }
+
+    #[test]
+    fn the_last_part_of_a_meeting_still_carries_the_transcript_when_reloading_fails() {
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let first = worker
+            .enqueue(vec![3.0; 16_000], 16_000, meeting_part(0, false))
+            .unwrap();
+        assert_eq!(completed_text(&worker, first), "3");
+
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        probe.fail_reloads.store(true, Ordering::SeqCst);
+        let last = worker
+            .enqueue(vec![4.0; 16_000], 16_000, meeting_part(1, true))
+            .unwrap();
+        let text = completed_text(&worker, last);
+        assert!(
+            text.starts_with("3 [The part of the recording starting at 0:01"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "loads, releases and reloads the real pinned Parakeet CPU sessions"]
+    fn reloads_real_parakeet_cpu_from_the_files_checked_at_the_first_load() {
+        let mut loader = RuntimeEngineLoader::new().unwrap();
+        let cancellation = CancellationToken::default();
+        let engine = loader
+            .load("parakeet_cpu", &cancellation, &mut |_| {})
+            .unwrap();
+        drop(engine);
+        let started = Instant::now();
+        let mut engine = loader.reload("parakeet_cpu", &cancellation).unwrap();
+        eprintln!("reloaded in {:?}", started.elapsed());
+        engine.transcribe(&vec![0.0; 16_000], 16_000).unwrap();
     }
 
     #[test]

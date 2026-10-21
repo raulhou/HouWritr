@@ -16,6 +16,7 @@ mod local_llm;
 mod log_files;
 mod media;
 mod meeting;
+mod memory;
 mod model_manager;
 mod overlay;
 mod paths;
