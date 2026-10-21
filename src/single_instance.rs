@@ -73,7 +73,7 @@ fn mutex_name_for_identity(purpose: &str, identity: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!(r"Global\OpenWritr.{purpose}.{suffix}")
+    format!(r"Global\HouWritr.{purpose}.{suffix}")
 }
 
 pub struct SettingsTransaction {
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn rejects_a_second_live_instance() {
         let name = format!(
-            r"Global\OpenWritr.test.{}.{}",
+            r"Global\HouWritr.test.{}.{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         );
@@ -180,7 +180,7 @@ mod tests {
     fn tray_and_settings_locks_are_distinct() {
         let tray = mutex_name_for_identity(TRAY_MUTEX_PURPOSE, r"C:\Users\Example");
         let settings = mutex_name_for_identity(SETTINGS_MUTEX_PURPOSE, r"C:\Users\Example");
-        assert!(tray.starts_with(r"Global\OpenWritr."));
+        assert!(tray.starts_with(r"Global\HouWritr."));
         assert_ne!(tray, settings);
         assert_ne!(
             tray,
@@ -208,14 +208,14 @@ mod tests {
 
     #[test]
     fn rejects_a_second_process() {
-        const CHILD_MUTEX: &str = "OPENWRITR_TEST_MUTEX_NAME";
+        const CHILD_MUTEX: &str = "HOUWRITR_TEST_MUTEX_NAME";
         if let Ok(name) = std::env::var(CHILD_MUTEX) {
             assert!(SingleInstance::acquire_named(&name).unwrap().is_none());
             return;
         }
 
         let name = format!(
-            r"Global\OpenWritr.test-process.{}.{}",
+            r"Global\HouWritr.test-process.{}.{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         );

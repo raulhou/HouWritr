@@ -173,7 +173,7 @@ fn overlay_main(handles: OverlayHandles, commands: Receiver<OverlayCommand>, ena
             Ok(h) => h,
             Err(_) => return,
         };
-        let class_name = w!("OpenWritrOverlay");
+        let class_name = w!("HouWritrOverlay");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,

@@ -1,7 +1,7 @@
 //! A language model that runs on this machine, for AI text cleanup and meeting
 //! notes.
 //!
-//! OpenWritr drives Qualcomm's GenieX command-line tool (`geniex serve` is an
+//! HouWritr drives Qualcomm's GenieX command-line tool (`geniex serve` is an
 //! OpenAI-compatible server that runs AI Hub models on the Hexagon NPU) as a
 //! private child process, and the normal OpenAI-compatible cleanup pipeline
 //! talks to it over loopback. Nothing is bound in-process: GenieX is a
@@ -12,7 +12,7 @@
 //! * finding (or, with the user's consent, installing) the official GenieX CLI;
 //! * downloading / removing the model with `geniex pull` / `geniex remove`;
 //! * starting `geniex serve` on a private port when a request needs it, and
-//!   stopping it again when idle or when OpenWritr exits.
+//!   stopping it again when idle or when HouWritr exits.
 //!
 //! The server is only ever started for the *managed* endpoint
 //! ([`MANAGED_BASE_URL`]). Any other loopback address (Ollama, LM Studio, a
@@ -33,12 +33,143 @@ use tracing::{debug, info, warn};
 
 use crate::cleanup::EndpointScope;
 
-/// Private port for the server OpenWritr starts. Deliberately not GenieX's
+/// Private port for the server HouWritr starts. Deliberately not GenieX's
 /// default (18181) so it never collides with a server the user runs.
 pub const MANAGED_PORT: u16 = 18651;
 pub const MANAGED_BASE_URL: &str = "http://127.0.0.1:18651/v1";
-/// Qualcomm AI Hub bundle run on the NPU (4B instruct, no reasoning prefix).
-pub const DEFAULT_MODEL: &str = "ai-hub-models/Qwen3-4B-Instruct-2507";
+/// The built-in choice a fresh setup starts with: the faster one, which
+/// peaked below 50% CPU on the test PC with other work in the foreground.
+pub const DEFAULT_MODEL: &str = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid";
+
+/// Models from before the list was cut to the two llama.cpp choices:
+/// uninstalling GenieX still removes them if they are on disk.
+const LEGACY_MODELS: &[&str] = &[
+    "ai-hub-models/Qwen3-4B-Instruct-2507",
+    "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0",
+];
+
+/// Where GenieX runs a built-in model: its llama.cpp runtime, on the NPU
+/// through the Hexagon backend, or split between the NPU and the CPU. (The
+/// precompiled Qualcomm bundle wrote about one token a second on the test PC
+/// and is gone; the CPU alone is not offered.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    /// All layers on the NPU.
+    NpuLlama,
+    /// llama.cpp's per tensor scheduler across the backends it can use (the
+    /// NPU and, as measured on the test PC, the GPU), which
+    /// GenieX calls the fast path on Snapdragon. Shown to the user as
+    /// "hybrid mode"; GenieX's own log does not say which processor ran a step.
+    Hybrid,
+}
+
+impl Runtime {
+    /// For the transcript window and the log.
+    pub fn place(self) -> &'static str {
+        match self {
+            Runtime::NpuLlama => "NPU, llama.cpp",
+            Runtime::Hybrid => "hybrid mode",
+        }
+    }
+
+    /// GenieX's `compute` request field.
+    fn compute(self) -> &'static str {
+        match self {
+            Runtime::NpuLlama => "npu",
+            Runtime::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// A model HouWritr can download and run through GenieX by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltInModel {
+    /// What the settings file stores; unique per choice.
+    pub id: &'static str,
+    /// The name GenieX downloads and serves it under (`name[:precision]`).
+    /// Both choices share one file and differ only in `runtime`.
+    pub name: &'static str,
+    /// Shown in Settings.
+    pub label: &'static str,
+    /// One line for Settings: size and what to expect.
+    pub detail: &'static str,
+    pub runtime: Runtime,
+    /// Download size in bytes: GenieX's own total can be far too small (it
+    /// sizes its bar from the first file it sees).
+    pub download_bytes: Option<u64>,
+}
+
+const QWEN3_4B_GGUF: &str = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0";
+const QWEN3_4B_GGUF_BYTES: u64 = 2_375_773_280;
+
+/// The models offered in Settings: one Qwen3 4B file from Hugging Face, run
+/// two ways.
+pub const BUILT_IN_MODELS: &[BuiltInModel] = &[
+    BuiltInModel {
+        id: DEFAULT_MODEL,
+        name: QWEN3_4B_GGUF,
+        label: "Qwen3 4B in hybrid mode",
+        detail: "About 2.4 GB from Hugging Face. Hybrid mode: llama.cpp spreads the work over the NPU and the other processors. The faster choice (about 18 tokens a second on a Snapdragon X Elite), but on that PC Task Manager showed the GPU as busy as the NPU.",
+        runtime: Runtime::Hybrid,
+        download_bytes: Some(QWEN3_4B_GGUF_BYTES),
+    },
+    BuiltInModel {
+        id: "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu",
+        name: QWEN3_4B_GGUF,
+        label: "Qwen3 4B on the NPU only (llama.cpp)",
+        detail: "The same file on the NPU alone: about 13 tokens a second, the lightest on the CPU.",
+        runtime: Runtime::NpuLlama,
+        download_bytes: Some(QWEN3_4B_GGUF_BYTES),
+    },
+];
+
+/// The built-in model the setting `model` names, if it is one.
+pub fn built_in(model: &str) -> Option<&'static BuiltInModel> {
+    let model = model.trim();
+    BUILT_IN_MODELS
+        .iter()
+        .find(|known| known.id.eq_ignore_ascii_case(model))
+}
+
+/// The choice a request for setting `model` uses: the one it names, or the
+/// first for a setting from before the list was cut down.
+fn chosen(model: &str) -> &'static BuiltInModel {
+    built_in(model).unwrap_or(&BUILT_IN_MODELS[0])
+}
+
+/// The name GenieX knows the model of setting `model` by.
+pub fn geniex_name(model: &str) -> &'static str {
+    chosen(model).name
+}
+
+/// Where the model of setting `model` runs.
+pub fn runtime(model: &str) -> Runtime {
+    chosen(model).runtime
+}
+
+/// Make a chat request for setting `model` one GenieX runs where it should:
+/// the model's GenieX name and compute unit, all layers offloaded.
+pub fn add_request_options(body: &mut serde_json::Value, model: &str) {
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let choice = chosen(model);
+    body.insert("model".into(), serde_json::json!(choice.name));
+    body.insert(
+        "compute".into(),
+        serde_json::json!(choice.runtime.compute()),
+    );
+    body.insert("ngl".into(), serde_json::json!(-1));
+    // GenieX asks models to think first unless told otherwise; this
+    // instruct model does not, and must not start to.
+    body.insert("enable_think".into(), serde_json::json!(false));
+}
+
+/// The arguments `geniex pull` needs for setting `model`, without prompts.
+fn pull_arguments(model: &str) -> Vec<&str> {
+    // A Hugging Face download asks whether the model reads images.
+    vec!["pull", geniex_name(model), "--model-type", "llm"]
+}
 
 /// Pinned official installer (GenieX v0.8.0, Windows ARM64, Inno Setup).
 const INSTALLER_URL: &str = "https://github.com/qualcomm/GenieX/releases/download/v0.8.0/geniex-cli-setup-windows-arm64-v0.8.0.exe";
@@ -57,7 +188,7 @@ const IDLE_STOP: Duration = Duration::from_secs(5 * 60);
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Whether `endpoint` is the server OpenWritr manages itself.
+/// Whether `endpoint` is the server HouWritr manages itself.
 pub fn is_managed(endpoint: &EndpointScope) -> bool {
     endpoint.is_loopback()
         && endpoint.port() == Some(MANAGED_PORT)
@@ -288,18 +419,82 @@ fn lists_model(listing: &str, model: &str) -> bool {
     }
 }
 
-/// Download `model` with `geniex pull`. `progress` gets a percentage when the
-/// tool prints one, plus the latest status line. Cancelling keeps what was
-/// downloaded so far (GenieX resumes).
+/// Download attempts before a download is reported as failed.
+const PULL_ATTEMPTS: usize = 5;
+/// Seconds to wait before attempt 2, 3, … (a dropped connection often needs
+/// a moment).
+const PULL_RETRY_WAITS: [u64; PULL_ATTEMPTS - 1] = [5, 15, 30, 60];
+
+/// Download `model` with `geniex pull`. `progress` gets the fraction done
+/// (when it is known) and one line saying how far the download is. A
+/// download that stops is resumed by itself (GenieX keeps what it has) up to
+/// [`PULL_ATTEMPTS`] times; cancelling keeps what was downloaded so far.
 pub fn pull_model(
     cli: &Path,
     model: &str,
     progress: &mut dyn FnMut(Option<f32>, &str),
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        let error = match pull_once(cli, model, progress, cancel) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if attempt >= PULL_ATTEMPTS || !worth_retrying(&error) {
+            return Err(error);
+        }
+        let wait = PULL_RETRY_WAITS[attempt - 1];
+        attempt += 1;
+        warn!(error = %format!("{error:#}"), attempt, "model download stopped; resuming");
+        for left in (1..=wait).rev() {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
+            progress(
+                None,
+                &format!(
+                    "The download stopped; resuming in {left} s (attempt {attempt} of {PULL_ATTEMPTS})…"
+                ),
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Whether trying a failed download again could help: not when it was
+/// cancelled, or failed for a reason a retry does not change.
+fn worth_retrying(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    const FINAL: &[&str] = &[
+        "cancelled",
+        "start geniex pull",
+        "no precision",
+        "not found",
+        "404",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "gated",
+        "no space",
+        "not enough space",
+        "disk full",
+        "unknown model type",
+    ];
+    !FINAL.iter().any(|word| text.contains(word))
+}
+
+fn pull_once(
+    cli: &Path,
+    model: &str,
+    progress: &mut dyn FnMut(Option<f32>, &str),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let expected = built_in(model).and_then(|known| known.download_bytes);
     let mut child = hidden(
         Command::new(cli)
-            .args(["pull", model])
+            .args(pull_arguments(model))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
@@ -339,8 +534,14 @@ pub fn pull_model(
                 let clean = strip_ansi(&line);
                 let clean = clean.trim();
                 if !clean.is_empty() {
-                    progress(parse_percent(clean), clean);
-                    if parse_percent(clean).is_none() {
+                    match parse_pull_progress(clean) {
+                        Some(bar) => {
+                            let (fraction, text) = describe_pull(&bar, expected);
+                            progress(fraction, &text);
+                        }
+                        None => progress(None, clean),
+                    }
+                    if parse_pull_progress(clean).is_none() {
                         info!("geniex pull: {clean}");
                         recent.push_back(clean.to_string());
                         if recent.len() > 4 {
@@ -380,8 +581,16 @@ pub fn remove_model(cli: &Path, model: &str) -> Result<()> {
 /// uninstaller and is left to Windows Settings → Apps.
 pub fn uninstall_cli(cli: &Path) -> Result<()> {
     shutdown();
-    if let Err(error) = remove_model(cli, DEFAULT_MODEL) {
-        warn!(error = %error, "could not remove the GenieX model before uninstalling");
+    let mut names: Vec<&str> = BUILT_IN_MODELS.iter().map(|model| model.name).collect();
+    names.extend(LEGACY_MODELS);
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        if model_installed(cli, name).unwrap_or(true) {
+            if let Err(error) = remove_model(cli, name) {
+                warn!(error = %error, model = name, "could not remove a GenieX model before uninstalling");
+            }
+        }
     }
     let uninstaller = find_uninstaller(cli).ok_or_else(|| {
         anyhow!(
@@ -461,17 +670,113 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// The last `NN%` / `NN.N%` figure in a progress line.
-fn parse_percent(line: &str) -> Option<f32> {
-    let end = line.rfind('%')?;
-    let head = &line[..end];
-    let start = head
-        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map_or(0, |index| index + 1);
-    head[start..]
-        .parse::<f32>()
-        .ok()
-        .filter(|value| (0.0..=100.0).contains(value))
+/// One redraw of GenieX's download bar, e.g.
+/// `downloading  45% |████      | (1.1/2.4 GB, 25 MB/s) [40s:52s]`.
+/// Only the bytes downloaded and the speed are trusted: GenieX sizes the bar
+/// (its percentage, total and time left) from the first file it sees, so it
+/// can read 100% early on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PullProgress {
+    downloaded: f64,
+    /// Bytes a second.
+    rate: Option<f64>,
+    /// GenieX's total, which may be too small.
+    total: Option<f64>,
+}
+
+fn parse_pull_progress(line: &str) -> Option<PullProgress> {
+    let line = line.trim();
+    if !line.starts_with("downloading") {
+        return None;
+    }
+    let open = line.find('(')?;
+    let close = open + line[open..].find(')')?;
+    let mut parts = line[open + 1..close].split(", ");
+    let amount = parts.next()?;
+    let (current, total) = match amount.split_once('/') {
+        Some((current, total)) => (current.trim(), Some(total.trim())),
+        None => (amount.trim(), None),
+    };
+    let total_unit = total.and_then(|total| total.rsplit_once(' ').map(|(_, unit)| unit));
+    let downloaded =
+        parse_bytes(current).or_else(|| parse_bytes(&format!("{current} {}", total_unit?)))?;
+    let rate = parts.find_map(|part| part.trim().strip_suffix("/s").and_then(parse_bytes));
+    Some(PullProgress {
+        downloaded,
+        rate,
+        total: total.and_then(parse_bytes),
+    })
+}
+
+/// `2.4 GB`, `512 MB`, `1.5 GiB`, ` 7 B` as bytes.
+fn parse_bytes(text: &str) -> Option<f64> {
+    let (number, unit) = text.trim().rsplit_once(' ')?;
+    let value: f64 = number.trim().parse().ok()?;
+    let scale = match unit {
+        "B" => 1.0,
+        "kB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(value * scale)
+}
+
+/// The fraction done and one line for Settings, e.g.
+/// `45% · 1.1 of 2.4 GB · 25.0 MB/s · about 1 min left`.
+fn describe_pull(bar: &PullProgress, expected: Option<u64>) -> (Option<f32>, String) {
+    let total = expected
+        .map(|bytes| bytes as f64)
+        .or(bar.total.filter(|total| *total > bar.downloaded));
+    // Never "done" before GenieX says so: the size can be a little off.
+    let fraction = total.map(|total| (bar.downloaded / total).clamp(0.0, 0.99) as f32);
+    let mut parts = Vec::new();
+    if let Some(fraction) = fraction {
+        parts.push(format!("{:.0}%", fraction * 100.0));
+    }
+    parts.push(match total {
+        Some(total) => format!("{} of {}", human_bytes(bar.downloaded), human_bytes(total)),
+        None => format!("{} downloaded", human_bytes(bar.downloaded)),
+    });
+    if let Some(rate) = bar.rate.filter(|rate| *rate > 0.0) {
+        parts.push(format!("{}/s", human_bytes(rate)));
+        if let Some(total) = total {
+            let seconds = ((total - bar.downloaded).max(0.0) / rate).round() as u64;
+            parts.push(time_left(seconds));
+        }
+    }
+    (fraction, parts.join(" · "))
+}
+
+fn human_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 4] = ["kB", "MB", "GB", "TB"];
+    let mut value = bytes / 1e3;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if bytes < 1e3 {
+        return format!("{bytes:.0} B");
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn time_left(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("about {seconds} s left"),
+        60..=3599 => format!("about {} min left", (seconds + 30) / 60),
+        _ => format!(
+            "about {} h {} min left",
+            seconds / 3600,
+            seconds % 3600 / 60
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +790,8 @@ struct Server {
     reaper_running: bool,
     /// The model has answered at least once since the server started.
     model_loaded: bool,
+    /// Which model the server was last asked to load.
+    loaded_model: Option<String>,
     /// The model has written at normal speed since the server started.
     was_fast: bool,
     /// Slow answers in a row from this server.
@@ -498,23 +805,49 @@ static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
         failed_at: None,
         reaper_running: false,
         model_loaded: false,
+        loaded_model: None,
         was_fast: false,
         slow_answers: 0,
     })
 });
 
-/// Make sure a request to `endpoint` can be answered. A no-op for every
-/// endpoint other than the managed one.
-pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), LocalLlmError> {
+/// Make sure a request for `model` to `endpoint` can be answered (with no
+/// model, only that the server runs). A no-op for every endpoint other than
+/// the managed one.
+pub fn ensure_running(
+    endpoint: &EndpointScope,
+    model: Option<&str>,
+) -> std::result::Result<(), LocalLlmError> {
     if !is_managed(endpoint) {
         return Ok(());
     }
     let mut server = SERVER.lock();
+    // Another built-in model is wanted: stop the server so the one it holds
+    // does not stay in memory next to the new one.
+    if let (Some(wanted), Some(loaded)) = (model, server.loaded_model.as_deref()) {
+        if !wanted.trim().eq_ignore_ascii_case(loaded) && server.child.is_some() {
+            info!(
+                from = loaded,
+                to = wanted.trim(),
+                "switching the local model"
+            );
+            stop_locked(&mut server);
+        }
+    }
     let previous_use = server.last_used;
     server.last_used = Instant::now();
 
     let running = match server.child.as_mut().map(Child::try_wait) {
         Some(Ok(None)) => true,
+        Some(Ok(Some(status))) => {
+            warn!(%status, "local model server exited; restarting");
+            server.child = None;
+            server.model_loaded = false;
+            server.loaded_model = None;
+            server.was_fast = false;
+            server.slow_answers = 0;
+            false
+        }
         Some(_) => {
             warn!("local model server exited; restarting");
             server.child = None;
@@ -557,13 +890,19 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
     // the model after five idle minutes. The first request after either has
     // to wait for the load, which takes far longer than a cleanup request may
     // wait, so load it here, once, before any real request is sent.
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        server.failed_at = None;
+        return Ok(());
+    };
     if !server.model_loaded || previous_use.elapsed() >= MODEL_RESIDENT {
-        info!("loading the local model");
+        let place = runtime(model).place();
+        info!(model, place, "loading the local model");
         let started = Instant::now();
-        match load_model() {
+        match load_model(model) {
             Ok(()) => {
                 info!(took = ?started.elapsed(), "local model is loaded");
                 server.model_loaded = true;
+                server.loaded_model = Some(model.to_string());
                 server.failed_at = None;
             }
             Err(error) => {
@@ -586,19 +925,21 @@ const MODEL_RESIDENT: Duration = Duration::from_secs(240);
 /// The longest a model load may take.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Make the server load [`DEFAULT_MODEL`] by asking it for one token.
-fn load_model() -> Result<()> {
+/// Make the server load `model` by asking it for one token.
+fn load_model(model: &str) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(LOAD_TIMEOUT)
         .build()?;
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+    });
+    add_request_options(&mut body, model);
     let response = client
         .post(format!("{MANAGED_BASE_URL}/chat/completions"))
-        .json(&serde_json::json!({
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-        }))
+        .json(&body)
         .send()
         .context("no answer")?;
     if !response.status().is_success() {
@@ -636,7 +977,7 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
             );
         }
     }
-    // Everything the server prints goes into OpenWritr's log, so a model
+    // Everything the server prints goes into HouWritr's log, so a model
     // that fails or stalls can be diagnosed from one file.
     if let Some(stream) = child.stdout.take() {
         forward_output(stream, "stdout");
@@ -661,11 +1002,11 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     Err(LocalLlmError::StartFailed("timed out".into()))
 }
 
-/// How loud a line of the server's output is in OpenWritr's log.
+/// How loud a line of the server's output is in HouWritr's log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineLevel {
     /// Two lines per model step (hundreds per reply): only with
-    /// `RUST_LOG=openwritr=debug`, where they time each part of the model.
+    /// `RUST_LOG=houwritr=debug`, where they time each part of the model.
     Debug,
     Info,
     /// The server or the NPU runtime reported an error.
@@ -745,13 +1086,42 @@ fn stop_locked(server: &mut Server) {
         let _ = child.wait();
     }
     server.model_loaded = false;
+    server.loaded_model = None;
     server.was_fast = false;
     server.slow_answers = 0;
 }
 
-/// Stop the server OpenWritr started, now, so the NPU and its memory go back
+/// After a request to the server failed without timing out: whether the
+/// server HouWritr started has exited (waiting up to two seconds for a
+/// process that is going down). Its exit status is logged, and the next
+/// request starts a new server.
+pub fn server_exited() -> bool {
+    let Some(mut server) = SERVER.try_lock_for(Duration::from_secs(2)) else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        let Some(child) = server.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                warn!(%status, "the local model server stopped by itself");
+                server.child = None;
+                stop_locked(&mut server);
+                return true;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Stop the server HouWritr started, now, so the NPU and its memory go back
 /// to the rest of the system. The next request starts it again (and reloads
-/// the model, about half a minute). Does nothing when OpenWritr did not start
+/// the model, about half a minute). Does nothing when HouWritr did not start
 /// a server, so a server the user runs is never touched. Also cancels
 /// whatever the server is still generating, e.g. a reply nobody waits for
 /// any more after a timeout.
@@ -796,6 +1166,7 @@ pub fn note_writing_speed(tokens_per_second: f64) {
     if tokens_per_second >= SLOW_WRITING_TOKENS_PER_SECOND {
         server.was_fast = true;
         server.slow_answers = 0;
+        forget_timeout();
         return;
     }
     server.slow_answers += 1;
@@ -821,12 +1192,30 @@ const SLOW_ANSWERS_TO_GIVE_UP: u32 = 2;
 /// Whether the built-in model has kept writing slowly (a long cleanup then
 /// stops instead of grinding on).
 pub fn keeps_writing_slowly() -> bool {
-    SERVER
-        .try_lock_for(Duration::from_secs(2))
-        .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
+    TIMED_OUT.load(Ordering::Relaxed)
+        || SERVER
+            .try_lock_for(Duration::from_secs(2))
+            .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
 }
 
-/// Stop the server (called when OpenWritr exits or the model is removed).
+/// Set when the built-in model let a cleanup request time out. Kept apart
+/// from the server state, which stopping the server (as a timeout does)
+/// clears: a slice of a few hundred characters that takes over two minutes
+/// means the model writes at about one token a second, so the rest of the
+/// transcript would take hours.
+static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// The built-in model did not answer a request in time.
+pub fn note_timeout() {
+    TIMED_OUT.store(true, Ordering::Relaxed);
+}
+
+/// A new cleanup starts: give the model another chance.
+pub fn forget_timeout() {
+    TIMED_OUT.store(false, Ordering::Relaxed);
+}
+
+/// Stop the server (called when HouWritr exits or the model is removed).
 pub fn shutdown() {
     // A model load can hold the lock for minutes; do not make quitting wait
     // for it (Windows ends the server with the app anyway).
@@ -835,7 +1224,7 @@ pub fn shutdown() {
     }
 }
 
-/// Tie the child's life to ours: when OpenWritr exits for any reason, even a
+/// Tie the child's life to ours: when HouWritr exits for any reason, even a
 /// crash, Windows ends the server too, so the NPU is never left occupied.
 fn kill_with_parent(child: &Child) {
     use std::os::windows::io::AsRawHandle;
@@ -889,7 +1278,7 @@ pub fn discover_models(base_url: &str) -> Result<Vec<String>> {
     if !scope.is_loopback() {
         bail!("only servers on this PC can be queried here");
     }
-    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    ensure_running(&scope, None).map_err(|error| anyhow!(error.to_string()))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -937,22 +1326,26 @@ pub fn test_chat(base_url: &str, model: &str) -> Result<TestResult> {
     if model.trim().is_empty() {
         bail!("enter a model ID first");
     }
-    ensure_running(&scope).map_err(|error| anyhow!(error.to_string()))?;
+    ensure_running(&scope, Some(model)).map_err(|error| anyhow!(error.to_string()))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(240))
         .build()?;
+    let mut body = serde_json::json!({
+        "model": model.trim(),
+        "messages": [{
+            "role": "user",
+            "content": "Write two short sentences about a quiet morning."
+        }],
+        "max_tokens": 48,
+        "temperature": 0.0,
+    });
+    if is_managed(&scope) {
+        add_request_options(&mut body, model);
+    }
     let started = Instant::now();
     let response = client
         .post(scope.join("/chat/completions"))
-        .json(&serde_json::json!({
-            "model": model.trim(),
-            "messages": [{
-                "role": "user",
-                "content": "Write two short sentences about a quiet morning."
-            }],
-            "max_tokens": 48,
-            "temperature": 0.0,
-        }))
+        .json(&body)
         .send()
         .context("the server did not answer")?;
     if !response.status().is_success() {
@@ -1002,6 +1395,66 @@ mod tests {
 
     fn scope(raw: &str) -> EndpointScope {
         EndpointScope::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn each_choice_is_asked_to_run_where_it_should() {
+        let mut body = serde_json::json!({"model": "x"});
+        add_request_options(&mut body, "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu");
+        assert_eq!(body["model"], QWEN3_4B_GGUF);
+        assert_eq!(body["compute"], "npu");
+        assert_eq!(body["ngl"], -1);
+        assert_eq!(body["enable_think"], false);
+        let mut body = serde_json::json!({"model": "x"});
+        add_request_options(&mut body, "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid");
+        assert_eq!(body["model"], QWEN3_4B_GGUF);
+        assert_eq!(body["compute"], "hybrid");
+        // A setting from before the list was cut down uses the first choice.
+        let mut old = serde_json::json!({"model": "x"});
+        add_request_options(&mut old, "ai-hub-models/Qwen3-4B-Instruct-2507");
+        assert_eq!(old["model"], QWEN3_4B_GGUF);
+        assert_eq!(old["compute"], "hybrid");
+        assert_eq!(runtime("something-else"), Runtime::Hybrid);
+        // Every choice is unique and shares one file.
+        let mut ids: Vec<&str> = BUILT_IN_MODELS.iter().map(|model| model.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), BUILT_IN_MODELS.len());
+        assert!(BUILT_IN_MODELS
+            .iter()
+            .all(|model| model.name == QWEN3_4B_GGUF));
+    }
+
+    #[test]
+    fn downloads_never_wait_for_an_answer() {
+        // A precision and a model type, or GenieX would ask for them.
+        assert!(QWEN3_4B_GGUF.ends_with(":Q4_0"));
+        for model in BUILT_IN_MODELS {
+            assert_eq!(
+                pull_arguments(model.id),
+                ["pull", QWEN3_4B_GGUF, "--model-type", "llm"]
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_models_are_found_by_name_and_listed_apart() {
+        assert_eq!(
+            built_in(" unsloth/qwen3-4b-instruct-2507-gguf:q4_0@HYBRID ")
+                .map(|model| model.runtime),
+            Some(Runtime::Hybrid)
+        );
+        assert_eq!(built_in("ai-hub-models/Qwen3-4B-Instruct-2507"), None);
+        let listing = r#"[{"name":"unsloth/Qwen3-4B-Instruct-2507-GGUF","precisions":["Q4_0"]}]"#;
+        assert!(lists_model(listing, geniex_name(DEFAULT_MODEL)));
+        assert!(!lists_model(
+            listing,
+            "ai-hub-models/Qwen3-4B-Instruct-2507"
+        ));
+        assert!(!lists_model(
+            listing,
+            "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_0"
+        ));
     }
 
     #[test]
@@ -1061,31 +1514,59 @@ mod tests {
     fn model_listing_matches_the_canonical_name_geniex_stores() {
         let listing =
             r#"[{"name":"qualcomm/Qwen3-4B-Instruct-2507","size":123,"precisions":["N/A"]}]"#;
-        assert!(lists_model(listing, DEFAULT_MODEL));
+        assert!(lists_model(listing, "ai-hub-models/Qwen3-4B-Instruct-2507"));
         assert!(lists_model(listing, "AI-HUB-MODELS/qwen3-4b-instruct-2507"));
         assert!(lists_model(listing, "qualcomm/Qwen3-4B-Instruct-2507:int4"));
         assert!(!lists_model(listing, "ai-hub-models/Other"));
         assert!(!lists_model(listing, "ai-hub-models/Qwen3-4B"));
         assert!(!lists_model(listing, "  "));
-        assert!(!lists_model("[]", DEFAULT_MODEL));
+        assert!(!lists_model("[]", "ai-hub-models/Qwen3-4B-Instruct-2507"));
         // Not JSON: plain search for the bare name.
         assert!(lists_model(
             "qualcomm/Qwen3-4B-Instruct-2507  2.3 GiB",
-            DEFAULT_MODEL
+            "ai-hub-models/Qwen3-4B-Instruct-2507"
         ));
     }
 
     #[test]
-    fn percent_is_read_from_progress_lines() {
-        assert_eq!(
-            parse_percent("Downloading  42%  1.2 GiB/2.9 GiB"),
-            Some(42.0)
-        );
-        assert_eq!(parse_percent("[=====>   ] 63.5% 12 MB/s"), Some(63.5));
-        assert_eq!(parse_percent("100%"), Some(100.0));
-        assert_eq!(parse_percent("step 1 of 3"), None);
-        assert_eq!(parse_percent("up 250%"), None);
-        assert_eq!(parse_percent("%"), None);
+    fn download_bars_are_read_without_trusting_their_total() {
+        // GenieX's bar at 100% while the download is still going.
+        let line = "downloading 100% |██████████| (1.2 GB/310 MB, 25 MB/s) [48s:0s]";
+        let bar = parse_pull_progress(line).unwrap();
+        assert_eq!(bar.downloaded, 1.2e9);
+        assert_eq!(bar.rate, Some(25e6));
+        let (fraction, text) = describe_pull(&bar, Some(2_400_000_000));
+        assert_eq!(fraction, Some(0.5));
+        assert_eq!(text, "50% · 1.2 GB of 2.4 GB · 25.0 MB/s · about 48 s left");
+        // Same unit for both: written once.
+        let bar =
+            parse_pull_progress("downloading  45% |████   | (1.1/2.4 GB, 9.5 MB/s) [1m0s:2m0s]")
+                .unwrap();
+        assert_eq!(bar.downloaded, 1.1e9);
+        assert_eq!(bar.total, Some(2.4e9));
+        // Unknown size: GenieX's total only when it is larger than what came.
+        let (fraction, text) = describe_pull(&bar, None);
+        assert!((fraction.unwrap() - 0.458).abs() < 0.01);
+        assert_eq!(text, "46% · 1.1 GB of 2.4 GB · 9.5 MB/s · about 2 min left");
+        // Never 100% before GenieX finishes.
+        let (fraction, _) = describe_pull(&bar, Some(1_000_000_000));
+        assert_eq!(fraction, Some(0.99));
+        assert_eq!(parse_pull_progress("Detected model type: llm"), None);
+        assert_eq!(parse_pull_progress("fetching available precisions"), None);
+    }
+
+    #[test]
+    fn only_downloads_that_can_recover_are_retried() {
+        assert!(worth_retrying(&anyhow!(
+            "geniex pull failed (exit code: 1): connection reset"
+        )));
+        assert!(!worth_retrying(&anyhow!("cancelled")));
+        assert!(!worth_retrying(&anyhow!(
+            "geniex pull failed: 404 Not Found"
+        )));
+        assert!(!worth_retrying(&anyhow!(
+            "geniex pull failed: no space left on device"
+        )));
     }
 
     #[test]
@@ -1171,7 +1652,7 @@ mod tests {
 
     #[test]
     fn unmanaged_endpoints_never_start_anything() {
-        assert!(ensure_running(&scope("http://127.0.0.1:11434/v1")).is_ok());
-        assert!(ensure_running(&scope("https://api.openai.com/v1")).is_ok());
+        assert!(ensure_running(&scope("http://127.0.0.1:11434/v1"), Some("m")).is_ok());
+        assert!(ensure_running(&scope("https://api.openai.com/v1"), None).is_ok());
     }
 }

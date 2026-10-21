@@ -1,4 +1,4 @@
-# HouWritr for Windows
+# HouWritr
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Windows 11](https://img.shields.io/badge/Windows-11_24H2-0078D4?logo=windows)](https://github.com/raulhou/HouWritr)
@@ -51,23 +51,23 @@ no admin rights needed:
 Not sure? Snapdragon laptops report "ARM based processor" in Settings →
 System → About. Everything else is x64.
 
-**Installer.** Download `openwritr-windows-<arch>-vX.Y.Z-setup.exe` from
+**Installer.** Download `houwritr-windows-<arch>-vX.Y.Z-setup.exe` from
 [Releases](https://github.com/raulhou/HouWritr/releases/latest) and run it.
 It adds a Start menu entry, an optional start at sign in entry and an
 uninstaller under Settings → Apps.
 
-**Portable zip.** Download `openwritr-windows-<arch>-vX.Y.Z.zip`, unzip it
-into any folder and run `openwritr.exe`. The app finds its DLLs next to the
+**Portable zip.** Download `houwritr-windows-<arch>-vX.Y.Z.zip`, unzip it
+into any folder and run `houwritr.exe`. The app finds its DLLs next to the
 exe. Start at sign in is available here too (Settings → Startup) and is
 repaired automatically if you move the folder.
 
 > **Windows SmartScreen.** The binaries are not code signed yet, so the first
 > launch shows "Windows protected your PC". Click **More info → Run anyway**.
 > To check a download, compare its SHA-256 with `SHA256SUMS.txt` on the
-> release: `Get-FileHash .\openwritr-windows-<arch>-vX.Y.Z-setup.exe`.
+> release: `Get-FileHash .\houwritr-windows-<arch>-vX.Y.Z-setup.exe`.
 
 On first use the selected engine downloads its verified model files into
-`%LOCALAPPDATA%\OpenWritr\models\`: Parakeet CPU about 670 MB, Parakeet NPU
+`%LOCALAPPDATA%\HouWritr\models\`: Parakeet CPU about 670 MB, Parakeet NPU
 about 650 MB more, Whisper NPU a 2.0 GB archive (about 2.2 GB unpacked).
 Progress shows in the tray.
 
@@ -77,10 +77,11 @@ HouWritr lives in the system tray. Right click the icon:
 
 | Tray menu | What it does |
 |---|---|
-| **Transcribe audio or video file…** | Pick a file; a window shows progress and the result. |
+| **Transcribe audio or video file…** | Pick a file; a window shows progress and the result, with **Stop** while it runs (nothing is saved). |
 | **Start / Stop meeting recording** | Record your microphone and the PC's sound, transcribed while you record. |
 | **Pause / Resume meeting recording** | Stop capturing for a while without ending the meeting. |
 | **Hide / Show recording indicator** | Toggle the meeting pill for this session only. |
+| **Jobs…** | Everything running or waiting: the meeting being recorded, files and meeting parts with their progress, and background cleanup retries with their next try. Files can be stopped and retries cancelled from here. |
 | **Settings** | Engine, speaker labels, AI cleanup, output format, startup. |
 | **Open logs / Export diagnostics…** | See [Logs and diagnostics](#logs-and-diagnostics). |
 | **Retry model / engine, Cancel model download** | Recover from a failed or unwanted download. |
@@ -141,9 +142,45 @@ playing, only the microphone contributes).
   bars, or amber `Paused 12:34`. It steps aside while the status pill needs the
   same spot. Turn it off in Settings, or for the session from the tray. The
   tray icon turns red (recording) or amber (paused) either way.
-* Transcripts are saved to `Documents\OpenWritr\Meetings\Meeting <date>
+* Transcripts are saved to `Documents\HouWritr\Meetings\Meeting <date>
   <time>.txt`, named after when the meeting started. Quitting while recording
   saves what was recorded.
+
+### Power saving
+
+Turn on **Power saving: only record, transcribe later** in the tray menu (or in
+Settings → Output and feedback). While it is on, a meeting is **only
+recorded**, files you choose are **only queued**, and no transcription,
+speaker detection or AI cleanup runs (retries of cleanup wait too). When you
+turn the mode off (checked every two seconds), everything that waited is done
+in the order it came, then the engine and the model unload as usual. A job that
+has already started when you turn it on finishes. Whether the PC is plugged in
+makes no difference; for that, use *Follow Windows* below.
+
+* **Nothing waits only in memory.** Each cut part of a meeting, and each
+  queued file, is saved first as files under `%LOCALAPPDATA%\HouWritr\pending\`
+  (the audio is uncompressed 16 kHz, about 115 MB an hour) and deleted when
+  its transcript is done. If the battery runs out, HouWritr is closed or the PC
+  restarts, they are picked up on the next start (and still wait for power if
+  power saving is on). The audio of the part being recorded at that moment
+  (up to five minutes) is only in memory. Unfinished AI cleanup retries are
+  kept in `repairs.json` in the same folder.
+* **Turning it on or off never loses anything.** Switching modes only decides
+  whether waiting jobs start now.
+* **Let Windows decide.** Settings has *Follow Windows*: work then waits
+  exactly while Windows' power saving mode (battery saver, called energy saver
+  on newer Windows) is on, and runs as soon as it is off. Windows decides when
+  that is, for example at a low battery level. The tray item shows that, and a click on it overrides
+  Windows for the rest of the session only; click it back, or restart HouWritr,
+  and it follows Windows again. (The "Power mode" slider in Windows, such as Best power efficiency,
+  is a different setting and is not read.)
+* The tray tooltip and the Jobs window list what is waiting ("Waiting for
+  power saving to be turned off").
+* Files are decoded to audio when you choose them, which uses a little
+  power; the heavy work (speech recognition, speaker detection, cleanup)
+  waits. If a meeting was split across a restart, the part of it that was
+  finished before the restart is only in its "(in progress)" file, so the
+  final transcript after the restart holds the parts that were waiting.
 
 For in person meetings, use the best microphone available (a conference or
 USB microphone beats a laptop's), keep it near the speakers, and expect quiet
@@ -176,7 +213,11 @@ Labels never remove speech: audio that cannot be attributed is transcribed with
 the neighbouring speaker. Labels are numbered in order of appearance and are
 **not** names. Accuracy drops with overlapping speech, short interjections,
 similar voices and poor audio, and one voice is sometimes split into two
-labels. With a single speaker the transcript stays unlabelled; if the models
+labels. To limit that, a voice heard for less than 30 seconds (or 2% of all the
+speech, if that is more) is counted as the closest voice that was heard enough,
+and in a meeting this is decided once, after Stop, across all the parts: applause or
+a stray word no longer becomes a "Speaker 17". The cost is that someone who only
+speaks briefly is labelled as another speaker. With a single speaker the transcript stays unlabelled; if the models
 cannot run you still get the transcript and a note saying so.
 
 The Speaker labels section also shows whether the models are installed, with
@@ -193,14 +234,27 @@ text and never as audio, to the provider you chose, which fixes punctuation
 and recognition slips:
 
 * The transcript is sent in slices: about 3,000 characters for a hosted
-  provider, 1,200 for a local server and 600 for the built in NPU model (local
-  models get a third of that for Chinese and Japanese, which take more tokens
-  per character). Slices are cut at sentence ends and never split a speaker's
-  block.
-* With a hosted provider the first slice goes alone, then three slices are
-  cleaned at a time; the results are put back in order. A model on this PC
-  gets one slice at a time.
+  provider and 1,200 for a model on this PC
+  (a third of that for Chinese and Japanese). Slices are cut at sentence ends
+  and never split a speaker's block.
+* With a hosted provider one tiny request first finds a working model, then
+  one slice at a time is cleaned (a rate limit costs more than the minutes
+  this takes). A provider that answers "busy" (429) or "unavailable" (503) is asked again
+  after 30, 60 and 120 seconds (or what its Retry-After says, if longer), and
+  all slices and later retries wait out that pause together; if it still
+  refuses, it is left alone for 5 minutes and the slices are retried in the
+  background. If that first request is not answered twice in a
+  row, the provider is treated as down: no slice waits out its own timeout,
+  and all of them are left for the retry in the background. With GitHub
+  Copilot, a model the account's sign-in is refused is tried under the other
+  app identity before a different model is used. A model on this PC gets one
+  slice at a time.
 * `[m:ss]` markers are held back from the request and put back afterwards.
+* Speaker labels are held back too. When a section holds several speakers,
+  each speaker's block is sent with a tag (`[A]`, `[B]`, ...) that the model
+  must keep, and the answer is matched to the blocks by those tags, so a model
+  that merges the short turns of a fast conversation no longer fails the
+  section. A tag that is missing or out of order still counts as a change.
 * If most of the Chinese in a transcript is Simplified (or Traditional), every
   slice is told to write in that script, so a transcript does not drift
   between the two.
@@ -209,14 +263,28 @@ and recognition slips:
   text, and the log says why. If no slice can be cleaned, the raw transcript is
   saved with a warning that names the reason.
 
+**Changes the number and label checks refuse.** The cleaned version of a
+section is compared with the original: every number written in digits and
+every speaker label has to be the same (a model that "completes" 23 to 2023,
+drops a figure or merges two speakers' turns changes what was said). This is
+not a content filter and nothing is blocked: a section that fails keeps its
+recognised text. When it failed on a number, the model is first asked once
+more with the numbers of that section named. If that does not help, or it
+was a speaker label, the section is cut in two at the sentence or block boundary nearest its middle, each
+half is cleaned on its own (and cut again if it fails too, down to about a
+quarter of the section), and the pieces are put back together with the gaps
+they had. Only the smallest piece that keeps failing keeps its recognised
+text. The transcript window counts such sections as cleaned in part.
+
 **Unreliable connections.** Cleanup never holds up a transcript. A slice that
 cannot reach the provider keeps its recognised text; after three failures in a
 row the rest is skipped, and for a minute no further requests are made.
 Unfinished sections of a meeting get a second try when you press Stop (up to
 90 seconds). Anything still unfinished is retried in the background 2, 5, 10,
 20 and 30 minutes after saving, and the file is updated in place, unless you
-have edited, moved or deleted it. Timeouts grow with the slice length (up to
-10 minutes), for slow networks.
+have edited, moved or deleted it. The transcript window shows each retry and
+its progress, and says "Done" only when nothing is left to retry. Timeouts
+grow with the slice length (up to 10 minutes), for slow networks.
 
 Leave enhancement **Off** to keep everything on this PC. With it on, the
 transcript text goes to your provider, so think twice for confidential
@@ -241,20 +309,47 @@ meetings.
   kept in Windows Credential Manager, never in the settings file, and is only
   sent over https (or to a server on this PC).
 * **Local model (on this PC).**
-  * *Built in model (NPU)*: on a Snapdragon PC, HouWritr uses Qualcomm's
-    [GenieX](https://github.com/qualcomm/GenieX) to run
-    `Qwen3-4B-Instruct-2507` on the Hexagon NPU. Press **Install GenieX…**
-    (the pinned v0.8.0 installer, checked against its SHA-256, installed for
-    your user only), then **Download model** (several GB, resumable), then
-    **Test model**. HouWritr starts `geniex serve` on a private port (18651)
-    only when needed and stops it as soon as a transcript is finished, after
-    5 idle minutes, or when it stops answering or slows down sharply. While it
-    runs, an NPU speech engine is unloaded to give it the NPU, and loaded
-    again for the next transcription. **Remove model** deletes the model;
-    **Uninstall GenieX…** removes the model and runs GenieX's own uninstaller.
+  * *Built in model*: on a Snapdragon PC, HouWritr uses Qualcomm's
+    [GenieX](https://github.com/qualcomm/GenieX) to run a model for you.
+    Press **Install GenieX…** (the pinned v0.8.0 installer, checked against
+    its SHA-256, installed for your user only), pick a model, then
+    **Download model** (one bar with size, speed and time left; a download
+    that stops resumes by itself, up to five tries) and **Test model**, which shows how fast
+    it writes. One Qwen3 4B file (`unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0`,
+    about 2.4 GB from Hugging Face), run two ways through GenieX's llama.cpp
+    runtime:
+    * *Qwen3 4B in hybrid mode* (the default): GenieX's `hybrid` setting, where
+      llama.cpp's scheduler spreads the work over what it can use.
+      Qualcomm's documentation says NPU and CPU, but on the test PC Task
+      Manager showed `geniex.exe` using the Adreno GPU (about 76%) and the NPU
+      (about 69%) with the CPU low (about 9%); GenieX does not log which
+      processor ran a step. The faster choice (about 18 tokens a second on a
+      Snapdragon X Elite), but the GPU load costs battery.
+    * *Qwen3 4B on the NPU only*: all layers on the NPU. Steady (about 13
+      tokens a second) and the lightest on the CPU.
+
+    Earlier versions also offered Qualcomm's precompiled NPU bundle (about
+    one token a second on the test PC), the CPU alone, and Qwen2.5 7B. Their
+    files are not deleted by the update; **Uninstall GenieX…** removes them.
+
+    HouWritr starts `geniex serve` on a private port (18651) only when a
+    job needs it and stops it as soon as that job is finished (each meeting
+    part, each background retry and each test in Settings included), or
+    when it stops answering or slows down sharply. If a model
+    writes too slowly to be useful (a slice takes over two minutes), cleanup
+    stops and the rest of the transcript stays as recognised, without
+    background retries. **Remove model** deletes the selected model;
+    **Uninstall GenieX…** removes all of them and runs GenieX's own
+    uninstaller.
   * *Another local server*: any OpenAI compatible server on `localhost`
     (LM Studio, Ollama, Foundry Local, your own GenieX). Presets, **Find
     models**, **Test connection** and a setup guide are in Settings.
+
+  With a model on this PC, a meeting is cleaned up once, after you press
+  Stop: while it runs, its parts are only transcribed. The model then loads
+  once instead of every five minutes, and stays off the CPU during the call.
+  Hosted providers clean each part as it comes, so their result is ready at
+  Stop.
 
   Local models are slower and weaker than hosted ones, so they get smaller
   slices, longer waits, and `<think>…</think>` blocks removed from replies.
@@ -286,8 +381,9 @@ Tray icon → right click → **Settings**:
   are not using (it downloads again if you select it later).
 * **Output and feedback**: save transcripts as Markdown (`.md` with a title,
   details line and paragraphs; added by HouWritr, not the AI) or plain text;
-  show the status pill; show the meeting recording indicator; and what to do
-  about meeting notes.
+  show the status pill; show the meeting recording indicator; power saving
+  (and whether Windows' battery saver switches it); and what to do about
+  meeting notes.
 * **Speaker labels**: on or off, model status and management, and **Remove
   models** (see above).
 * **Text enhancement**: **Off** or **On**, the provider, model and prompt.
@@ -295,7 +391,7 @@ Tray icon → right click → **Settings**:
 * **About, credits & support**: version, architecture, source, issues,
   privacy, licences, model and runtime credits.
 
-Settings are stored in `%LOCALAPPDATA%\OpenWritr\settings.json`, written
+Settings are stored in `%LOCALAPPDATA%\HouWritr\settings.json`, written
 atomically and picked up live, including edits made outside the app. Settings
 files from older (dictation) versions still load; their shortcut and paste
 options are ignored, and cleanup that used to need Shift is simply on.
@@ -305,18 +401,20 @@ options are ignored, and cleanup that used to need Shift is simply on.
 | What | Where |
 |---|---|
 | File transcripts | Next to the source file |
-| Meeting transcripts and notes | `Documents\OpenWritr\Meetings\` |
+| Meeting transcripts and notes | `Documents\HouWritr\Meetings\` |
 | Transcripts that could not be saved where they belong | `Documents\HouWritr\` |
-| Settings, models, logs | `%LOCALAPPDATA%\OpenWritr\` |
+| Settings, models, logs | `%LOCALAPPDATA%\HouWritr\` |
+| Jobs waiting for power or unfinished at exit | `%LOCALAPPDATA%\HouWritr\pending\` (deleted when done) |
 | API keys | Windows Credential Manager |
 
-The data folders keep the OpenWritr name so existing installs keep their
-models and settings. `AppData` is hidden; paste `%LOCALAPPDATA%\OpenWritr`
-into the Explorer address bar to open it.
+The data folders were called OpenWritr before the rename. HouWritr moves them
+to the new name the first time it starts, with models and settings intact (the Credential Manager entry for an API key
+and the startup entry move too). `AppData` is hidden; paste
+`%LOCALAPPDATA%\HouWritr` into the Explorer address bar to open it.
 
 ## Logs and diagnostics
 
-Logs are in `%LOCALAPPDATA%\OpenWritr\logs`:
+Logs are in `%LOCALAPPDATA%\HouWritr\logs`:
 
 * `sessions\` holds one file per run of the app (the settings and transcript
   windows it opens write into the same file).
@@ -478,7 +576,7 @@ HouWritr/
 └── target/                gitignored build and staging output
 ```
 
-The shipped `openwritr.exe` does not call Python at runtime.
+The shipped `houwritr.exe` does not call Python at runtime.
 
 ## Development
 
@@ -489,7 +587,7 @@ cd HouWritr
 cargo build --release --bins
 python scripts/fetch_runtime.py --arch arm64
 python scripts/prepare_release.py --arch arm64
-target\stage\arm64\openwritr.exe --self-check
+target\stage\arm64\houwritr.exe --self-check
 ```
 
 For x64 packaging, stage the CPU runtime with:

@@ -11,8 +11,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-pub const PUBLISHER: &str = "Torsten Mahr";
-pub const COPYRIGHT: &str = "Copyright © 2026 Torsten Mahr and contributors.";
+pub const PUBLISHER: &str = "Wenxuan Hou";
+pub const COPYRIGHT: &str = "Copyright © 2026 Wenxuan Hou. Based on OpenWritr, copyright © 2026 Torsten Mahr and contributors (MIT).";
 pub const LICENSE_SUMMARY: &str = "HouWritr is licensed under the MIT License.";
 pub const DISCLAIMER: &str = "HouWritr is an independent open-source project and is not affiliated with NVIDIA, Qualcomm, or Microsoft.";
 

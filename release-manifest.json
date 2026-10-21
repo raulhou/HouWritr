@@ -8,7 +8,7 @@
         "repository": "."
       },
       "files": [
-        { "source_root": "binary", "source": "openwritr.exe", "target": "openwritr.exe", "kind": "pe" },
+        { "source_root": "binary", "source": "houwritr.exe", "target": "houwritr.exe", "kind": "pe" },
         { "source_root": "runtime", "source": "runtime-versions.json", "target": "runtime-versions.json", "kind": "runtime_receipt" },
         { "source_root": "runtime", "source": "onnxruntime.dll", "target": "onnxruntime.dll", "kind": "pe" },
         { "source_root": "runtime", "source": "onnxruntime_providers_qnn.dll", "target": "onnxruntime_providers_qnn.dll", "kind": "pe" },
@@ -40,7 +40,7 @@
         "repository": "."
       },
       "files": [
-        { "source_root": "binary", "source": "openwritr.exe", "target": "openwritr.exe", "kind": "pe" },
+        { "source_root": "binary", "source": "houwritr.exe", "target": "houwritr.exe", "kind": "pe" },
         { "source_root": "runtime", "source": "runtime-versions.json", "target": "runtime-versions.json", "kind": "runtime_receipt" },
         { "source_root": "runtime", "source": "onnxruntime.dll", "target": "onnxruntime.dll", "kind": "pe" },
         { "source_root": "runtime", "source": "third-party-licenses/onnxruntime-LICENSE.txt", "target": "third-party-licenses/onnxruntime-LICENSE.txt", "kind": "file" },

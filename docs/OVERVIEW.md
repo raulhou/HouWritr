@@ -49,8 +49,9 @@ notes and reports.
   covers about 100, including Chinese and Japanese.
 * **AI cleanup** (optional, off by default): the recognised text, never audio,
   is sent in slices to GitHub Copilot, an OpenAI compatible API, or a model on
-  this PC (Qwen3 4B on the NPU through Qualcomm GenieX, or a local server).
-  Hosted providers get three slices at a time. Every slice is checked by an
+  this PC (Qwen3 4B on the NPU, alone or with the CPU, through Qualcomm
+  GenieX's llama.cpp runtime; or a local server you run).
+  Hosted providers get one slice at a time. Every slice is checked by an
   integrity validator, and a slice that fails or cannot be sent keeps its
   recognised text and is retried in the background later.
 * **Meeting notes** (optional): summary, key points, decisions, action items
@@ -65,7 +66,7 @@ at run time).
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  openwritr.exe (tray process, winit event loop on the main thread) │
+│  houwritr.exe (tray process, winit event loop on the main thread) │
 │                                                                    │
 │  tray menu ── file picker ── decode (Symphonia) → 16 kHz mono      │
 │           └── meeting capture: mic (cpal) + loopback (WASAPI)      │
@@ -79,7 +80,7 @@ at run time).
 │  │   Whisper Large v3 Turbo: encoder + decoder on NPU (QNN)     │   │
 │  │        ↓ text                                                │   │
 │  │ AI cleanup / notes (optional): Copilot, OpenAI compatible,   │   │
-│  │   or local model (GenieX `geniex serve` on the NPU)          │   │
+│  │   or local model (GenieX `geniex serve`, NPU or CPU)         │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                     │ transcript                                   │
 │                     ▼                                              │
@@ -131,8 +132,15 @@ are cut to one copy.
   sections are retried in the background and written back only if the file is
   untouched.
 * **No clipboard, no keystrokes.** Results only ever go to files.
-* **Power.** The app and its GenieX server opt out of Windows power throttling,
-  so background jobs keep their speed with no window in front.
+* **Power.** With nothing to do, HouWritr holds no model: the speech engine
+  leaves the NPU as soon as no work is waiting (also between the parts of a
+  meeting) and loads again in about two seconds for the next job, and the
+  GenieX server is started for each job's cleanup and stopped when that job
+  ends. While working, the app and its GenieX server opt out of Windows
+  power throttling, so background jobs keep their speed with no window in
+  front.
+* **Text size.** The Settings and transcript windows follow Windows' display
+  scale and its Accessibility → Text size setting.
 * **Observable.** One log per app session and one per transcript, with the
   build commit on the first line and a crash log.
 
@@ -146,7 +154,7 @@ are cut to one copy.
   for the optional local model, the pinned GenieX installer) and, only if you
   turn it on, AI cleanup and notes, which send transcript text to the provider
   you configured with your own credentials.
-* Settings, models and logs live under `%LOCALAPPDATA%\OpenWritr\`; API keys
+* Settings, models and logs live under `%LOCALAPPDATA%\HouWritr\`; API keys
   live in Windows Credential Manager. See [PRIVACY.md](../PRIVACY.md).
 
 ## Tech stack

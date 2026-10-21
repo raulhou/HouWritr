@@ -1,7 +1,7 @@
-; Inno Setup script — produces a single-exe installer for OpenWritr.
+; Inno Setup script — produces a single-exe installer for HouWritr.
 ;
 ; Build with:
-;     "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" /Qp installer\openwritr.iss
+;     "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" /Qp installer\houwritr.iss
 ;
 ; The Cargo bin `installer_build` (cargo run --release --bin installer_build)
 ; runs this automatically as part of the release flow.
@@ -12,7 +12,7 @@
 #endif
 #define AppPublisher  "Wenxuan Hou"
 #define AppURL        "https://github.com/raulhou/HouWritr"
-#define AppExeName    "openwritr.exe"
+#define AppExeName    "houwritr.exe"
 #define SrcDir        "..\target\stage\arm64"
 
 [Setup]
@@ -32,7 +32,7 @@ DisableProgramGroupPage=auto
 ArchitecturesAllowed=arm64
 ArchitecturesInstallIn64BitMode=arm64
 OutputDir=..\target\dist
-OutputBaseFilename=openwritr-windows-arm64-v{#AppVersion}-setup
+OutputBaseFilename=houwritr-windows-arm64-v{#AppVersion}-setup
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -78,9 +78,12 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; exact same mechanism at runtime (Settings → Startup). uninsdeletevalue removes
 ; it on uninstall even if the task was unselected but later enabled in the app.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-      ValueType: string; ValueName: "OpenWritr"; \
+      ValueType: string; ValueName: "HouWritr"; \
       ValueData: """{app}\{#AppExeName}"""; \
       Flags: uninsdeletevalue; Tasks: autostart
+; The startup value had another name before the rename; the autostart task is
+; preselected below when it was there, so nothing is lost by removing it.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "OpenWritr"; Flags: deletevalue
 
 [InstallDelete]
 ; Migrate away from the legacy startup-folder shortcut used by older installers,
@@ -90,6 +93,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 ; and the app-side migration in autostart.rs remains able to pick it up later —
 ; a previously active autostart is never silently dropped.
 Type: files; Name: "{userstartup}\{#AppName}.lnk"; Tasks: autostart
+; The program file had another name before the rename; an upgrade installs
+; into the same folder, so remove the old one.
+Type: files; Name: "{app}\openwritr.exe"
 
 [Run]
 ; Optional: launch right after install. SkipIfSilent so headless installs don't pop a window.
@@ -97,14 +103,14 @@ Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait
 
 [UninstallRun]
 ; Stop any running instance before removing files.
-Filename: "{cmd}"; Parameters: "/C taskkill /IM {#AppExeName} /F"; Flags: runhidden; RunOnceId: "KillOpenWritr"
+Filename: "{cmd}"; Parameters: "/C taskkill /IM {#AppExeName} /F"; Flags: runhidden; RunOnceId: "KillHouWritr"
 ; Always remove the autostart Run value, even if the user enabled it from inside
 ; the app after installing without the autostart task (so uninsdeletevalue never
 ; recorded it). reg delete is a no-op with exit 1 if it is already gone.
-Filename: "{cmd}"; Parameters: "/C reg delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v OpenWritr /f"; Flags: runhidden; RunOnceId: "RemoveOpenWritrRun"
+Filename: "{cmd}"; Parameters: "/C reg delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v HouWritr /f"; Flags: runhidden; RunOnceId: "RemoveHouWritrRun"
 
 [UninstallDelete]
-; Leave user data (settings, models, logs) under %LOCALAPPDATA%\OpenWritr\ alone.
+; Leave user data (settings, models, logs) under %LOCALAPPDATA%\HouWritr\ alone.
 ; Only the app/ subfolder is uninstalled. Add a custom message in the wizard.
 Type: files; Name: "{userstartup}\{#AppName}.lnk"
 Type: filesandordirs; Name: "{app}"
@@ -119,6 +125,8 @@ function LegacyAutostartEnabled(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{userstartup}\{#AppName}.lnk')) or
     RegValueExists(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', 'HouWritr') or
+    RegValueExists(HKEY_CURRENT_USER,
       'Software\Microsoft\Windows\CurrentVersion\Run', 'OpenWritr');
 end;
 
@@ -126,4 +134,15 @@ procedure InitializeWizard();
 begin
   if LegacyAutostartEnabled() then
     WizardSelectTasks('autostart');
+end;
+
+// The program had another name before the rename: stop a copy of the old one
+// that is still running before its file is removed.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssInstall then
+    Exec(ExpandConstant('{cmd}'), '/C taskkill /IM openwritr.exe /F', '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;

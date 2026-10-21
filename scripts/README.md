@@ -1,7 +1,7 @@
 # `scripts/` — NPU model toolchain
 
 Build-time tools used to produce the QNN HTP context binary that the
-native app ships against. **None of these are invoked by openwritr.exe
+native app ships against. **None of these are invoked by houwritr.exe
 at runtime** — the released app pulls the pre-compiled `.bin` from
 [trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s)
 on first launch.

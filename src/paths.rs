@@ -1,13 +1,55 @@
 use std::path::PathBuf;
-pub const APP_NAME: &str = "OpenWritr";
+use std::sync::OnceLock;
+use tracing::{info, warn};
+
+pub const APP_NAME: &str = "HouWritr";
+/// What the app and its folders were called before the rename.
+const LEGACY_APP_NAME: &str = "OpenWritr";
+
+/// `parent\HouWritr`. A folder left by the old name is moved there first, so
+/// models, settings and transcripts follow the rename. When the move fails
+/// (a file in it is open) the old folder keeps being used rather than
+/// starting from nothing.
+fn migrated(parent: PathBuf) -> PathBuf {
+    let new = parent.join(APP_NAME);
+    let old = parent.join(LEGACY_APP_NAME);
+    if new.exists() || !old.is_dir() {
+        return new;
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => {
+            info!(from = %old.display(), to = %new.display(), "moved a folder to the new app name");
+            new
+        }
+        Err(error) => {
+            warn!(%error, folder = %old.display(), "could not move a folder to the new app name; keeping the old one");
+            old
+        }
+    }
+}
 
 fn base() -> PathBuf {
-    if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(p).join(APP_NAME);
-    }
-    directories::BaseDirs::new()
-        .map(|d| d.data_local_dir().join(APP_NAME))
-        .unwrap_or_else(|| PathBuf::from("."))
+    static BASE: OnceLock<PathBuf> = OnceLock::new();
+    BASE.get_or_init(|| {
+        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+            return migrated(PathBuf::from(p));
+        }
+        directories::BaseDirs::new()
+            .map(|d| migrated(d.data_local_dir().to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
+    .clone()
+}
+
+/// `Documents\HouWritr`, where meeting transcripts and notes go.
+pub fn documents_dir() -> Option<PathBuf> {
+    static DOCUMENTS: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DOCUMENTS
+        .get_or_init(|| {
+            let documents = directories::UserDirs::new()?.document_dir()?.to_path_buf();
+            Some(migrated(documents))
+        })
+        .clone()
 }
 
 pub fn log_dir() -> PathBuf {

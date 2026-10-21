@@ -1,8 +1,8 @@
 //! The GitHub sign-in used for GitHub Copilot cleanup.
 //!
-//! OpenWritr looks in the same places, in the same order, as GitHub Copilot
+//! HouWritr looks in the same places, in the same order, as GitHub Copilot
 //! CLI itself, so the account the `copilot` command is signed in with is the
-//! one OpenWritr uses:
+//! one HouWritr uses:
 //!
 //! 1. the `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN` variables;
 //! 2. the token `copilot login` saved in Windows Credential Manager (an entry
@@ -418,6 +418,7 @@ mod tests {
             "Copilot-CLI/https://github.com:octocat"
         ));
         assert!(!is_copilot_cli_entry("git:https://github.com"));
+        assert!(!is_copilot_cli_entry("HouWritr/OpenAICompatibleApiKey"));
         assert!(!is_copilot_cli_entry("OpenWritr/OpenAICompatibleApiKey"));
     }
 
