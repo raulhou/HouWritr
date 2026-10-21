@@ -1,8 +1,11 @@
 use thiserror::Error;
 
-const SERVICE: &str = "OpenWritr";
+const SERVICE: &str = "HouWritr";
 const USER: &str = "openai-compatible";
-const TARGET: &str = "OpenWritr/OpenAICompatibleApiKey";
+const TARGET: &str = "HouWritr/OpenAICompatibleApiKey";
+/// The entry the key was saved under before the app was renamed.
+const LEGACY_SERVICE: &str = "OpenWritr";
+const LEGACY_TARGET: &str = "OpenWritr/OpenAICompatibleApiKey";
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -37,11 +40,29 @@ impl WindowsCredentialStore {
     }
 }
 
+impl WindowsCredentialStore {
+    /// A key saved under the old app name moves to the new entry the first
+    /// time it is read, so the user does not have to enter it again.
+    fn take_legacy(&self) -> Result<Option<String>, CredentialError> {
+        let legacy = keyring::Entry::new_with_target(LEGACY_TARGET, LEGACY_SERVICE, USER)
+            .map_err(|error| backend_error("entry creation", error))?;
+        let secret = match legacy.get_password() {
+            Ok(secret) if !secret.is_empty() => secret,
+            Ok(_) | Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(error) => return Err(backend_error("read", error)),
+        };
+        if Self::entry()?.set_password(&secret).is_ok() {
+            let _ = legacy.delete_credential();
+        }
+        Ok(Some(secret))
+    }
+}
+
 impl CredentialStore for WindowsCredentialStore {
     fn read(&self) -> Result<Option<String>, CredentialError> {
         match Self::entry()?.get_password() {
             Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring::Error::NoEntry) => self.take_legacy(),
             Err(error) => Err(backend_error("read", error)),
         }
     }
@@ -56,6 +77,9 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn delete(&self) -> Result<(), CredentialError> {
+        if let Ok(legacy) = keyring::Entry::new_with_target(LEGACY_TARGET, LEGACY_SERVICE, USER) {
+            let _ = legacy.delete_credential();
+        }
         match Self::entry()?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(backend_error("delete", error)),

@@ -1110,7 +1110,7 @@ pub fn initialize_ort_runtime() -> Result<PathBuf> {
     if !*initialized {
         verify_runtime_contract(&runtime_dir)?;
         std::env::set_var("ORT_DYLIB_PATH", runtime_dir.join("onnxruntime.dll"));
-        let _ = ort::init().with_name("openwritr").commit();
+        let _ = ort::init().with_name("houwritr").commit();
         *initialized = true;
     }
     Ok(runtime_dir)

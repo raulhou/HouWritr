@@ -1,5 +1,5 @@
 """
-Generate the OpenWritr app icon as a multi-resolution .ico.
+Generate the HouWritr app icon as a multi-resolution .ico.
 
 A rounded-square badge in the app's blue (the tray idle color 74,144,226),
 with a simple white microphone glyph. Emitted at 16/32/48/64/128/256 px so
@@ -11,7 +11,7 @@ installer.
 from pathlib import Path
 from PIL import Image, ImageDraw
 
-OUT = Path(__file__).parent / "openwritr.ico"
+OUT = Path(__file__).parent / "houwritr.ico"
 BASE = 256  # design at 256, downscale for the .ico set
 
 

@@ -13,7 +13,7 @@
 //! sanity-check latency and decision distribution. Never prints secrets,
 //! transcripts, prompts, or raw candidate text.
 //!
-//! This binary shares the production `cleanup` core with `openwritr.exe` by
+//! This binary shares the production `cleanup` core with `houwritr.exe` by
 //! including the same module tree (`src/cleanup/`) directly — there is no
 //! library target, so `#[path]` includes are the standard way multiple
 //! binaries in this package share source without duplicating logic. See
@@ -25,7 +25,7 @@ mod cleanup;
 // `credentials`, `paths`, and `single_instance` are mounted whole (see the
 // module-level doc comment above) so live mode can reuse
 // `credentials::read_openai_api_key()` and `paths::settings_path()` without
-// duplicating them; most of their other items exist only for `openwritr`'s
+// duplicating them; most of their other items exist only for `houwritr`'s
 // own use and are legitimately unused here, mirroring `cleanup::mod`'s own
 // crate-wide `#![allow(dead_code, unused_imports)]` for the same reason.
 #[path = "../../credentials.rs"]

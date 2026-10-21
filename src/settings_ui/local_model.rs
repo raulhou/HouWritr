@@ -1,8 +1,9 @@
 //! "Local model" choice for AI cleanup: a model that runs on this PC.
 //!
 //! Two sources:
-//! * **Built-in** – OpenWritr manages Qualcomm's GenieX tool and an NPU model
-//!   (see [`crate::local_llm`]): install the tool, download the model, done.
+//! * **Built-in** – HouWritr manages Qualcomm's GenieX tool and a model on
+//!   the NPU or the CPU (see [`crate::local_llm`]): install the tool, pick
+//!   and download a model, done.
 //! * **Another local server** – any OpenAI-compatible server on this PC
 //!   (GenieX's own, LM Studio, Ollama, Foundry Local), with model discovery,
 //!   a connection test and a setup guide.
@@ -199,7 +200,7 @@ impl SettingsApp {
             ui.radio_value(
                 &mut self.local_model.source,
                 LocalSource::BuiltIn,
-                "Built-in model (NPU)",
+                "Built-in model",
             );
             ui.radio_value(
                 &mut self.local_model.source,
@@ -212,7 +213,9 @@ impl SettingsApp {
                 match self.local_model.source {
                     LocalSource::BuiltIn => {
                         enhance.base_url = MANAGED_BASE_URL.into();
-                        enhance.model = DEFAULT_MODEL.into();
+                        if local_llm::built_in(&enhance.model).is_none() {
+                            enhance.model = DEFAULT_MODEL.into();
+                        }
                     }
                     LocalSource::Server => {
                         if local_llm::is_managed_url(&enhance.base_url) {
@@ -267,7 +270,7 @@ impl SettingsApp {
         if self.local_model.status.is_some() && cli.is_none() {
             status_label(
                 ui,
-                "Qualcomm's GenieX runs the model on the NPU. Installing downloads the official v0.8.0 \
+                "Qualcomm's GenieX runs the model on the NPU or the CPU. Installing downloads the official v0.8.0 \
                  installer (about 62 MB) from GitHub, checks its SHA-256, and installs it for your Windows \
                  user only (no administrator rights; adds `geniex` to your PATH).",
                 secondary_text(),
@@ -283,14 +286,49 @@ impl SettingsApp {
         // The model.
         if cli.is_some() {
             ui.add_space(4.0);
+            let selected = match local_llm::built_in(&self.settings.enhance.model) {
+                Some(model) => *model,
+                None => {
+                    // Settings from before the choice existed, or edited by hand.
+                    self.settings.enhance.model = DEFAULT_MODEL.into();
+                    self.dirty = true;
+                    local_llm::BUILT_IN_MODELS[0]
+                }
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Model");
+                egui::ComboBox::from_id_salt("built_in_model")
+                    .selected_text(selected.label)
+                    .show_ui(ui, |ui| {
+                        for model in local_llm::BUILT_IN_MODELS {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::SelectableLabel::new(
+                                        model.id == selected.id,
+                                        model.label,
+                                    ),
+                                )
+                                .clicked()
+                                && model.id != selected.id
+                            {
+                                self.settings.enhance.model = model.id.into();
+                                self.local_model.status = None;
+                                self.local_model.outcome = None;
+                                self.dirty = true;
+                            }
+                        }
+                    });
+            });
+            status_label(ui, selected.detail, secondary_text());
             let installed = self
                 .local_model
                 .status
                 .as_ref()
                 .and_then(|status| status.model_installed);
             ui.horizontal_wrapped(|ui| {
-                ui.label("Model");
-                ui.monospace(DEFAULT_MODEL);
+                ui.label("Download");
+                ui.monospace(selected.name);
                 match installed {
                     Some(true) => status_label(ui, "Downloaded", status_green()),
                     Some(false) => status_label(ui, "Not downloaded", warning_color()),
@@ -309,7 +347,7 @@ impl SettingsApp {
                 if installed != Some(true)
                     && ui
                         .add_enabled(!busy, egui::Button::new("Download model"))
-                        .on_hover_text("Several GB from Qualcomm AI Hub. Cancelling keeps what was downloaded.")
+                        .on_hover_text("Several GB. Cancelling keeps what was downloaded.")
                         .clicked()
                 {
                     self.start_local_job(JobKind::Pull);
@@ -317,7 +355,9 @@ impl SettingsApp {
                 if installed == Some(true) {
                     if ui
                         .add_enabled(!busy, egui::Button::new("Test model"))
-                        .on_hover_text("Loads the model onto the NPU and asks it one question.")
+                        .on_hover_text(
+                            "Loads the model and asks it one question; shows how fast it writes.",
+                        )
                         .clicked()
                     {
                         self.start_local_job(JobKind::Test);
@@ -366,8 +406,8 @@ impl SettingsApp {
         ui.add_space(4.0);
         status_label(
             ui,
-            "A 4B-parameter model is smaller than hosted models: cleanup of long recordings takes longer, \
-             and changes it makes that fail HouWritr's safety checks fall back to the original text.",
+            "Built-in models are smaller than hosted ones: cleanup of long recordings takes longer, \
+             and a cleaned section that changes a number or a speaker label is discarded: the original text stays.",
             secondary_text(),
         );
     }
@@ -468,18 +508,25 @@ impl SettingsApp {
         let mut cancel = false;
         if let Some(job) = &self.local_model.job {
             ui.add_space(4.0);
+            // One bar that says it all (percentage, size, speed, time left);
+            // a spinner and the text while the amount is unknown.
             match job.fraction {
                 Some(fraction) => {
-                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                    let text = if job.text.is_empty() {
+                        format!("{:.0}%", fraction * 100.0)
+                    } else {
+                        job.text.clone()
+                    };
+                    ui.add(egui::ProgressBar::new(fraction).text(text));
                 }
                 None => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.spinner();
+                        if !job.text.is_empty() {
+                            status_label(ui, &job.text, secondary_text());
+                        }
                     });
                 }
-            }
-            if !job.text.is_empty() {
-                status_label(ui, &job.text, secondary_text());
             }
             if matches!(job.kind, JobKind::Install | JobKind::Pull)
                 && ui.small_button("Cancel").clicked()
@@ -615,7 +662,8 @@ fn run_local_job(
         JobKind::Check => {
             let cli = local_llm::locate_cli();
             let (model_installed, error) = match &cli {
-                Some(path) => match local_llm::model_installed(path, DEFAULT_MODEL) {
+                Some(path) => match local_llm::model_installed(path, local_llm::geniex_name(model))
+                {
                     Ok(installed) => (Some(installed), None),
                     Err(error) => (None, Some(format!("Could not list models: {error:#}"))),
                 },
@@ -645,7 +693,7 @@ fn run_local_job(
             let cli = local_llm::locate_cli().ok_or("The GenieX tool is not installed.")?;
             local_llm::pull_model(
                 &cli,
-                DEFAULT_MODEL,
+                model,
                 &mut |fraction, line| {
                     let _ = sender.send(JobEvent::Progress(fraction, line.to_string()));
                 },
@@ -657,7 +705,7 @@ fn run_local_job(
         JobKind::Remove => {
             let cli = local_llm::locate_cli().ok_or("The GenieX tool is not installed.")?;
             local_llm::shutdown();
-            local_llm::remove_model(&cli, DEFAULT_MODEL).map_err(fail)?;
+            local_llm::remove_model(&cli, local_llm::geniex_name(model)).map_err(fail)?;
             Ok("Model removed.".into())
         }
         JobKind::Uninstall => {
@@ -666,11 +714,15 @@ fn run_local_job(
             Ok("GenieX and its model were removed.".into())
         }
         JobKind::Test => {
-            let result = local_llm::test_chat(base_url, model).map_err(fail)?;
-            Ok(result.summary())
+            let result = local_llm::test_chat(base_url, model);
+            // A server HouWritr started for the test stops right away.
+            local_llm::release("the test is finished");
+            Ok(result.map_err(fail)?.summary())
         }
         JobKind::Discover => {
-            let models = local_llm::discover_models(base_url).map_err(fail)?;
+            let models = local_llm::discover_models(base_url);
+            local_llm::release("the models were listed");
+            let models = models.map_err(fail)?;
             let message = if models.is_empty() {
                 "The server answered but lists no models.".to_string()
             } else {

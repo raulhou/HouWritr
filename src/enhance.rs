@@ -7,7 +7,7 @@
 
 use crate::cleanup::{
     adapter, pipeline, EndpointScope, EnhanceOutcome, EnhanceProvider, FallbackReason,
-    PromptTarget, SkipReason, Transcript,
+    PromptTarget, SkipReason, Transcript, ViolationKind,
 };
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
@@ -15,12 +15,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Set when OpenWritr quits without finishing its work: requests still
+/// Set when HouWritr quits without finishing its work: requests still
 /// waiting for an answer are abandoned at once instead of holding up the exit
 /// for as long as their timeout.
 static CANCEL_REQUESTS: AtomicBool = AtomicBool::new(false);
 
-/// Abandon every cleanup or notes request in flight (OpenWritr is quitting).
+/// Abandon every cleanup or notes request in flight (HouWritr is quitting).
 pub fn cancel_requests() {
     CANCEL_REQUESTS.store(true, Ordering::Release);
 }
@@ -75,8 +75,79 @@ fn send_cancellable(
         }
         let response = result?;
         let status = response.status();
+        if matches!(status.as_u16(), 429 | 503) {
+            let advised = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            RETRY_AFTER_SECONDS.store(advised, Ordering::Release);
+        }
         Ok((status, response.text()?))
     })
+}
+
+/// What the last "busy" answer said to wait (`Retry-After`, in seconds), 0
+/// when it said nothing.
+static RETRY_AFTER_SECONDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Until when a hosted provider that said "too many requests" is left alone.
+/// Every slice worker (and every later retry of the transcript) looks at it
+/// before asking, so a rate limit is waited out once, not tested by each
+/// request in turn.
+static COOLDOWN_UNTIL: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+fn cool_down(pause: Duration) {
+    let until = Instant::now() + pause;
+    let mut shared = COOLDOWN_UNTIL.lock();
+    if shared.map_or(true, |current| current < until) {
+        *shared = Some(until);
+    }
+}
+
+fn cooldown_left() -> Duration {
+    COOLDOWN_UNTIL.lock().map_or(Duration::ZERO, |until| {
+        until.saturating_duration_since(Instant::now())
+    })
+}
+
+/// A request that would have to wait longer than this for the cooldown is not
+/// sent now: the slice keeps its text and is retried in the background.
+const MAX_WAIT_FOR_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// How long to leave the provider alone after it kept saying "too many
+/// requests" through every pause.
+const COOLDOWN_AFTER_GIVING_UP: Duration = Duration::from_secs(300);
+
+/// The pause after the `attempt`th "busy" answer: the provider's own
+/// `Retry-After` when it is longer than ours (at most 5 minutes).
+fn busy_pause(attempt: usize, advised_seconds: u64) -> Duration {
+    let ours = BUSY_PAUSES[attempt.min(BUSY_PAUSES.len() - 1)];
+    ours.max(Duration::from_secs(advised_seconds.min(300)))
+}
+
+/// Pauses before asking again after "busy" (429) or "unavailable" (503). A
+/// rate limit lasts for the better part of a minute or more (GitHub Copilot
+/// said "exceeded your rate limit for utility models" for over 15 minutes
+/// after a burst of requests), so short pauses only add requests to it.
+const BUSY_PAUSES: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
+/// Wait `pause`, ending early when [`cancel_requests`] is called. `false`
+/// when it was cancelled.
+fn pause_unless_cancelled(pause: Duration) -> bool {
+    let until = Instant::now() + pause;
+    while Instant::now() < until {
+        if CANCEL_REQUESTS.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
 }
 
 /// Models GitHub Copilot lists for this account: the chat models it offers
@@ -375,18 +446,40 @@ fn copilot_fallbacks(
     token: &str,
     source: TokenSource,
 ) -> Vec<(String, &'static str)> {
-    let mut pairs = Vec::new();
-    for integration in copilot_integrations(source) {
-        let Some(available) = copilot_models(wanted, token, integration) else {
-            continue;
-        };
-        pairs.extend(
-            rank_copilot_models(wanted, &available)
-                .into_iter()
-                .map(|model| (model, integration))
-                .filter(|pair| pair.0 != tried.0 || pair.1 != tried.1)
-                .take(COPILOT_TRIES_PER_IDENTITY),
-        );
+    let offers: Vec<(&'static str, Vec<String>)> = copilot_integrations(source)
+        .into_iter()
+        .filter_map(|integration| {
+            copilot_models(wanted, token, integration).map(|available| (integration, available))
+        })
+        .collect();
+    order_fallbacks(wanted, tried, &offers)
+}
+
+/// What to try after `tried` was refused, given the models each identity
+/// offers: the configured model under the other identity first (a model that
+/// one identity refuses is often allowed under the other, and the user chose
+/// it), then the closest models of each identity.
+fn order_fallbacks(
+    wanted: &str,
+    tried: &(String, &'static str),
+    offers: &[(&'static str, Vec<String>)],
+) -> Vec<(String, &'static str)> {
+    let mut pairs: Vec<(String, &'static str)> = Vec::new();
+    let is_tried = |pair: &(String, &'static str)| pair.0 == tried.0 && pair.1 == tried.1;
+    for (integration, available) in offers {
+        let pair = (wanted.to_string(), *integration);
+        if available.iter().any(|id| id == wanted) && !is_tried(&pair) {
+            pairs.push(pair);
+        }
+    }
+    for (integration, available) in offers {
+        let ranked: Vec<(String, &'static str)> = rank_copilot_models(wanted, available)
+            .into_iter()
+            .map(|model| (model, *integration))
+            .filter(|pair| !is_tried(pair) && !pairs.contains(pair))
+            .take(COPILOT_TRIES_PER_IDENTITY)
+            .collect();
+        pairs.extend(ranked);
     }
     pairs
 }
@@ -645,12 +738,13 @@ fn key_may_travel_to(endpoint: &EndpointScope) -> bool {
     endpoint.scheme() == "https" || endpoint.is_loopback()
 }
 
-/// Whether the target is the server OpenWritr starts itself (GenieX on the NPU).
+/// Whether the target is the server HouWritr starts itself (GenieX on the NPU).
 fn is_managed_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(crate::local_llm::is_managed)
 }
 
-/// Whether the configured cleanup provider is the built-in model on the NPU.
+/// Whether the configured cleanup provider is one of the built-in models
+/// (GenieX, started by HouWritr, on the NPU or the CPU).
 pub fn uses_managed_model(settings: &Settings) -> bool {
     settings
         .prompt_target()
@@ -691,7 +785,11 @@ pub fn cleanup_engine_label(settings: &Settings) -> String {
     match settings.prompt_target() {
         Ok(target) => match target.endpoint() {
             Some(endpoint) if crate::local_llm::is_managed(endpoint) => {
-                format!("{name} · this PC (NPU)")
+                let name = name.split(':').next().unwrap_or(name);
+                format!(
+                    "{name} · this PC ({})",
+                    crate::local_llm::runtime(model).place()
+                )
             }
             Some(endpoint) if endpoint.is_loopback() => format!("{name} · this PC"),
             Some(endpoint) => format!("{name} · {}", endpoint.host()),
@@ -713,12 +811,6 @@ fn local_max_tokens(text: &str) -> usize {
 /// Small local models have short context windows and generate slowly, so
 /// they get smaller slices than a hosted model.
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
-/// The built-in model gets smaller slices still, so a request (about 160
-/// tokens of instructions, the slice, and a reply as long as the slice)
-/// stays inside GenieX's smallest 512-token context. A request that outgrew
-/// it switched the model to its 1,024-token variant, and from that token on
-/// the NPU wrote about 20 times slower until the server was restarted.
-const MANAGED_CLEANUP_CHARS: usize = 600;
 const LOCAL_NOTES_PART_CHARS: usize = 8_000;
 
 /// Chinese, Japanese and Korean text costs about one token per character,
@@ -747,10 +839,386 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// How many times a rejected slice is cut in two and tried again, piece by
+/// piece: 400 characters, then 200, then 100.
+const MAX_SPLITS: usize = 2;
+/// Pieces are not cut below this many characters.
+const MIN_PIECE_CHARS: usize = 40;
+
+/// Whether a rejection says "the model's version was not acceptable", where
+/// a smaller piece may pass, rather than "the provider could not be used".
+fn is_splittable(reason: &FallbackReason) -> bool {
+    matches!(
+        reason,
+        FallbackReason::IntegrityRejected(_) | FallbackReason::EmptyCandidate
+    )
+}
+
+/// The instruction that names the numbers of `slice`, for a second try after
+/// the model changed one. `None` when the slice holds no digits.
+fn number_hint(slice: &str) -> Option<String> {
+    let numbers = crate::cleanup::integrity::numbers_in(slice);
+    if numbers.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = numbers.into_iter().take(12).collect();
+    Some(format!(
+        "The transcript contains these numbers written in digits: {}. Keep each one exactly as written: do not drop it, do not change it, do not complete a short year (23 stays 23), and do not merge or split numbers.",
+        listed.join(", ")
+    ))
+}
+
+/// Two optional instructions as one.
+fn combined_instruction(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Cut `slice` in two at the block or sentence end nearest its middle:
+/// `(left, gap, right)`, where the gap is the whitespace between them. When
+/// the slice has no sentence end that leaves both pieces long enough (some
+/// speech runs on for a whole slice), it is cut at a comma instead. `None`
+/// when no cut leaves both pieces at least [`MIN_PIECE_CHARS`] long.
+fn split_in_two(slice: &str) -> Option<(&str, &str, &str)> {
+    split_at_breaks(slice, false).or_else(|| split_at_breaks(slice, true))
+}
+
+/// [`split_in_two`] cutting at sentence ends, or with `commas` at commas.
+fn split_at_breaks(slice: &str, commas: bool) -> Option<(&str, &str, &str)> {
+    let total = slice.chars().count();
+    if total < MIN_PIECE_CHARS * 2 {
+        return None;
+    }
+    let middle = total / 2;
+    let characters: Vec<(usize, char)> = slice.char_indices().collect();
+    // (distance from the middle, end of the left piece, start of the right).
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (position, &(byte, c)) in characters.iter().enumerate() {
+        let block_boundary = c == '\n' && slice[byte..].starts_with("\n\n");
+        let (left_end, left_chars) = if block_boundary {
+            (byte, position)
+        } else if matches!(c, '。' | '！' | '？' | '；') {
+            (byte + c.len_utf8(), position + 1)
+        } else if matches!(c, '.' | '!' | '?' | ';')
+            && characters
+                .get(position + 1)
+                .map_or(true, |&(_, next)| next.is_whitespace())
+        {
+            (byte + c.len_utf8(), position + 1)
+        } else if commas && matches!(c, '，' | '、' | '：') {
+            (byte + c.len_utf8(), position + 1)
+        } else if commas
+            && matches!(c, ',' | ':')
+            && characters
+                .get(position + 1)
+                .map_or(true, |&(_, next)| next.is_whitespace())
+        {
+            (byte + c.len_utf8(), position + 1)
+        } else {
+            continue;
+        };
+        let rest = &slice[left_end..];
+        let right_start = left_end + (rest.len() - rest.trim_start().len());
+        let right_chars = slice[right_start..].chars().count();
+        // A block boundary is structure, not style: it may leave a short
+        // piece (an interjection); other cuts may not.
+        let smallest = if block_boundary { 1 } else { MIN_PIECE_CHARS };
+        if left_chars < smallest || right_chars < smallest {
+            continue;
+        }
+        let distance = left_chars.abs_diff(middle);
+        if best.map_or(true, |(nearest, _, _)| distance < nearest) {
+            best = Some((distance, left_end, right_start));
+        }
+    }
+    best.map(|(_, left_end, right_start)| {
+        (
+            &slice[..left_end],
+            &slice[left_end..right_start],
+            &slice[right_start..],
+        )
+    })
+}
+
+/// Clean `slice` with `clean`; when the model's version is rejected for
+/// changing content, cut the slice in two, clean each half on its own (cutting
+/// again if a half is rejected too, down to [`MAX_SPLITS`]) and put the
+/// pieces back together with the gaps they had. A change is then lost only
+/// for the smallest piece that keeps failing, not the whole slice, and the
+/// model gets different text to work on each time. A failure of the provider
+/// itself (unreachable, refused) is not retried this way.
+fn clean_splitting(
+    slice: &str,
+    depth: usize,
+    clean: &mut dyn FnMut(&str, Option<&str>) -> Option<EnhanceOutcome>,
+) -> Option<EnhanceOutcome> {
+    let outcome = clean(slice, None)?;
+    let EnhanceOutcome::RawFallback { reason, .. } = &outcome else {
+        return Some(outcome);
+    };
+    // The model changed a number (dropped it, or completed a short year): ask
+    // once more, naming the numbers it has to keep. That is one request, and
+    // it often works where cutting the slice in two does not (the same input
+    // gives the same answer, and some slices cannot be cut).
+    if matches!(reason, FallbackReason::IntegrityRejected(kinds)
+        if kinds.contains(&ViolationKind::FactualDigitChanged))
+    {
+        if let Some(hint) = number_hint(slice) {
+            info!(
+                chars = slice.chars().count(),
+                depth, "cleanup slice changed a number; asking again with the numbers named"
+            );
+            let again = clean(slice, Some(&hint))?;
+            match &again {
+                EnhanceOutcome::Enhanced { .. } => {
+                    info!("cleanup slice recovered with its numbers named");
+                    return Some(again);
+                }
+                EnhanceOutcome::RawFallback { reason, .. } if !is_splittable(reason) => {
+                    return Some(again);
+                }
+                _ => {}
+            }
+        }
+    }
+    if depth >= MAX_SPLITS || !is_splittable(reason) {
+        return Some(outcome);
+    }
+    let Some((left, gap, right)) = split_in_two(slice) else {
+        return Some(outcome);
+    };
+    info!(
+        ?reason,
+        chars = slice.chars().count(),
+        depth,
+        "cleanup slice rejected; trying its two halves"
+    );
+    let first = clean_splitting(left, depth + 1, clean)?;
+    let second = clean_splitting(right, depth + 1, clean)?;
+    // A half the provider could not be used for fails the whole slice the
+    // same way, so it is retried or reported as before.
+    for half in [&first, &second] {
+        if let EnhanceOutcome::RawFallback { reason, .. } = half {
+            if !is_splittable(reason) {
+                return Some(EnhanceOutcome::raw_fallback(slice, reason.clone()));
+            }
+        }
+    }
+    let whole = |half: &EnhanceOutcome| {
+        matches!(half, EnhanceOutcome::Enhanced { warnings, .. }
+            if !warnings.contains(&ViolationKind::PartlyCleaned))
+    };
+    let cleaned = |half: &EnhanceOutcome| matches!(half, EnhanceOutcome::Enhanced { .. });
+    if !cleaned(&first) && !cleaned(&second) {
+        return Some(outcome);
+    }
+    let mut warnings: Vec<ViolationKind> = Vec::new();
+    for half in [&first, &second] {
+        if let EnhanceOutcome::Enhanced { warnings: more, .. } = half {
+            for kind in more {
+                if *kind != ViolationKind::PartlyCleaned && !warnings.contains(kind) {
+                    warnings.push(*kind);
+                }
+            }
+        }
+    }
+    if !(whole(&first) && whole(&second)) {
+        warnings.push(ViolationKind::PartlyCleaned);
+    }
+    let text = format!("{}{gap}{}", first.text(), second.text());
+    info!(
+        whole = whole(&first) && whole(&second),
+        "cleanup slice recovered by cutting it in two"
+    );
+    Some(EnhanceOutcome::enhanced(text, warnings))
+}
+
+/// The `Speaker N: ` at the start of a block, if it has one.
+fn speaker_prefix(block: &str) -> Option<&str> {
+    let rest = block.strip_prefix("Speaker ")?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || digits > 3 {
+        return None;
+    }
+    let after = &rest[digits..];
+    let colon = after.chars().next().filter(|c| matches!(c, ':' | '：'))?;
+    let mut end = "Speaker ".len() + digits + colon.len_utf8();
+    if block[end..].starts_with(' ') {
+        end += 1;
+    }
+    Some(&block[..end])
+}
+
+/// Clean one slice of a speaker-labelled transcript with its `Speaker N:`
+/// labels held out of what the model sees, as the `[m:ss]` times are: left in
+/// the text, local models dropped them (seen on 7 to 9 of 48 slices of a
+/// four speaker recording, the same ones every time), and the slice was
+/// rejected for it. The labels go back in front of the blocks of the answer;
+/// if the model changed the number of blocks they cannot be matched, and the
+/// slice keeps its text.
+fn clean_slice_keeping_labels(
+    slice: &str,
+    settings: &Settings,
+    extra_instruction: Option<&str>,
+    before_validate: impl FnOnce() -> bool,
+) -> Option<EnhanceOutcome> {
+    let blocks: Vec<&str> = slice.split("\n\n").collect();
+    let prefixes: Vec<&str> = blocks
+        .iter()
+        .map(|block| speaker_prefix(block).unwrap_or(""))
+        .collect();
+    let labelled = prefixes.iter().any(|prefix| !prefix.is_empty());
+    if !labelled && blocks.len() > 1 {
+        return enhance_outcome_with(slice, settings, extra_instruction, before_validate);
+    }
+    let bare_blocks: Vec<&str> = blocks
+        .iter()
+        .zip(&prefixes)
+        .map(|(block, prefix)| &block[prefix.len()..])
+        .collect();
+    // Several speakers in one slice: each block gets a tag the model has to
+    // keep, so the blocks are matched by their tags and not by counting blank
+    // lines. Models merge the short turns of a fast conversation ("嗯。")
+    // and the slice was rejected for it: 35 of 123 slices in a two speaker
+    // podcast, each costing a wasted request.
+    let tagged = (2..=BLOCK_TAGS).contains(&blocks.len());
+    let (bare, instruction) = if tagged {
+        let instruction = match extra_instruction {
+            Some(extra) => format!("{extra}\n\n{TAG_INSTRUCTION}"),
+            None => TAG_INSTRUCTION.to_string(),
+        };
+        (tag_blocks(&bare_blocks), Some(instruction))
+    } else {
+        (
+            bare_blocks.join("\n\n"),
+            extra_instruction.map(str::to_string),
+        )
+    };
+    let outcome = enhance_outcome_with(&bare, settings, instruction.as_deref(), before_validate)?;
+    Some(match outcome {
+        EnhanceOutcome::Enhanced { text, warnings } => {
+            let by_tag = if tagged {
+                split_tagged(&text, blocks.len())
+            } else {
+                None
+            };
+            let cleaned: Vec<String> = if let Some(by_tag) = by_tag {
+                by_tag
+            } else if text.split("\n\n").count() == blocks.len() && !has_block_tags(&text) {
+                text.split("\n\n").map(str::to_string).collect()
+            } else if blocks.len() == 1 {
+                // One block going in: the paragraph breaks the model added
+                // (seen on long runs where Whisper wrote no punctuation) are
+                // joined up again, so the block count stays what it was.
+                vec![collapse_paragraphs(&text)]
+            } else {
+                return Some(EnhanceOutcome::raw_fallback(
+                    slice,
+                    FallbackReason::IntegrityRejected(vec![ViolationKind::SpeakerLabelsChanged]),
+                ));
+            };
+            let joined = cleaned
+                .iter()
+                .zip(&prefixes)
+                .map(|(block, prefix)| format!("{prefix}{}", block.trim_start()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            EnhanceOutcome::enhanced(joined, warnings)
+        }
+        // Nothing was changed: the slice goes on as it was.
+        EnhanceOutcome::Skipped { reason, .. } => EnhanceOutcome::skipped(slice, reason),
+        EnhanceOutcome::RawFallback { reason, .. } => EnhanceOutcome::raw_fallback(slice, reason),
+    })
+}
+
+/// Tags for the blocks of a slice with several speakers: `[A]`, `[B]`, ...
+/// They hold no digit (the number check would see one) and a slice has to fit
+/// in the alphabet.
+const BLOCK_TAGS: usize = 26;
+
+const TAG_INSTRUCTION: &str = "Each paragraph starts with a tag such as [A]. Keep every tag exactly as written, in the same order, at the start of its own paragraph. Never merge, split, move, drop or add paragraphs.";
+
+fn block_tag(index: usize) -> String {
+    format!("[{}]", char::from(b'A' + index as u8))
+}
+
+/// `[A] first block`, a blank line, `[B] second block`, and so on.
+fn tag_blocks(blocks: &[&str]) -> String {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| format!("{} {}", block_tag(index), block.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Whether `text` still holds one of the block tags.
+fn has_block_tags(text: &str) -> bool {
+    (0..BLOCK_TAGS).any(|index| text.contains(&block_tag(index)))
+}
+
+/// The text of each of `count` blocks in a model's answer, found by their
+/// tags whatever the model did with the blank lines between them. `None` when
+/// a tag is missing, out of order or repeated, when a block came back empty,
+/// or when there is text before the first tag.
+fn split_tagged(text: &str, count: usize) -> Option<Vec<String>> {
+    let mut starts = Vec::with_capacity(count);
+    let mut position = 0;
+    for index in 0..count {
+        let tag = block_tag(index);
+        let at = position + text[position..].find(&tag)?;
+        starts.push((at, at + tag.len()));
+        position = at + tag.len();
+    }
+    if !text[..starts[0].0].trim().is_empty() {
+        return None;
+    }
+    let mut blocks = Vec::with_capacity(count);
+    for (index, &(_, body)) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).map_or(text.len(), |next| next.0);
+        let block = text[body..end].trim();
+        if block.is_empty() || has_block_tags(block) {
+            return None;
+        }
+        blocks.push(block.to_string());
+    }
+    Some(blocks)
+}
+
+/// Join the paragraphs of `text` into one block: nothing between two wide
+/// (Chinese, Japanese, Korean) characters, one space otherwise.
+fn collapse_paragraphs(text: &str) -> String {
+    let wide = |c: char| c as u32 >= 0x2E80;
+    let mut joined = String::new();
+    for part in text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let (Some(last), Some(first)) = (joined.chars().last(), part.chars().next()) {
+            if !wide(last) && !wide(first) {
+                joined.push(' ');
+            }
+        }
+        joined.push_str(part);
+    }
+    joined
+}
+
+/// How many requests cleaning up `text` takes, for progress across several
+/// texts.
+pub fn cleanup_slice_count(text: &str, settings: &Settings) -> usize {
+    split_for_cleanup(text, cleanup_slice_chars(settings, text)).len()
+}
+
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
-    if uses_managed_model(settings) {
-        scaled_for_script(MANAGED_CLEANUP_CHARS, text)
-    } else if uses_local_model(settings) {
+    // The built-in models run with a 4,096-token context like any local
+    // server.
+    if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
         LONG_FORM_CLEANUP_CHARS
@@ -806,9 +1274,10 @@ fn request_content(
         },
     };
 
-    // OpenWritr's own local model server is started on demand.
+    // HouWritr's own local model server is started on demand.
     if let Some(endpoint) = prepared.target.endpoint() {
-        if let Err(error) = crate::local_llm::ensure_running(endpoint) {
+        let model = prepared.body.get("model").and_then(|model| model.as_str());
+        if let Err(error) = crate::local_llm::ensure_running(endpoint, model) {
             warn!(error = %error, "local model server is not available");
             return Err(FallbackReason::RequestFailed);
         }
@@ -888,6 +1357,22 @@ fn request_content(
     };
 
     let managed = is_managed_target(&prepared.target);
+    if managed {
+        crate::local_llm::add_request_options(&mut body, &configured);
+    }
+    if !local && !managed {
+        let left = cooldown_left();
+        if left > MAX_WAIT_FOR_COOLDOWN {
+            warn!(
+                ?left,
+                "the cleanup provider is rate limiting; not asking now"
+            );
+            return Err(FallbackReason::RequestFailed);
+        }
+        if !pause_unless_cancelled(left) {
+            return Err(FallbackReason::RequestFailed);
+        }
+    }
     let sent = Instant::now();
     let mut result = match send_cancellable(build(&body, &route), !local) {
         Ok(result) => result,
@@ -899,6 +1384,30 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
+    // GenieX can crash between requests (seen on the CPU runtime): the next
+    // request then fails at once. Start it again and send this slice once
+    // more, instead of losing it and, after three, the rest of the job.
+    if managed
+        && result.as_ref().is_err_and(|error| !error.is_timeout())
+        && crate::local_llm::server_exited()
+    {
+        if let Some(endpoint) = prepared.target.endpoint() {
+            match crate::local_llm::ensure_running(endpoint, Some(&configured)) {
+                Ok(()) => {
+                    info!("sending the cleanup request again to the restarted local model");
+                    result = match send_cancellable(build(&body, &route), false) {
+                        Ok(result) => result,
+                        Err(why) => {
+                            info!(waited = ?sent.elapsed(), "cleanup request {why}");
+                            crate::local_llm::release("the cleanup request was abandoned");
+                            return Err(FallbackReason::RequestFailed);
+                        }
+                    };
+                }
+                Err(error) => warn!(error = %error, "the local model could not be started again"),
+            }
+        }
+    }
     // Copilot offers each account only some models, and which depends on the
     // app identity the request names. When the model is refused, ask what is
     // offered under each identity and try the closest few.
@@ -945,6 +1454,34 @@ fn request_content(
             }
         }
     }
+    // A hosted provider that is busy (429) or briefly down (503) is asked
+    // again after a pause: with several slices in flight at once it will
+    // say so now and then, and a slice should not lose its cleanup for it.
+    if !local && !managed {
+        let is_busy = |result: &reqwest::Result<(reqwest::StatusCode, String)>| matches!(result, Ok((status, _)) if matches!(status.as_u16(), 429 | 503));
+        for attempt in 0..BUSY_PAUSES.len() {
+            if !is_busy(&result) {
+                break;
+            }
+            let pause = busy_pause(attempt, RETRY_AFTER_SECONDS.swap(0, Ordering::AcqRel));
+            warn!(?pause, "the cleanup provider is busy; asking again");
+            cool_down(pause);
+            // Others may have asked for a longer wait meanwhile.
+            if !pause_unless_cancelled(cooldown_left()) {
+                return Err(FallbackReason::RequestFailed);
+            }
+            result = match send_cancellable(build(&body, &route), true) {
+                Ok(result) => result,
+                Err(why) => {
+                    info!(waited = ?sent.elapsed(), "cleanup request {why}");
+                    return Err(FallbackReason::RequestFailed);
+                }
+            };
+        }
+        if is_busy(&result) {
+            cool_down(COOLDOWN_AFTER_GIVING_UP);
+        }
+    }
     let (status, body) = match result {
         Ok(answer) => answer,
         Err(error) if error.is_timeout() => {
@@ -957,6 +1494,7 @@ fn request_content(
                 // The server keeps writing the reply nobody waits for, and
                 // every later request would queue behind it.
                 crate::local_llm::release("the local model did not answer in time");
+                crate::local_llm::note_timeout();
             }
             return Err(FallbackReason::RequestFailed);
         }
@@ -1063,6 +1601,9 @@ pub struct CleanupReport {
     pub total: usize,
     /// Slices the provider cleaned.
     pub cleaned: usize,
+    /// Slices cleaned in part: some pieces passed the checks, the others kept
+    /// the recognised text.
+    pub partly: usize,
     /// Slices left as recognised because the provider could not be reached or
     /// did not answer in time (or the circuit breaker skipped them): worth
     /// trying again later.
@@ -1078,6 +1619,7 @@ impl CleanupReport {
     pub fn add(&mut self, other: CleanupReport) {
         self.total += other.total;
         self.cleaned += other.cleaned;
+        self.partly += other.partly;
         self.unreachable += other.unreachable;
     }
 }
@@ -1126,6 +1668,9 @@ pub fn enhance_long_form(
         "long-form cleanup started"
     );
     let managed = uses_managed_model(settings);
+    if managed {
+        crate::local_llm::forget_timeout();
+    }
     // Whisper sometimes drifts into Traditional characters in a Simplified
     // recording (or the other way round); each slice is told the script of
     // the whole transcript.
@@ -1142,22 +1687,95 @@ pub fn enhance_long_form(
         return clean_slices(
             slices,
             &joins,
-            |slice| enhance_outcome_with(slice, settings, instruction, || !interrupted()),
+            |slice| {
+                clean_splitting(slice, 0, &mut |piece, hint| {
+                    let instruction = combined_instruction(instruction, hint);
+                    clean_slice_keeping_labels(piece, settings, instruction.as_deref(), || {
+                        !interrupted()
+                    })
+                })
+            },
             &give_up,
             &interrupted,
             progress,
         );
     }
     // Workers cannot see `interrupted`; it is checked as results are taken.
-    let clean = |slice: &str| enhance_outcome_with(slice, settings, instruction, || true);
+    let clean = |slice: &str| {
+        clean_splitting(slice, 0, &mut |piece, hint| {
+            let instruction = combined_instruction(instruction, hint);
+            clean_slice_keeping_labels(piece, settings, instruction.as_deref(), || true)
+        })
+    };
     let all: Vec<&str> = slices.clone();
-    with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, &clean, |take| {
+    // Finding a working model takes the first request; waiting for a whole
+    // slice to come back first cost the time of one slice (45 to 75 seconds
+    // for Chinese) before the others started.
+    let warm_up = warm_up_hosted(settings, instruction);
+    if warm_up == WarmUp::Down {
+        warn!("the cleanup provider did not answer; the slices are left for a retry later");
+        return clean_slices(
+            slices,
+            &joins,
+            |slice| {
+                Some(EnhanceOutcome::raw_fallback(
+                    slice,
+                    FallbackReason::RequestFailed,
+                ))
+            },
+            &give_up,
+            &interrupted,
+            progress,
+        );
+    }
+    let ready = warm_up == WarmUp::Working;
+    with_parallel_cleaner(&all, HOSTED_PARALLEL_SLICES, ready, &clean, |take| {
         clean_slices(slices, &joins, take, &give_up, &interrupted, progress)
     })
 }
 
-/// Slices a hosted provider cleans at the same time.
-const HOSTED_PARALLEL_SLICES: usize = 3;
+/// What the first tiny request to a hosted provider showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarmUp {
+    /// It answered: the slices can start together.
+    Working,
+    /// It did not answer, twice: it is down or stalled.
+    Down,
+    /// Something else (a refusal, say): start one slice at a time as before.
+    Unclear,
+}
+
+/// One tiny request that finds the working model and checks the provider
+/// answers, so the slices can start together. When the provider does not
+/// answer it is asked once more; two silences in a row mean every slice would
+/// wait out its own timeout (about 150 seconds each, three of them in a row,
+/// seen when Copilot stalled for a quarter of an hour), so the job leaves
+/// the slices for the background retry at once.
+fn warm_up_hosted(settings: &Settings, instruction: Option<&str>) -> WarmUp {
+    for _ in 0..2 {
+        match enhance_outcome_with("OK", settings, instruction, || true) {
+            Some(
+                EnhanceOutcome::Enhanced { .. }
+                | EnhanceOutcome::Skipped { .. }
+                | EnhanceOutcome::RawFallback {
+                    reason: FallbackReason::IntegrityRejected(_),
+                    ..
+                },
+            ) => return WarmUp::Working,
+            Some(EnhanceOutcome::RawFallback { reason, .. }) if is_unreachable(&reason) => {}
+            _ => return WarmUp::Unclear,
+        }
+    }
+    WarmUp::Down
+}
+
+/// Slices a hosted provider cleans at the same time. One: GitHub Copilot
+/// refused every request for over 15 minutes ("exceeded your rate limit for
+/// utility models") after bursts of five at a time, and a failed cleanup costs
+/// more than the minutes a sequential one takes. Raising it again means
+/// sending more requests per minute (and the 3,000 character slices of
+/// Chinese about 2,000 tokens each).
+const HOSTED_PARALLEL_SLICES: usize = 1;
 
 /// Work shared between the slice workers and the thread putting the
 /// transcript back together.
@@ -1179,13 +1797,14 @@ struct ParallelSlices {
 fn with_parallel_cleaner<R>(
     slices: &[&str],
     workers: usize,
+    ready: bool,
     clean: &(dyn Fn(&str) -> Option<EnhanceOutcome> + Sync),
     consume: impl FnOnce(&mut dyn FnMut(&str) -> Option<EnhanceOutcome>) -> R,
 ) -> R {
     let state = parking_lot::Mutex::new(ParallelSlices {
         results: (0..slices.len()).map(|_| None).collect(),
         next: 0,
-        started: false,
+        started: ready,
         stop: false,
     });
     let changed = parking_lot::Condvar::new();
@@ -1435,6 +2054,7 @@ pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
     let joins = joins_between(text, &slices);
     LongFormCleanup {
         report: CleanupReport {
+            partly: 0,
             total: slices.len(),
             cleaned: 0,
             unreachable: slices.len(),
@@ -1486,8 +2106,12 @@ fn clean_slices(
             continue;
         }
         match clean(slice)? {
-            EnhanceOutcome::Enhanced { text, .. } => {
-                report.cleaned += 1;
+            EnhanceOutcome::Enhanced { text, warnings } => {
+                if warnings.contains(&ViolationKind::PartlyCleaned) {
+                    report.partly += 1;
+                } else {
+                    report.cleaned += 1;
+                }
                 in_a_row = 0;
                 joined.push_str(&text);
             }
@@ -1522,28 +2146,30 @@ fn clean_slices(
         }
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
-        if !tripped && index + 1 < total && give_up() {
+        if !tripped && give_up() {
             // Not retried in the background either: a model this slow was
             // just as slow on every retry, and each one held the NPU for
-            // minutes.
+            // minutes. That includes slices that already timed out.
             tripped = true;
             rejected = true;
+            report.unreachable = 0;
             warn!("cleanup is too slow on this PC; the remaining slices keep their text and are not retried");
         }
     }
 
-    let failed = report.total - report.cleaned;
-    if failed > 0 {
+    let failed = report.total - report.cleaned - report.partly;
+    if failed > 0 || report.partly > 0 {
         warn!(
             failed,
             total,
+            partly = report.partly,
             unreachable = report.unreachable,
             "some long-form cleanup slices kept raw text"
         );
     }
     let outcome = match first_failure {
         Some(reason) if report.cleaned == 0 => EnhanceOutcome::raw_fallback(joined, reason),
-        _ if report.cleaned > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
+        _ if report.cleaned + report.partly > 0 => EnhanceOutcome::enhanced(joined, Vec::new()),
         _ => EnhanceOutcome::skipped(joined, SkipReason::EmptyTranscript),
     };
     Some(LongFormCleanup { outcome, report })
@@ -1754,13 +2380,239 @@ mod long_form_tests {
     }
 
     #[test]
+    fn a_slice_is_cut_in_two_at_the_boundary_nearest_the_middle() {
+        let text = format!(
+            "{}。{}。{}。",
+            "甲".repeat(45),
+            "乙".repeat(45),
+            "丙".repeat(45)
+        );
+        let (left, gap, right) = split_in_two(&text).unwrap();
+        assert!(left.ends_with('。') && right.ends_with('。'));
+        assert_eq!(gap, "");
+        assert_eq!(format!("{left}{gap}{right}"), text);
+        // A block boundary near the middle is used, and the gap kept.
+        let blocks = format!(
+            "Speaker 1: {}.\n\nSpeaker 2: {}.",
+            "a".repeat(60),
+            "b".repeat(60)
+        );
+        let (left, gap, right) = split_in_two(&blocks).unwrap();
+        assert!(left.starts_with("Speaker 1:") && right.starts_with("Speaker 2:"));
+        assert_eq!(gap, "\n\n");
+        // Decimals are not sentence ends; too short or no boundary: no cut.
+        assert!(split_in_two(&"1.5 ".repeat(5)).is_none());
+        assert!(split_in_two(&"x".repeat(200)).is_none());
+        assert!(split_in_two("short。text。").is_none());
+        // Without a sentence end it is cut at a comma, never inside a number.
+        let run_on = format!("{}，{}", "说".repeat(60), "话".repeat(60));
+        let (left, _, right) = split_in_two(&run_on).unwrap();
+        assert!(left.ends_with('，') && right.starts_with('话'));
+        assert!(split_in_two(&format!("{},{}", "1".repeat(60), "2".repeat(60))).is_none());
+    }
+
+    #[test]
+    fn paragraphs_a_model_made_of_one_block_are_joined_again() {
+        assert_eq!(collapse_paragraphs("你好。\n\n再见。"), "你好。再见。");
+        assert_eq!(collapse_paragraphs("Hello\n\nworld"), "Hello world");
+        assert_eq!(collapse_paragraphs("a\n\n\n\nb"), "a b");
+        assert_eq!(
+            collapse_paragraphs("中文\n\nand English"),
+            "中文and English"
+        );
+        assert_eq!(collapse_paragraphs("one block"), "one block");
+    }
+
+    #[test]
+    fn a_long_block_is_cut_from_the_short_interjections_after_it() {
+        let text = format!(
+            "Speaker 1: {}。\n\nSpeaker 2: 嗯。\n\nSpeaker 3: 对。",
+            "甲".repeat(90)
+        );
+        let (left, gap, right) = split_in_two(&text).unwrap();
+        assert!(left.starts_with("Speaker 1:") && left.ends_with('。'));
+        assert_eq!(gap, "\n\n");
+        assert!(right.starts_with("Speaker 2:"));
+        assert_eq!(format!("{left}{gap}{right}"), text);
+    }
+
+    fn rejected() -> EnhanceOutcome {
+        EnhanceOutcome::raw_fallback(
+            "raw",
+            FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]),
+        )
+    }
+
+    #[test]
+    fn a_rejected_slice_is_cut_in_two_and_put_back_together() {
+        let text = format!(
+            "{}。BAD{}。{}。",
+            "甲".repeat(40),
+            "乙".repeat(40),
+            "丙".repeat(40)
+        );
+        let mut calls = 0;
+        // The model "cleans" by upper-casing, and always garbles text with BAD.
+        let mut clean = |piece: &str, _hint: Option<&str>| {
+            calls += 1;
+            Some(if piece.contains("BAD") {
+                EnhanceOutcome::raw_fallback(
+                    piece,
+                    FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]),
+                )
+            } else {
+                EnhanceOutcome::enhanced(format!("[{piece}]"), Vec::new())
+            })
+        };
+        let outcome = clean_splitting(&text, 0, &mut clean).unwrap();
+        let EnhanceOutcome::Enhanced {
+            text: joined,
+            warnings,
+        } = outcome
+        else {
+            panic!("the good piece should have been recovered");
+        };
+        // One piece kept as it was, the others cleaned; nothing lost or moved.
+        assert!(warnings.contains(&ViolationKind::PartlyCleaned));
+        assert!(joined.contains("BAD"));
+        assert_eq!(joined.replace(['[', ']'], ""), text);
+        assert!(calls > 1 && calls <= 1 + 2 + 4, "{calls}");
+
+        // Every piece fails: the slice keeps its text and the first reason.
+        let mut always = |piece: &str, _hint: Option<&str>| {
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                FallbackReason::IntegrityRejected(vec![ViolationKind::NegationChanged]),
+            ))
+        };
+        assert!(matches!(
+            clean_splitting(&text, 0, &mut always),
+            Some(EnhanceOutcome::RawFallback { .. })
+        ));
+        // A provider failure is not retried in halves.
+        let mut calls = 0;
+        let mut down = |piece: &str, _hint: Option<&str>| {
+            calls += 1;
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                FallbackReason::RequestFailed,
+            ))
+        };
+        clean_splitting(&text, 0, &mut down);
+        assert_eq!(calls, 1);
+        // Interrupted: stops at once.
+        assert!(clean_splitting(&text, 0, &mut |_, _| None).is_none());
+        let _ = rejected();
+    }
+
+    #[test]
+    fn a_changed_number_is_asked_again_with_the_numbers_named() {
+        let text = "Speaker 2: 在23年和24年，我们有578个人。";
+        let digits = FallbackReason::IntegrityRejected(vec![ViolationKind::FactualDigitChanged]);
+        // The first answer changes a number; the answer with the hint is good.
+        let mut hints: Vec<Option<String>> = Vec::new();
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            hints.push(hint.map(str::to_string));
+            Some(if hint.is_some() {
+                EnhanceOutcome::enhanced(piece.to_string(), Vec::new())
+            } else {
+                EnhanceOutcome::raw_fallback(piece, digits.clone())
+            })
+        };
+        let outcome = clean_splitting(text, 0, &mut clean).unwrap();
+        assert!(matches!(outcome, EnhanceOutcome::Enhanced { .. }));
+        assert_eq!(hints.len(), 2);
+        let hint = hints[1].as_deref().unwrap();
+        assert!(hint.contains("23, 24, 578"), "{hint}");
+        assert!(!hint.contains("Speaker 2"));
+        assert_eq!(
+            crate::cleanup::integrity::numbers_in("Speaker 12: 3 and 3 and 7.5"),
+            vec!["3".to_string(), "7.5".to_string()]
+        );
+
+        // Not a number: no hint, and the slice is cut in two as before.
+        let labels = FallbackReason::IntegrityRejected(vec![ViolationKind::SpeakerLabelsChanged]);
+        let mut hinted = false;
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            hinted |= hint.is_some();
+            Some(EnhanceOutcome::raw_fallback(piece, labels.clone()))
+        };
+        clean_splitting(text, 0, &mut clean);
+        assert!(!hinted);
+
+        // No digits in the slice: nothing to name.
+        assert!(number_hint("没有数字。").is_none());
+        // A provider failure on the second ask is passed on, not cut in two.
+        let mut calls = 0;
+        let mut clean = |piece: &str, hint: Option<&str>| {
+            calls += 1;
+            Some(EnhanceOutcome::raw_fallback(
+                piece,
+                if hint.is_some() {
+                    FallbackReason::RequestFailed
+                } else {
+                    digits.clone()
+                },
+            ))
+        };
+        let outcome = clean_splitting(text, 0, &mut clean).unwrap();
+        assert!(matches!(
+            outcome,
+            EnhanceOutcome::RawFallback {
+                reason: FallbackReason::RequestFailed,
+                ..
+            }
+        ));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn speaker_labels_are_found_and_kept_out_of_the_text_sent_to_a_model() {
+        assert_eq!(speaker_prefix("Speaker 3: 好的。"), Some("Speaker 3: "));
+        assert_eq!(speaker_prefix("Speaker 12：好的。"), Some("Speaker 12："));
+        assert_eq!(speaker_prefix("Speaker : no number"), None);
+        assert_eq!(speaker_prefix("Speaker 1234: too many digits"), None);
+        assert_eq!(speaker_prefix("Speakers 1: plural"), None);
+        assert_eq!(speaker_prefix("no label"), None);
+
+        // With cleanup off nothing is sent; the slice comes back as it was,
+        // labels included.
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Never;
+        let slice = "Speaker 1: 你好。\n\nSpeaker 2: 好的。";
+        let outcome = clean_slice_keeping_labels(slice, &settings, None, || true).unwrap();
+        assert_eq!(outcome.text(), slice);
+    }
+
+    #[test]
+    fn built_in_models_get_the_usual_local_slices_and_name_where_they_run() {
+        let mut npu = openai_settings("http://127.0.0.1:18651/v1");
+        npu.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@npu".into();
+        assert!(uses_managed_model(&npu));
+        assert_eq!(
+            cleanup_slice_chars(&npu, "plain english text"),
+            LOCAL_CLEANUP_CHARS
+        );
+        assert_eq!(
+            cleanup_engine_label(&npu),
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (NPU, llama.cpp)"
+        );
+        let mut hybrid = npu.clone();
+        hybrid.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid".into();
+        assert_eq!(
+            cleanup_engine_label(&hybrid),
+            "Qwen3-4B-Instruct-2507-GGUF · this PC (hybrid mode)"
+        );
+    }
+
+    #[test]
     fn local_profile_applies_only_to_loopback_endpoints() {
         let managed = openai_settings("http://127.0.0.1:18651/v1");
         assert!(uses_local_model(&managed));
         assert!(uses_managed_model(&managed));
         assert_eq!(
             cleanup_slice_chars(&managed, "plain english text"),
-            MANAGED_CLEANUP_CHARS
+            LOCAL_CLEANUP_CHARS
         );
 
         let local = openai_settings("http://127.0.0.1:11434/v1");
@@ -1796,7 +2648,7 @@ mod long_form_tests {
                 s.enhance.model = "ai-hub-models/Qwen3-4B-Instruct-2507".into();
                 s
             }),
-            "Qwen3-4B-Instruct-2507 · this PC (NPU)"
+            "Qwen3-4B-Instruct-2507 · this PC (hybrid mode)"
         );
         assert_eq!(
             cleanup_engine_label(&openai_settings("http://localhost:11434/v1")),
@@ -1873,17 +2725,16 @@ mod long_form_tests {
     }
 
     #[test]
-    fn built_in_model_slices_stay_inside_its_smallest_context() {
-        const { assert!(MANAGED_CLEANUP_CHARS < LOCAL_CLEANUP_CHARS) };
+    fn built_in_model_slices_cut_chinese_to_a_third() {
         let managed = openai_settings("http://127.0.0.1:18651/v1");
-        // The transcript from the failed run: Chinese, one slice of up to 400
-        // characters came to about 250 tokens; now at most 200 characters.
+        // One token per character: a Chinese slice is a third of the English
+        // size, 400 characters.
         let chinese = "这是一段很长的中文文字，用来测试切分。".repeat(100);
-        assert_eq!(cleanup_slice_chars(&managed, &chinese), 200);
+        assert_eq!(cleanup_slice_chars(&managed, &chinese), 400);
         assert!(
             split_for_cleanup(&chinese, cleanup_slice_chars(&managed, &chinese))
                 .iter()
-                .all(|slice| slice.chars().count() <= 200)
+                .all(|slice| slice.chars().count() <= 400)
         );
     }
 
@@ -2040,6 +2891,7 @@ mod long_form_tests {
         assert_eq!(
             result.report,
             CleanupReport {
+                partly: 0,
                 total: 3,
                 cleaned: 3,
                 unreachable: 0
@@ -2236,7 +3088,7 @@ mod long_form_tests {
             std::thread::sleep(Duration::from_millis(wait as u64 * 5));
             enhanced(&slice.to_uppercase())
         };
-        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+        let result = with_parallel_cleaner(&parts, 3, false, &clean, |take| {
             clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
         })
         .unwrap();
@@ -2249,6 +3101,27 @@ mod long_form_tests {
     }
 
     #[test]
+    fn a_ready_provider_has_every_worker_start_at_once() {
+        let parts = ["one", "two", "three", "four", "five", "six"];
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let most = std::sync::atomic::AtomicUsize::new(0);
+        let clean = |slice: &str| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            running.fetch_sub(1, Ordering::SeqCst);
+            enhanced(&slice.to_uppercase())
+        };
+        let result = with_parallel_cleaner(&parts, 3, true, &clean, |take| {
+            clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(result.report.cleaned, 6);
+        // Without the first slice finishing alone, three ran together.
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn parallel_cleanup_stops_after_a_rejection() {
         let parts = ["one", "two", "three", "four", "five", "six"];
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -2256,7 +3129,7 @@ mod long_form_tests {
             calls.fetch_add(1, Ordering::SeqCst);
             failed(FallbackReason::ProviderRejected(400))
         };
-        let result = with_parallel_cleaner(&parts, 3, &clean, |take| {
+        let result = with_parallel_cleaner(&parts, 3, false, &clean, |take| {
             clean_slices(parts.to_vec(), &[], take, &|| false, &|| false, |_, _| {})
         })
         .unwrap();
@@ -2279,6 +3152,31 @@ mod long_form_tests {
         assert_eq!(chinese_script("Hello there, nothing Chinese here."), None);
         let mostly = format!("{}{}", simplified.repeat(5), "這個");
         assert_eq!(chinese_script(&mostly), Some(ChineseScript::Simplified));
+    }
+
+    #[test]
+    fn a_local_model_that_timed_out_stops_without_retries() {
+        // The built-in model let the first slice time out: the slice keeps
+        // its text and nothing is retried later, that one included.
+        let timed_out = std::cell::Cell::new(false);
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(6),
+            &[],
+            |_| {
+                calls += 1;
+                timed_out.set(true);
+                failed(FallbackReason::RequestFailed)
+            },
+            &|| timed_out.get(),
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.report.cleaned, 0);
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
     }
 
     #[test]
@@ -2358,5 +3256,74 @@ mod long_form_tests {
             skipped.outcome.text().split_whitespace().count(),
             text.split_whitespace().count()
         );
+    }
+
+    #[test]
+    fn blocks_are_tagged_and_found_again_by_their_tags() {
+        let tagged = tag_blocks(&["你好。", " 嗯。 ", "是的。"]);
+        assert_eq!(tagged, "[A] 你好。\n\n[B] 嗯。\n\n[C] 是的。");
+        // Blank lines gone, tags kept: still three blocks.
+        assert_eq!(
+            split_tagged("[A] 你好。 [B] 嗯。\n[C]\n是的。\n", 3),
+            Some(vec!["你好。".into(), "嗯。".into(), "是的。".into()])
+        );
+        // A tag missing, out of order, repeated, or text before the first.
+        assert_eq!(split_tagged("[A] 你好。 嗯。 [C] 是的。", 3), None);
+        assert_eq!(split_tagged("[B] 嗯。 [A] 你好。 [C] 是的。", 3), None);
+        assert_eq!(
+            split_tagged("[A] 你好。 [B] 嗯。 [B] 嗯。 [C] 是的。", 3),
+            None
+        );
+        assert_eq!(split_tagged("Here you go: [A] a [B] b", 2), None);
+        // A block that came back empty is a change.
+        assert_eq!(split_tagged("[A] a [B] [C] c", 3), None);
+    }
+
+    #[test]
+    fn the_configured_model_is_tried_under_the_other_identity_first() {
+        let offered = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let offers = vec![
+            (
+                COPILOT_CLI,
+                offered(&["claude-haiku-4.5", "gpt-4.1", "gpt-4o-mini"]),
+            ),
+            (
+                COPILOT_VSCODE,
+                offered(&["claude-haiku-4.5", "gpt-4.1", "gpt-4o"]),
+            ),
+        ];
+        let tried = ("claude-haiku-4.5".to_string(), COPILOT_CLI);
+        let order = order_fallbacks("claude-haiku-4.5", &tried, &offers);
+        assert_eq!(
+            order.first(),
+            Some(&("claude-haiku-4.5".to_string(), COPILOT_VSCODE))
+        );
+        // Nothing is listed twice and the refused pair is not asked again.
+        assert!(!order.contains(&tried));
+        let mut seen = order.clone();
+        seen.dedup();
+        assert_eq!(seen, order);
+        // The other models follow.
+        assert!(order.contains(&("gpt-4.1".to_string(), COPILOT_CLI)));
+        // A model the other identity does not offer is not tried under it.
+        let narrower = vec![
+            (COPILOT_CLI, offered(&["claude-haiku-4.5", "gpt-4.1"])),
+            (COPILOT_VSCODE, offered(&["gpt-4.1"])),
+        ];
+        let order = order_fallbacks("claude-haiku-4.5", &tried, &narrower);
+        assert_eq!(order[0].0, "gpt-4.1");
+    }
+
+    #[test]
+    fn a_busy_provider_is_given_long_pauses_and_its_own_advice() {
+        assert_eq!(busy_pause(0, 0), Duration::from_secs(30));
+        assert_eq!(busy_pause(1, 0), Duration::from_secs(60));
+        assert_eq!(busy_pause(2, 0), Duration::from_secs(120));
+        // More attempts than pauses stay at the last one.
+        assert_eq!(busy_pause(9, 0), Duration::from_secs(120));
+        // Its own Retry-After wins when it is longer, up to five minutes.
+        assert_eq!(busy_pause(0, 90), Duration::from_secs(90));
+        assert_eq!(busy_pause(0, 10), Duration::from_secs(30));
+        assert_eq!(busy_pause(0, 9_999), Duration::from_secs(300));
     }
 }

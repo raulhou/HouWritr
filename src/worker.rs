@@ -121,7 +121,7 @@ pub enum JobStage {
 /// recording continues. All parts of a meeting share an `id`; the worker
 /// keeps their texts and speaker identities until the `last` part arrives
 /// and stitches everything together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionPart {
     pub id: u64,
     /// Where this part starts on the meeting's timeline (16 kHz samples), so
@@ -132,7 +132,7 @@ pub struct SessionPart {
 
 /// One stretch of a delivered transcript. `raw` is the text as recognised,
 /// kept only for pieces whose AI cleanup is worth trying again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepairPiece {
     pub text: String,
     pub raw: Option<String>,
@@ -141,7 +141,7 @@ pub struct RepairPiece {
 /// What a delivered transcript still lacks, and how to put it together again
 /// once it is fixed: the app retries in the background (a connection that was
 /// down, say) and rewrites the saved files when cleanup or notes succeed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepairPlan {
     pub pieces: Vec<RepairPiece>,
     /// Put between pieces: a blank line for labelled blocks, a space for
@@ -255,13 +255,6 @@ pub enum WorkerEvent {
     JobDiscarded {
         id: u64,
     },
-    /// A released engine could not be loaded again ahead of a job (see
-    /// [`Worker::prepare_engine`]). The next job tries again.
-    EngineReloadFailed {
-        generation: u64,
-        engine: String,
-        error: String,
-    },
     ShutdownComplete,
 }
 
@@ -297,11 +290,6 @@ enum Command {
         cancellation: CancellationToken,
     },
     Transcribe(Job),
-    /// Unload the speech engine while HouWritr has nothing to do, giving its
-    /// memory (and the NPU) back. The next job loads it again.
-    Release,
-    /// Load a released engine again now, ahead of a job that is coming.
-    Prepare,
     Shutdown(ShutdownMode),
 }
 
@@ -391,6 +379,8 @@ pub struct Worker {
     latest_generation: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    /// Jobs the user stopped; the worker drops them at the next check.
+    stopped: Arc<Mutex<HashSet<u64>>>,
     pending_jobs_by_generation: Arc<Mutex<HashMap<u64, usize>>>,
     job_events: Mutex<JobEventTracker>,
     synthetic_events: Mutex<VecDeque<WorkerEvent>>,
@@ -404,16 +394,24 @@ impl Worker {
     /// Start the inference thread. `wake` is called after every event it
     /// sends, so the app can sleep until there is something to read.
     pub fn spawn(wake: Wake) -> Result<Self> {
-        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?), wake)
+        Self::spawn_with_loader(Box::new(RuntimeEngineLoader::new()?), wake, true)
     }
 
-    fn spawn_with_loader(loader: Box<dyn EngineLoader>, wake: Wake) -> Result<Self> {
+    /// `unload_when_idle`: drop the speech engine whenever no work is
+    /// waiting (the app); tests that count loads keep it.
+    fn spawn_with_loader(
+        loader: Box<dyn EngineLoader>,
+        wake: Wake,
+        unload_when_idle: bool,
+    ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
         let event_tx = EventSink { events, wake };
         let latest_generation = Arc::new(AtomicU64::new(0));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let discard_requested = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(HashSet::new()));
+        let worker_stopped = stopped.clone();
         let pending_jobs_by_generation = Arc::new(Mutex::new(HashMap::new()));
         let transition_gate = Arc::new(Mutex::new(()));
         let worker_generation = latest_generation.clone();
@@ -428,11 +426,13 @@ impl Worker {
             .spawn(move || {
                 worker_main(
                     loader,
+                    unload_when_idle,
                     command_rx,
                     event_tx,
                     worker_generation,
                     worker_shutdown,
                     worker_discard,
+                    worker_stopped,
                     worker_pending_jobs,
                     worker_transition_gate,
                 )
@@ -445,6 +445,7 @@ impl Worker {
             latest_generation,
             shutdown_requested,
             discard_requested,
+            stopped,
             pending_jobs_by_generation,
             job_events: Mutex::new(JobEventTracker::default()),
             synthetic_events: Mutex::new(VecDeque::new()),
@@ -487,6 +488,13 @@ impl Worker {
         Ok(generation)
     }
 
+    /// Stop job `id`, queued or running: it ends with `JobDiscarded` at the
+    /// next point where it checks (between transcription windows or cleanup
+    /// slices), and nothing of it is delivered.
+    pub fn stop_job(&self, id: u64) {
+        self.stopped.lock().insert(id);
+    }
+
     pub fn cancel_load(&mut self) -> u64 {
         let _transition = self.transition_gate.lock();
         let current_generation = self.latest_generation.load(Ordering::Acquire);
@@ -498,22 +506,6 @@ impl Worker {
         self.latest_generation
             .store(invalid_generation, Ordering::Release);
         invalid_generation
-    }
-
-    /// Unload the speech engine until a job needs it again. Queued behind any
-    /// job already sent, so it never interrupts one.
-    pub fn release_engine(&self) -> Result<()> {
-        self.command_tx
-            .send(Command::Release)
-            .context("send engine release command")
-    }
-
-    /// Load a released engine again now, so a job about to be queued does not
-    /// wait for it. Does nothing when the engine is loaded.
-    pub fn prepare_engine(&self) -> Result<()> {
-        self.command_tx
-            .send(Command::Prepare)
-            .context("send engine prepare command")
     }
 
     pub fn enqueue(
@@ -745,32 +737,58 @@ impl JobEventTracker {
 
 fn worker_main(
     mut loader: Box<dyn EngineLoader>,
+    unload_when_idle: bool,
     command_rx: Receiver<Command>,
     event_tx: EventSink,
     latest_generation: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    stopped: Arc<Mutex<HashSet<u64>>>,
     pending_jobs_by_generation: Arc<Mutex<HashMap<u64, usize>>>,
     transition_gate: Arc<Mutex<()>>,
 ) {
     let mut engine: Option<Box<dyn Engine>> = None;
     let mut engine_generation: Option<u64> = None;
     let mut engine_cancellation: Option<CancellationToken> = None;
-    // The NPU engine loaded for `engine_generation`, and whether it was
-    // unloaded to give the NPU to the built-in text model (see
-    // `park_npu_engine`).
+    // The engine `engine_generation` names; `engine` is None while it is
+    // unloaded for idleness and loaded again by the next job.
     let mut engine_name: Option<String> = None;
-    let mut engine_parked = false;
     // Rolling meeting transcriptions in progress. Jobs run one at a time on
     // this thread, so the map needs no locking.
     let mut sessions: HashMap<u64, SessionState> = HashMap::new();
     // Whether the AI provider answered recently (see `CleanupGate`).
     let mut gate = CleanupGate::default();
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        // The speech engine is held only while there is work: once nothing
+        // is waiting it leaves the NPU (also between the parts of a meeting
+        // and right after the check at startup), and the next job loads it
+        // again, which takes about two seconds.
+        let command = if unload_when_idle && engine.is_some() {
+            match command_rx.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => {
+                    engine = None;
+                    info!(
+                        engine = engine_name.as_deref().unwrap_or_default(),
+                        "speech engine unloaded; the next job loads it again"
+                    );
+                    // What the last job used (audio, model buffers) is free
+                    // now: hand it back to Windows rather than keep it resident.
+                    crate::memory::release_idle_memory();
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        } else {
+            match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        };
         match command {
             Command::Load {
                 generation,
-                engine: engine_name_requested,
+                engine: requested,
                 cancellation,
             } => {
                 {
@@ -791,20 +809,18 @@ fn worker_main(
                 engine_generation = None;
                 engine_cancellation = None;
                 engine_name = None;
-                engine_parked = false;
                 let _ = event_tx.send(WorkerEvent::EngineLoading {
                     generation,
-                    engine: engine_name_requested.clone(),
+                    engine: requested.clone(),
                 });
                 let mut emit_model_state = |state| {
                     let _ = event_tx.send(WorkerEvent::ModelState {
                         generation,
-                        engine: engine_name_requested.clone(),
+                        engine: requested.clone(),
                         state,
                     });
                 };
-                let loaded =
-                    loader.load(&engine_name_requested, &cancellation, &mut emit_model_state);
+                let loaded = loader.load(&requested, &cancellation, &mut emit_model_state);
                 let _transition = transition_gate.lock();
                 if cancellation.is_cancelled()
                     || !should_process_load(
@@ -822,12 +838,12 @@ fn worker_main(
                     Ok(loaded_engine) => {
                         let label = loaded_engine.label().to_string();
                         engine = Some(loaded_engine);
-                        engine_name = Some(engine_name_requested.clone());
                         engine_generation = Some(generation);
+                        engine_name = Some(requested.clone());
                         engine_cancellation = Some(cancellation.clone());
                         let _ = event_tx.send(WorkerEvent::EngineReady {
                             generation,
-                            engine: engine_name_requested.clone(),
+                            engine: requested,
                             label,
                         });
                     }
@@ -836,7 +852,7 @@ fn worker_main(
                         engine_cancellation = None;
                         let _ = event_tx.send(WorkerEvent::EngineFailed {
                             generation,
-                            engine: engine_name_requested.clone(),
+                            engine: requested,
                             error: error.to_string(),
                         });
                     }
@@ -853,7 +869,8 @@ fn worker_main(
                 crate::log_files::begin(job.id, recording_kind(&job.config));
                 {
                     let _transition = transition_gate.lock();
-                    if discard_requested.load(Ordering::Acquire) {
+                    if discard_requested.load(Ordering::Acquire) || stopped.lock().contains(&job.id)
+                    {
                         let _ = event_tx.send(WorkerEvent::JobDiscarded { id: job.id });
                         continue;
                     }
@@ -891,28 +908,22 @@ fn worker_main(
                     }
                 }
                 if let Some(rerun) = job.config.rerun.clone() {
-                    park_npu_engine(
-                        &mut engine,
-                        engine_name.as_deref(),
-                        &mut engine_parked,
-                        &job.config.settings,
-                    );
                     run_rerun(&job, rerun, &mut gate, &event_tx, &discard_requested);
                     continue;
                 }
-                if engine_parked {
+                if engine.is_none() {
                     let name = engine_name.clone().unwrap_or_default();
                     let cancellation = engine_cancellation.clone().unwrap_or_default();
                     match reload_engine(&mut *loader, &name, &cancellation) {
                         Ok(reloaded) => {
                             engine = Some(reloaded);
-                            engine_parked = false;
                         }
                         Err(error) => {
                             let reason = format!("could not load the speech engine again: {error}");
                             let _transition = transition_gate.lock();
                             let event = terminal_job_event(
                                 job.id,
+                                &stopped,
                                 &discard_requested,
                                 &engine_cancellation,
                                 || match job.config.session {
@@ -943,8 +954,13 @@ fn worker_main(
                 let mut diarization = DiarizationOutcome::NotRequested;
                 let transcription = if job.config.long_form {
                     let interrupted = || {
-                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                            .is_some()
+                        interrupted_job_event(
+                            job.id,
+                            &stopped,
+                            &discard_requested,
+                            &engine_cancellation,
+                        )
+                        .is_some()
                     };
                     let send_progress = |stage: JobStage, done: usize, total: usize| {
                         let _ = event_tx.send(WorkerEvent::JobProgress {
@@ -972,7 +988,13 @@ fn worker_main(
                                 // heard).
                                 Some(part) => {
                                     let state = sessions.entry(part.id).or_default();
-                                    let mapping = state.speakers.assign(&result.centroids);
+                                    let speech = asr::diarize::speech_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    let mapping = state
+                                        .speakers
+                                        .assign_with_speech(&result.centroids, &speech);
                                     let mut turns = result.turns;
                                     asr::diarize::remap_speakers(&mut turns, &mapping);
                                     if turns.is_empty() {
@@ -985,10 +1007,42 @@ fn worker_main(
                                     }
                                 }
                                 None => {
-                                    let speakers = asr::diarize::speaker_count(&result.turns);
+                                    // Voices heard for a few seconds are not
+                                    // people of their own.
+                                    let speech = asr::diarize::speech_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    let appearances = asr::diarize::appearances_per_speaker(
+                                        &result.turns,
+                                        result.centroids.len(),
+                                    );
+                                    for (speaker, (samples, stretches)) in
+                                        speech.iter().zip(&appearances).enumerate()
+                                    {
+                                        info!(
+                                            speaker,
+                                            seconds = (*samples as f32 / 16_000.0).round(),
+                                            stretches,
+                                            "speaker heard in this file"
+                                        );
+                                    }
+                                    let merges = asr::diarize::weak_speaker_merges(
+                                        &result.centroids,
+                                        &speech,
+                                        &appearances,
+                                    );
+                                    let turns =
+                                        asr::diarize::merge_speakers(&result.turns, &merges);
+                                    let speakers = asr::diarize::speaker_count(&turns);
+                                    info!(
+                                        found = asr::diarize::speaker_count(&result.turns),
+                                        kept = speakers,
+                                        "speakers after merging the ones heard only briefly"
+                                    );
                                     if speakers >= 2 {
                                         diarization = DiarizationOutcome::Labelled { speakers };
-                                        Some(result.turns)
+                                        Some(turns)
                                     } else {
                                         diarization = DiarizationOutcome::SingleSpeaker;
                                         None
@@ -1046,6 +1100,7 @@ fn worker_main(
                         let _transition = transition_gate.lock();
                         let event = terminal_job_event(
                             job.id,
+                            &stopped,
                             &discard_requested,
                             &engine_cancellation,
                             || WorkerEvent::JobFailed {
@@ -1059,25 +1114,25 @@ fn worker_main(
                 };
                 {
                     let _transition = transition_gate.lock();
-                    if let Some(event) =
-                        interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                    {
+                    if let Some(event) = interrupted_job_event(
+                        job.id,
+                        &stopped,
+                        &discard_requested,
+                        &engine_cancellation,
+                    ) {
                         let _ = event_tx.send(event);
                         continue;
                     }
                 }
 
-                if (job.config.should_enhance() || job.config.notes) && !transcription_failed {
-                    park_npu_engine(
-                        &mut engine,
-                        engine_name.as_deref(),
-                        &mut engine_parked,
-                        &job.config.settings,
-                    );
-                }
                 let interrupted_now = || {
-                    interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                        .is_some()
+                    interrupted_job_event(
+                        job.id,
+                        &stopped,
+                        &discard_requested,
+                        &engine_cancellation,
+                    )
+                    .is_some()
                 };
                 let send_cleaning_progress = |done: usize, total: usize| {
                     let _ = event_tx.send(WorkerEvent::JobProgress {
@@ -1088,47 +1143,74 @@ fn worker_main(
                     });
                 };
 
+                // The speech engine is finished with this job. When a model on
+                // this PC cleans the transcript next, the engine leaves the
+                // NPU first, so the two never hold it together (nor compute
+                // at the same time, which jobs on this one thread never do
+                // anyway); the next job loads it again, about two seconds.
+                if unload_when_idle
+                    && frees_engine_before_cleanup(&job.config, transcription_failed)
+                {
+                    engine = None;
+                    info!(
+                        engine = engine_name.as_deref().unwrap_or_default(),
+                        "speech engine unloaded before the cleanup on this PC"
+                    );
+                }
+
                 // `raw_text` is what was recognised; it is kept so a failed
                 // cleanup can be redone later.
                 let raw_text = text;
                 let mut cleanup_report: Option<enhance::CleanupReport> = None;
-                let (final_text, enhancement_warning) = if job.config.should_enhance()
-                    && !transcription_failed
-                {
-                    let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
-                    info!("enhancement requested");
-                    let cleaned = if job.config.long_form {
-                        clean_transcript(
-                            &raw_text,
-                            &job.config.settings,
-                            &mut gate,
-                            &interrupted_now,
-                            send_cleaning_progress,
-                        )
-                        .map(|cleaned| (cleaned.text, cleaned.warning, Some(cleaned.report)))
+                // A model on this PC cleans a meeting once, after Stop: loading
+                // it for every five-minute part would cost more energy than
+                // the cleanup itself, and it would compete with the call for
+                // the CPU. Hosted providers still clean each part as it comes.
+                let deferred = job.config.session.is_some()
+                    && job.config.should_enhance()
+                    && enhance::uses_local_model(&job.config.settings);
+                if deferred && !transcription_failed {
+                    cleanup_report = Some(DEFERRED_CLEANUP);
+                }
+                let (final_text, enhancement_warning) =
+                    if job.config.should_enhance() && !transcription_failed && !deferred {
+                        let _ = event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
+                        info!("enhancement requested");
+                        let cleaned = if job.config.long_form {
+                            clean_transcript(
+                                &raw_text,
+                                &job.config.settings,
+                                &mut gate,
+                                &interrupted_now,
+                                send_cleaning_progress,
+                            )
+                            .map(|cleaned| (cleaned.text, cleaned.warning, Some(cleaned.report)))
+                        } else {
+                            enhance::enhance_outcome(&raw_text, &job.config.settings, || {
+                                !interrupted_now()
+                            })
+                            .map(|outcome| {
+                                let (text, warning) = completed_cleanup(outcome);
+                                (text, warning, None)
+                            })
+                        };
+                        let Some((cleaned_text, warning, report)) = cleaned else {
+                            let _transition = transition_gate.lock();
+                            if let Some(event) = interrupted_job_event(
+                                job.id,
+                                &stopped,
+                                &discard_requested,
+                                &engine_cancellation,
+                            ) {
+                                let _ = event_tx.send(event);
+                            }
+                            continue;
+                        };
+                        cleanup_report = report;
+                        (cleaned_text, warning)
                     } else {
-                        enhance::enhance_outcome(&raw_text, &job.config.settings, || {
-                            !interrupted_now()
-                        })
-                        .map(|outcome| {
-                            let (text, warning) = completed_cleanup(outcome);
-                            (text, warning, None)
-                        })
+                        (raw_text.clone(), None)
                     };
-                    let Some((cleaned_text, warning, report)) = cleaned else {
-                        let _transition = transition_gate.lock();
-                        if let Some(event) =
-                            interrupted_job_event(job.id, &discard_requested, &engine_cancellation)
-                        {
-                            let _ = event_tx.send(event);
-                        }
-                        continue;
-                    };
-                    cleanup_report = report;
-                    (cleaned_text, warning)
-                } else {
-                    (raw_text.clone(), None)
-                };
 
                 // Parts of a rolling meeting: remember everything but the last
                 // part's text; the last part carries the whole transcript.
@@ -1146,9 +1228,31 @@ fn worker_main(
                         state.note_part(&diarization, &enhancement_warning);
                         if part.last {
                             let mut state = sessions.remove(&part.id).unwrap_or_default();
-                            // A second chance for parts whose cleanup could not
-                            // reach the provider while the meeting was running.
-                            if job.config.should_enhance() {
+                            let mut own = own;
+                            state.consolidate_speakers(&mut own);
+                            if deferred {
+                                let _ =
+                                    event_tx.send(WorkerEvent::EnhancementStarted { id: job.id });
+                                info!(parts = state.parts.len() + 1, "cleaning up the meeting");
+                                state.parts.push(own);
+                                clean_deferred_parts(
+                                    &mut state.parts,
+                                    &job.config.settings,
+                                    |raw, progress| {
+                                        clean_transcript(
+                                            raw,
+                                            &job.config.settings,
+                                            &mut gate,
+                                            &interrupted_now,
+                                            progress,
+                                        )
+                                    },
+                                    send_cleaning_progress,
+                                );
+                                own = state.parts.pop().expect("the last part was just added");
+                            } else if job.config.should_enhance() {
+                                // A second chance for parts whose cleanup could
+                                // not reach the provider while the meeting ran.
                                 retry_incomplete_parts(
                                     &mut state.parts,
                                     RETRY_BUDGET,
@@ -1183,6 +1287,7 @@ fn worker_main(
                             // delivery still comes from the stitched whole.
                             let event = terminal_job_event(
                                 job.id,
+                                &stopped,
                                 &discard_requested,
                                 &engine_cancellation,
                                 || WorkerEvent::JobCompleted {
@@ -1245,6 +1350,7 @@ fn worker_main(
                             let _transition = transition_gate.lock();
                             if let Some(event) = interrupted_job_event(
                                 job.id,
+                                &stopped,
                                 &discard_requested,
                                 &engine_cancellation,
                             ) {
@@ -1260,66 +1366,25 @@ fn worker_main(
                 let chars = final_text.chars().count();
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let _transition = transition_gate.lock();
-                let event =
-                    terminal_job_event(job.id, &discard_requested, &engine_cancellation, || {
-                        WorkerEvent::JobCompleted {
-                            id: job.id,
-                            text: final_text,
-                            diarization,
-                            cleanup: final_report,
-                            repair: repair_plan.filter(|plan| !plan.is_complete()),
-                            notes: notes_text,
-                            enhancement_warning,
-                        }
-                    });
+                let event = terminal_job_event(
+                    job.id,
+                    &stopped,
+                    &discard_requested,
+                    &engine_cancellation,
+                    || WorkerEvent::JobCompleted {
+                        id: job.id,
+                        text: final_text,
+                        diarization,
+                        cleanup: final_report,
+                        repair: repair_plan.filter(|plan| !plan.is_complete()),
+                        notes: notes_text,
+                        enhancement_warning,
+                    },
+                );
                 if matches!(&event, WorkerEvent::JobCompleted { .. }) {
                     info!(id = job.id, chars, elapsed_ms, "transcription job complete");
                 }
                 let _ = event_tx.send(event);
-            }
-            Command::Release => {
-                if engine.take().is_some() {
-                    engine_parked = true;
-                    info!(
-                        engine = engine_name.as_deref().unwrap_or_default(),
-                        "speech engine unloaded while idle"
-                    );
-                }
-                // Whatever the last job used (audio, model buffers) is free
-                // now: hand it back to Windows rather than keep it resident.
-                crate::memory::release_idle_memory();
-            }
-            Command::Prepare => {
-                let current = engine_cancellation
-                    .as_ref()
-                    .is_some_and(|cancellation| !cancellation.is_cancelled());
-                if !engine_parked
-                    || !current
-                    || shutdown_requested.load(Ordering::Acquire)
-                    || discard_requested.load(Ordering::Acquire)
-                {
-                    continue;
-                }
-                let (Some(name), Some(cancellation), Some(generation)) = (
-                    engine_name.clone(),
-                    engine_cancellation.clone(),
-                    engine_generation,
-                ) else {
-                    continue;
-                };
-                match reload_engine(&mut *loader, &name, &cancellation) {
-                    Ok(reloaded) => {
-                        engine = Some(reloaded);
-                        engine_parked = false;
-                    }
-                    Err(error) => {
-                        let _ = event_tx.send(WorkerEvent::EngineReloadFailed {
-                            generation,
-                            engine: name,
-                            error: error.to_string(),
-                        });
-                    }
-                }
             }
             Command::Shutdown(mode) => {
                 info!(?mode, "inference worker stopping");
@@ -1331,7 +1396,7 @@ fn worker_main(
     }
 }
 
-/// Stops OpenWritr's own local text model when dropped, if the job it was made
+/// Stops HouWritr's own local text model when dropped, if the job it was made
 /// for asks for that (see [`releases_local_model`]).
 struct ReleaseLocalModel(bool);
 
@@ -1346,30 +1411,6 @@ impl Drop for ReleaseLocalModel {
         if self.0 {
             crate::local_llm::release("the transcript is finished");
         }
-    }
-}
-
-/// Unload an NPU speech engine before the built-in text model (GenieX on the
-/// NPU) runs. Both together do not fit: GenieX could not map its model
-/// ("Failed to map buffer", "Context create from binary failed") and wrote
-/// under one token a second. The engine is loaded again before the next job
-/// that needs it.
-fn park_npu_engine(
-    engine: &mut Option<Box<dyn Engine>>,
-    engine_name: Option<&str>,
-    parked: &mut bool,
-    settings: &Settings,
-) {
-    let on_npu = engine_name.is_some_and(|name| name.ends_with("_npu"));
-    if !on_npu || !enhance::uses_managed_model(settings) {
-        return;
-    }
-    if engine.take().is_some() {
-        *parked = true;
-        info!(
-            engine = engine_name.unwrap_or_default(),
-            "speech engine unloaded so the local text model can use the NPU"
-        );
     }
 }
 
@@ -1419,14 +1460,22 @@ fn recording_kind(config: &JobConfig) -> crate::log_files::RecordingKind {
     }
 }
 
-/// Whether the local text model is unloaded right after this job: imported
-/// files, finished meetings and background cleanup retries that used AI
-/// cleanup or notes. A meeting keeps it between its parts (it is released
-/// after a few idle minutes).
-fn releases_local_model(config: &JobConfig) -> bool {
-    config.long_form
+/// Whether the local text model is stopped right after this job: every job
+/// that may have used it (AI cleanup, notes, a background retry), each
+/// meeting part included. It is started again only when the next job needs
+/// it, so it never sits idle in memory.
+/// Whether the job is about to be cleaned by a model on this PC, so the speech
+/// engine can leave the NPU first. For a meeting that is the last part only:
+/// the earlier parts are cleaned once, after Stop.
+fn frees_engine_before_cleanup(config: &JobConfig, transcription_failed: bool) -> bool {
+    config.should_enhance()
+        && !transcription_failed
+        && enhance::uses_local_model(&config.settings)
         && config.session.map_or(true, |part| part.last)
-        && (config.should_enhance() || config.notes)
+}
+
+fn releases_local_model(config: &JobConfig) -> bool {
+    config.rerun.is_some() || config.should_enhance() || config.notes
 }
 
 /// Longest window handed to the engine in one call for long-form audio.
@@ -1659,6 +1708,45 @@ impl PartText {
     }
 }
 
+/// `text` with the number of each `[m:ss] Speaker N:` block head replaced by
+/// `number(N - 1) + 1`. Blocks without such a head are left as they are.
+fn relabel_blocks(text: &str, number: &mut dyn FnMut(usize) -> usize) -> String {
+    let mut relabelled = String::with_capacity(text.len());
+    for (index, block) in text.split("\n\n").enumerate() {
+        if index > 0 {
+            relabelled.push_str("\n\n");
+        }
+        match speaker_label(block) {
+            Some((digits, speaker)) => {
+                relabelled.push_str(&block[..digits.start]);
+                relabelled.push_str(&(number(speaker - 1) + 1).to_string());
+                relabelled.push_str(&block[digits.end..]);
+            }
+            None => relabelled.push_str(block),
+        }
+    }
+    relabelled
+}
+
+/// Where the number is in a block that starts `[m:ss] Speaker N:` (the stamp
+/// is optional), and the number.
+fn speaker_label(block: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    let start = if block.starts_with('[') {
+        block.find("] ")? + 2
+    } else {
+        0
+    };
+    block.get(start..)?.strip_prefix("Speaker ")?;
+    let number_start = start + "Speaker ".len();
+    let rest = block.get(number_start..)?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(':') {
+        return None;
+    }
+    let speaker: usize = rest[..digits].parse().ok()?;
+    (speaker >= 1).then_some((number_start..number_start + digits, speaker))
+}
+
 /// A rolling meeting transcription, put together.
 struct Stitched {
     text: String,
@@ -1678,9 +1766,60 @@ struct SessionState {
     labelled: bool,
     diarization_failure: Option<String>,
     cleanup_warning: Option<FallbackReason>,
+    /// Speakers left after [`consolidate_speakers`](Self::consolidate_speakers).
+    final_speakers: Option<usize>,
 }
 
 impl SessionState {
+    /// Once the whole meeting is known, count speakers heard only briefly as
+    /// the closest voice heard properly (see `weak_speaker_merges`) and number
+    /// everyone by first appearance, in the recognised and the cleaned text of
+    /// every part. Each five minute part is clustered on its own, and a few
+    /// seconds of applause or one word over the speakers used to become a
+    /// speaker of its own: 28 of them in a meeting of five people.
+    fn consolidate_speakers(&mut self, own: &mut PartText) {
+        let merges = self.speakers.merges();
+        if merges.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        for part in self.parts.iter().chain(std::iter::once(&*own)) {
+            relabel_blocks(&part.text, &mut |speaker| {
+                let counted_as = merges.get(speaker).copied().unwrap_or(speaker);
+                if !order.contains(&counted_as) {
+                    order.push(counted_as);
+                }
+                speaker
+            });
+        }
+        let mut number = |speaker: usize| {
+            let counted_as = merges.get(speaker).copied().unwrap_or(speaker);
+            order
+                .iter()
+                .position(|&s| s == counted_as)
+                .unwrap_or(speaker)
+        };
+        for part in self.parts.iter_mut().chain(std::iter::once(own)) {
+            part.text = relabel_blocks(&part.text, &mut number);
+            part.raw = relabel_blocks(&part.raw, &mut number);
+        }
+        for (speaker, (seconds, parts)) in self.speakers.heard().into_iter().enumerate() {
+            info!(
+                speaker,
+                seconds = seconds.round(),
+                parts,
+                counted_as = merges.get(speaker).copied().unwrap_or(speaker),
+                "speaker heard in this meeting"
+            );
+        }
+        info!(
+            found = self.speakers.len(),
+            kept = order.len(),
+            "speakers after merging the ones heard only briefly"
+        );
+        self.final_speakers = Some(order.len());
+    }
+
     /// Remember what a finished part contributed besides its text.
     fn note_part(&mut self, diarization: &DiarizationOutcome, warning: &Option<FallbackReason>) {
         match diarization {
@@ -1705,7 +1844,7 @@ impl SessionState {
     ) -> Stitched {
         let labelled =
             self.labelled || matches!(own_diarization, DiarizationOutcome::Labelled { .. });
-        let speakers = self.speakers.len();
+        let speakers = self.final_speakers.unwrap_or_else(|| self.speakers.len());
         let mut report = enhance::CleanupReport::default();
         let mut pieces = Vec::new();
         for part in self.parts.into_iter().chain(std::iter::once(own)) {
@@ -1813,6 +1952,52 @@ fn clean_transcript(
 /// How long the second pass at Stop may spend on parts whose cleanup failed
 /// during the meeting.
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The cleanup report of a meeting part whose cleanup waits for the end of
+/// the meeting (a model on this PC). It counts as not yet cleaned, so if the
+/// end never gets to it, the background retry picks it up.
+const DEFERRED_CLEANUP: enhance::CleanupReport = enhance::CleanupReport {
+    partly: 0,
+    total: 1,
+    cleaned: 0,
+    unreachable: 1,
+};
+
+/// Clean up, in order, every part whose cleanup was left for the end of the
+/// meeting ([`DEFERRED_CLEANUP`]), reporting progress as one count of
+/// requests over all of them. Stops when interrupted; what is left keeps its
+/// recognised text and is retried later.
+fn clean_deferred_parts(
+    parts: &mut [PartText],
+    settings: &Settings,
+    mut clean: impl FnMut(&str, &mut dyn FnMut(usize, usize)) -> Option<CleanedText>,
+    mut progress: impl FnMut(usize, usize),
+) {
+    let todo: Vec<usize> = (0..parts.len())
+        .filter(|&index| parts[index].report == DEFERRED_CLEANUP)
+        .collect();
+    let sizes: Vec<usize> = todo
+        .iter()
+        .map(|&index| {
+            enhance::cleanup_slice_count(&strip_timestamps(&parts[index].raw).0, settings)
+        })
+        .collect();
+    let total: usize = sizes.iter().sum();
+    progress(0, total);
+    let mut base = 0;
+    for (index, size) in todo.into_iter().zip(sizes) {
+        let cleaned = clean(&parts[index].raw, &mut |done, _| {
+            progress(base + done.min(size), total)
+        });
+        let Some(cleaned) = cleaned else {
+            break;
+        };
+        parts[index].text = cleaned.text;
+        parts[index].report = cleaned.report;
+        base += size;
+        progress(base, total);
+    }
+}
 
 /// One retry of a part's cleanup.
 enum RetryAttempt {
@@ -1990,10 +2175,11 @@ fn completed_cleanup(outcome: EnhanceOutcome) -> (String, Option<FallbackReason>
 
 fn interrupted_job_event(
     id: u64,
+    stopped: &Mutex<HashSet<u64>>,
     discard_requested: &AtomicBool,
     engine_cancellation: &Option<CancellationToken>,
 ) -> Option<WorkerEvent> {
-    if discard_requested.load(Ordering::Acquire) {
+    if discard_requested.load(Ordering::Acquire) || stopped.lock().contains(&id) {
         Some(WorkerEvent::JobDiscarded { id })
     } else if engine_cancellation
         .as_ref()
@@ -2011,11 +2197,13 @@ fn interrupted_job_event(
 
 fn terminal_job_event(
     id: u64,
+    stopped: &Mutex<HashSet<u64>>,
     discard_requested: &AtomicBool,
     engine_cancellation: &Option<CancellationToken>,
     otherwise: impl FnOnce() -> WorkerEvent,
 ) -> WorkerEvent {
-    interrupted_job_event(id, discard_requested, engine_cancellation).unwrap_or_else(otherwise)
+    interrupted_job_event(id, stopped, discard_requested, engine_cancellation)
+        .unwrap_or_else(otherwise)
 }
 
 fn should_process_load(
@@ -2176,6 +2364,14 @@ mod tests {
     }
 
     fn probed_worker(failed: &[&str], slow_engine: Option<&str>) -> (Worker, Probe) {
+        probed_worker_with(failed, slow_engine, false)
+    }
+
+    fn probed_worker_with(
+        failed: &[&str],
+        slow_engine: Option<&str>,
+        unload_when_idle: bool,
+    ) -> (Worker, Probe) {
         let probe = Probe::default();
         let loader = FakeLoader {
             failed: failed.iter().map(|value| value.to_string()).collect(),
@@ -2192,7 +2388,7 @@ mod tests {
             wakes.fetch_add(1, Ordering::SeqCst);
         });
         (
-            Worker::spawn_with_loader(Box::new(loader), wake).unwrap(),
+            Worker::spawn_with_loader(Box::new(loader), wake, unload_when_idle).unwrap(),
             probe,
         )
     }
@@ -2206,7 +2402,20 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
-        let (worker, probe) = probed_worker(failed, slow_engine);
+        worker_with(failed, slow_engine, false)
+    }
+
+    fn worker_with(
+        failed: &[&str],
+        slow_engine: Option<&str>,
+        unload_when_idle: bool,
+    ) -> (
+        Worker,
+        Arc<Mutex<Vec<i32>>>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let (worker, probe) = probed_worker_with(failed, slow_engine, unload_when_idle);
         (worker, probe.calls, probe.max_active, probe.loads)
     }
 
@@ -2725,6 +2934,55 @@ mod tests {
         state
     }
 
+    #[test]
+    fn block_heads_are_relabelled_and_other_text_is_left_alone() {
+        let text = "[0:00] Speaker 1: hello Speaker 2: there\n\n[0:05] Speaker 12: hi\n\nSpeaker 3: no stamp\n\nplain words\n\n[0:09] Speaker x: odd";
+        let mut seen = Vec::new();
+        let out = relabel_blocks(text, &mut |speaker| {
+            seen.push(speaker);
+            speaker + 1
+        });
+        assert_eq!(
+            out,
+            "[0:00] Speaker 2: hello Speaker 2: there\n\n[0:05] Speaker 13: hi\n\nSpeaker 4: no stamp\n\nplain words\n\n[0:09] Speaker x: odd"
+        );
+        assert_eq!(seen, vec![0, 11, 2]);
+    }
+
+    #[test]
+    fn briefly_heard_speakers_join_the_closest_voice_across_the_meeting() {
+        let minute = 60 * 16_000;
+        let voice = |angle: f32| vec![angle.cos(), angle.sin()];
+        let mut state = SessionState::default();
+        // Two real people, then a stray voice that sounds close to the second.
+        state
+            .speakers
+            .assign_with_speech(&[voice(0.0), voice(2.0)], &[10 * minute, 5 * minute]);
+        state
+            .speakers
+            .assign_with_speech(&[voice(4.0)], &[20 * 16_000]);
+        assert_eq!(state.speakers.len(), 3);
+        state.labelled = true;
+        state.parts = parts(&["[0:00] Speaker 2: question\n\n[0:05] Speaker 1: answer"]);
+        let mut own = PartText::plain("[5:00] Speaker 3: thanks\n\n[5:03] Speaker 1: yes".into());
+        state.consolidate_speakers(&mut own);
+        // Speaker 3 counts as speaker 2; numbering follows first appearance.
+        assert_eq!(
+            state.parts[0].text,
+            "[0:00] Speaker 1: question\n\n[0:05] Speaker 2: answer"
+        );
+        assert_eq!(
+            own.text,
+            "[5:00] Speaker 1: thanks\n\n[5:03] Speaker 2: yes"
+        );
+        assert_eq!(own.raw, own.text);
+        let stitched = state.finish(own, None, DiarizationOutcome::Labelled { speakers: 3 });
+        assert_eq!(
+            stitched.outcome,
+            DiarizationOutcome::Labelled { speakers: 2 }
+        );
+    }
+
     fn parts(texts: &[&str]) -> Vec<PartText> {
         texts
             .iter()
@@ -2734,6 +2992,7 @@ mod tests {
 
     fn report(total: usize, cleaned: usize, unreachable: usize) -> enhance::CleanupReport {
         enhance::CleanupReport {
+            partly: 0,
             total,
             cleaned,
             unreachable,
@@ -3243,6 +3502,51 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_engine_is_unloaded_and_loaded_again_for_the_next_job() {
+        let (mut worker, calls, _, loads) = worker_with(&[], None, true);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
+        let job = worker
+            .enqueue(
+                vec![3.0],
+                16_000,
+                job_config(Settings::default(), RecordingIntent::Raw),
+            )
+            .unwrap();
+        wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == job),
+        );
+        assert_eq!(&*calls.lock(), &[3]);
+        assert_eq!(&*loads.lock(), &["ready", "ready"]);
+    }
+
+    #[test]
+    fn a_stopped_job_is_dropped_and_the_next_one_runs() {
+        let (mut worker, calls, _, _) = worker(&[], None);
+        worker.load("ready".into()).unwrap();
+        wait_ready(&worker, "ready");
+        let config = || job_config(Settings::default(), RecordingIntent::Raw);
+        let first = worker.enqueue(vec![1.0], 16_000, config()).unwrap();
+        let stopped = worker.enqueue(vec![2.0], 16_000, config()).unwrap();
+        let last = worker.enqueue(vec![3.0], 16_000, config()).unwrap();
+        worker.stop_job(stopped);
+        let events = wait_until(
+            &worker,
+            |event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == last),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::JobDiscarded { id } if *id == stopped)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::JobCompleted { id, .. } if *id == first)));
+        assert_eq!(&*calls.lock(), &[1, 3]);
+    }
+
+    #[test]
     fn wait_shutdown_skips_a_queued_engine_load() {
         let (mut worker, calls, _, loads) = worker(&[], None);
         worker.load("ready".into()).unwrap();
@@ -3482,7 +3786,56 @@ mod tests {
     }
 
     #[test]
-    fn local_text_model_is_released_after_transcripts_only() {
+    fn deferred_parts_are_cleaned_in_order_with_one_progress_count() {
+        let settings = Settings::default();
+        let pending = |raw: &str| PartText {
+            raw: raw.into(),
+            text: raw.into(),
+            report: DEFERRED_CLEANUP,
+        };
+        let mut parts = vec![
+            pending("one"),
+            PartText::plain("lost part".into()),
+            pending("two"),
+        ];
+        let mut seen = Vec::new();
+        let mut steps = Vec::new();
+        clean_deferred_parts(
+            &mut parts,
+            &settings,
+            |raw, progress| {
+                seen.push(raw.to_string());
+                progress(1, 1);
+                Some(CleanedText {
+                    text: raw.to_uppercase(),
+                    warning: None,
+                    report: enhance::CleanupReport {
+                        partly: 0,
+                        total: 1,
+                        cleaned: 1,
+                        unreachable: 0,
+                    },
+                })
+            },
+            |done, total| steps.push((done, total)),
+        );
+        assert_eq!(seen, ["one", "two"]);
+        assert_eq!(parts[0].text, "ONE");
+        assert_eq!(parts[1].text, "lost part");
+        assert_eq!(parts[2].text, "TWO");
+        assert!(!parts[2].report.needs_retry());
+        assert_eq!(steps.first(), Some(&(0, 2)));
+        assert_eq!(steps.last(), Some(&(2, 2)));
+
+        // Interrupted: the rest keeps its text and stays marked for a retry.
+        let mut parts = vec![pending("one"), pending("two")];
+        clean_deferred_parts(&mut parts, &settings, |_, _| None, |_, _| {});
+        assert_eq!(parts[0].text, "one");
+        assert!(parts[1].report.needs_retry());
+    }
+
+    #[test]
+    fn local_text_model_is_released_after_every_job_that_used_it() {
         let mut settings = Settings::default();
         settings.enhance.mode = crate::settings::EnhanceMode::Always;
 
@@ -3498,7 +3851,7 @@ mod tests {
             offset_samples: 0,
             last,
         };
-        assert!(!releases_local_model(&JobConfig::meeting_part(
+        assert!(releases_local_model(&JobConfig::meeting_part(
             settings.clone(),
             part(false),
             false
@@ -3508,11 +3861,6 @@ mod tests {
             part(true),
             false
         )));
-        assert!(!releases_local_model(&JobConfig::new(
-            settings.clone(),
-            RecordingIntent::Enhance
-        )));
-
         let mut off = settings.clone();
         off.enhance.mode = crate::settings::EnhanceMode::Never;
         assert!(!releases_local_model(&JobConfig::long_form(off.clone())));
@@ -3559,10 +3907,11 @@ mod tests {
 
     #[test]
     fn a_released_engine_is_loaded_again_by_the_next_job_without_the_app_noticing() {
-        let (mut worker, probe) = probed_worker(&[], None);
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
-        worker.release_engine().unwrap();
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
         let job = worker
             .enqueue(
                 vec![4.0; 16_000],
@@ -3588,58 +3937,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_reloads_a_released_engine_once_and_otherwise_does_nothing() {
-        let (mut worker, probe) = probed_worker(&[], None);
-        worker.load("ready".into()).unwrap();
-        wait_ready(&worker, "ready");
-        // Loaded: nothing to prepare.
-        worker.prepare_engine().unwrap();
-        worker.release_engine().unwrap();
-        worker.prepare_engine().unwrap();
-        worker.prepare_engine().unwrap();
-        let job = worker
-            .enqueue(
-                vec![5.0; 16_000],
-                16_000,
-                JobConfig::long_form(no_cleanup()),
-            )
-            .unwrap();
-
-        assert_eq!(completed_text(&worker, job), "5");
-        assert_eq!(*probe.reloads.lock(), vec!["ready".to_string()]);
-    }
-
-    #[test]
-    fn a_failed_prepare_is_reported_and_the_next_job_tries_again() {
-        let (mut worker, probe) = probed_worker(&[], None);
-        worker.load("ready".into()).unwrap();
-        wait_ready(&worker, "ready");
-        worker.release_engine().unwrap();
-        probe.fail_reloads.store(true, Ordering::SeqCst);
-        worker.prepare_engine().unwrap();
-        wait_until(
-            &worker,
-            |event| matches!(event, WorkerEvent::EngineReloadFailed { engine, .. } if engine == "ready"),
-        );
-
-        probe.fail_reloads.store(false, Ordering::SeqCst);
-        let job = worker
-            .enqueue(
-                vec![6.0; 16_000],
-                16_000,
-                JobConfig::long_form(no_cleanup()),
-            )
-            .unwrap();
-        assert_eq!(completed_text(&worker, job), "6");
-        assert_eq!(probe.reloads.lock().len(), 2);
-    }
-
-    #[test]
     fn a_file_job_fails_when_the_engine_cannot_be_loaded_again() {
-        let (mut worker, probe) = probed_worker(&[], None);
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
-        worker.release_engine().unwrap();
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
         probe.fail_reloads.store(true, Ordering::SeqCst);
         let job = worker
             .enqueue(
@@ -3662,10 +3965,11 @@ mod tests {
 
     #[test]
     fn a_meeting_part_that_meets_a_failed_reload_becomes_a_gap_not_a_lost_meeting() {
-        let (mut worker, probe) = probed_worker(&[], None);
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
-        worker.release_engine().unwrap();
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
         probe.fail_reloads.store(true, Ordering::SeqCst);
         let first = worker
             .enqueue(vec![1.0; 16_000], 16_000, meeting_part(0, false))
@@ -3687,7 +3991,7 @@ mod tests {
 
     #[test]
     fn the_last_part_of_a_meeting_still_carries_the_transcript_when_reloading_fails() {
-        let (mut worker, probe) = probed_worker(&[], None);
+        let (mut worker, probe) = probed_worker_with(&[], None, true);
         worker.load("ready".into()).unwrap();
         wait_ready(&worker, "ready");
         let first = worker
@@ -3695,7 +3999,8 @@ mod tests {
             .unwrap();
         assert_eq!(completed_text(&worker, first), "3");
 
-        worker.release_engine().unwrap();
+        // Nothing waiting: the engine leaves the NPU.
+        thread::sleep(Duration::from_millis(150));
         probe.fail_reloads.store(true, Ordering::SeqCst);
         let last = worker
             .enqueue(vec![4.0; 16_000], 16_000, meeting_part(1, true))
@@ -3720,5 +4025,50 @@ mod tests {
         let mut engine = loader.reload("parakeet_cpu", &cancellation).unwrap();
         eprintln!("reloaded in {:?}", started.elapsed());
         engine.transcribe(&vec![0.0; 16_000], 16_000).unwrap();
+    }
+
+    #[test]
+    fn the_speech_engine_leaves_the_npu_before_a_local_cleanup() {
+        let mut local = Settings::default();
+        local.enhance.mode = crate::settings::EnhanceMode::Always;
+        local.enhance.provider = "openai_compatible".into();
+        local.enhance.base_url = "http://127.0.0.1:18651/v1".into();
+        local.enhance.model = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_0@hybrid".into();
+        assert!(frees_engine_before_cleanup(
+            &JobConfig::long_form(local.clone()),
+            false
+        ));
+        // Nothing to clean, or the transcription failed: no reason to.
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(local.clone()),
+            true
+        ));
+        let mut off = local.clone();
+        off.enhance.mode = crate::settings::EnhanceMode::Never;
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(off),
+            false
+        ));
+        // A hosted provider does not use the NPU.
+        let mut hosted = local.clone();
+        hosted.enhance.provider = "github_copilot".into();
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::long_form(hosted),
+            false
+        ));
+        // A meeting is cleaned once, after its last part.
+        let part = |last| SessionPart {
+            id: 1,
+            offset_samples: 0,
+            last,
+        };
+        assert!(!frees_engine_before_cleanup(
+            &JobConfig::meeting_part(local.clone(), part(false), false),
+            false
+        ));
+        assert!(frees_engine_before_cleanup(
+            &JobConfig::meeting_part(local, part(true), false),
+            false
+        ));
     }
 }

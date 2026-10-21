@@ -10,7 +10,9 @@ use crate::{
     meeting::{self, MeetingRecorder},
     model_manager::ModelState,
     overlay::{self, NoticeKind, OverlayViewState, ProcessingPhase},
+    power,
     settings::{CredentialHealth, MeetingNotesMode, Settings, SettingsRevision},
+    spool::{Spool, SpooledJob},
     transcript_window::{self, WindowMsg},
     tray,
     worker::{
@@ -19,12 +21,15 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::mpsc;
-use std::sync::{atomic::AtomicU32, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -47,11 +52,11 @@ pub enum UserEvent {
         output: PathBuf,
         markdown: bool,
         window: mpsc::Sender<WindowMsg>,
+        /// Set when the user presses Stop in that popup.
+        stop: Arc<AtomicBool>,
     },
     /// The file dialog was dismissed, or decoding failed (`Some(reason)`).
     FileImportEnded(Option<String>),
-    /// A file was picked and is being decoded; a job for it follows.
-    FileChosen,
     /// Answer to "also create meeting notes?" after a recording stopped.
     MeetingNotesChoice(bool),
     /// A tray menu item was clicked.
@@ -86,6 +91,10 @@ struct FileJob {
     details: String,
     /// Popup window for this job. `None` (meetings) keeps the overlay pill.
     window: Option<mpsc::Sender<WindowMsg>>,
+    /// Set when the user presses Stop in the popup; `stop_sent` once the
+    /// worker was told.
+    stop: Option<Arc<AtomicBool>>,
+    stop_sent: bool,
     /// A non-final part of a rolling meeting transcription: it only feeds the
     /// worker's session and is never shown or delivered on its own.
     background: bool,
@@ -96,6 +105,39 @@ struct FileJob {
     /// (it is their `output`); the final job deletes it once the finished
     /// transcript is saved.
     partial: Option<PathBuf>,
+    /// Set when the job (and its audio) is also kept on disk, because it was
+    /// held for power or recovered from an earlier run; its files are deleted
+    /// when the job is done.
+    spool: Option<u64>,
+}
+
+/// What of a [`Repair`] is kept on disk, so that unfinished cleanup retries
+/// also survive closing HouWritr or a battery that runs out.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RepairRecord {
+    id: u64,
+    name: String,
+    plan: RepairPlan,
+    output: PathBuf,
+    notes_output: Option<PathBuf>,
+    markdown: bool,
+    title: String,
+    details: String,
+    last_written: String,
+    best_cleaned: Vec<usize>,
+    failed_rounds: u32,
+}
+
+/// The tray overrode Windows' power saving mode.
+struct PowerOverride {
+    on: bool,
+}
+
+/// A job waiting for power saving to end. Its audio is only on disk.
+struct HeldJob {
+    spool_id: u64,
+    job: FileJob,
+    kind: String,
 }
 
 impl FileJob {
@@ -142,6 +184,54 @@ struct Repair {
     failed_rounds: u32,
     next_attempt: Instant,
     in_flight: Option<u64>,
+    /// The popup of the job that saved the transcript, while it is open.
+    window: Option<mpsc::Sender<WindowMsg>>,
+}
+
+impl Repair {
+    /// What is being retried, for the popup.
+    fn what(&self) -> &'static str {
+        if self.plan.pieces.iter().any(|piece| piece.raw.is_some()) {
+            "AI cleanup"
+        } else {
+            "AI notes"
+        }
+    }
+
+    /// Tell the popup where the retry stands; a closed popup is ignored.
+    fn tell(&self, text: String, active: bool, settled: bool) {
+        if let Some(window) = &self.window {
+            let _ = window.send(WindowMsg::Retry {
+                text,
+                active,
+                settled,
+            });
+        }
+    }
+}
+
+/// "Transcribing 3/12" and the fraction done, for the Jobs window.
+fn progress_text(progress: Option<&(JobStage, usize, usize)>) -> (String, Option<f32>) {
+    let Some(&(stage, done, total)) = progress else {
+        return ("Starting…".into(), None);
+    };
+    let label = match stage {
+        JobStage::Diarizing => "Identifying speakers",
+        JobStage::Transcribing => "Transcribing",
+        JobStage::CleaningUp => "Cleaning up with AI",
+    };
+    if total == 0 {
+        return (label.into(), None);
+    }
+    (
+        format!("{label} {done}/{total}"),
+        Some((done as f32 / total as f32).clamp(0.0, 1.0)),
+    )
+}
+
+/// `120` seconds as `2 min`, for the popup.
+fn minutes(seconds: u64) -> String {
+    format!("{} min", seconds.div_ceil(60).max(1))
 }
 
 /// First retry after two minutes, then slower; after five fruitless rounds
@@ -154,14 +244,23 @@ const REPAIR_STEP_PAUSE: Duration = Duration::from_secs(5);
 const SETTINGS_SETTLE: Duration = Duration::from_millis(150);
 /// How often settings.json is read when its folder cannot be watched.
 const SETTINGS_POLL_FALLBACK: Duration = Duration::from_secs(2);
-/// How long the speech engine stays loaded with nothing to do. It holds
-/// hundreds of megabytes to a few gigabytes (and, on the NPU engines, the
-/// NPU); loading it again takes seconds and is started as soon as a meeting
-/// or a file pick begins, so most of that wait is hidden.
-const ENGINE_IDLE_RELEASE: Duration = Duration::from_secs(60);
+/// How often the tray loop looks for a Stop press while a transcript window
+/// or the Jobs window is open: those run on threads of their own and do not
+/// wake it.
+const STOP_POLL: Duration = Duration::from_millis(250);
 /// Shortest sleep of the tray loop, so a deadline that has just passed can
 /// never make it spin.
 const MIN_WAIT: Duration = Duration::from_millis(20);
+/// A cheap fingerprint to tell whether saved bytes changed.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How often the power supply is looked at.
+const POWER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long to wait before the next round after `failed_rounds` fruitless
 /// ones, or `None` to give up.
@@ -214,14 +313,55 @@ fn write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 /// Where a transcript goes when its own folder cannot be written:
 /// `Documents\HouWritr\<file name>`.
 fn fallback_output(output: &std::path::Path) -> Option<PathBuf> {
-    let documents = directories::UserDirs::new()?.document_dir()?.to_path_buf();
-    Some(documents.join("HouWritr").join(output.file_name()?))
+    Some(crate::paths::documents_dir()?.join(output.file_name()?))
 }
 
 /// "cleaned 21 of 25 sections" when some of the text is still as recognised.
 fn cleanup_summary(report: &crate::enhance::CleanupReport) -> Option<String> {
     (report.total > 0 && report.cleaned < report.total)
         .then(|| format!("cleaned {} of {} sections", report.cleaned, report.total))
+}
+
+/// What the transcript window says when AI cleanup finished but not every
+/// section was cleaned. Not an error: the file is complete and the sections
+/// that were not cleaned keep exactly what was recognised.
+fn cleanup_notice(report: &crate::enhance::CleanupReport) -> Option<String> {
+    if report.total == 0 || report.cleaned + report.partly >= report.total {
+        // Everything cleaned, or the rest only in part (said below).
+        if report.partly == 0 {
+            return None;
+        }
+    }
+    // Neither cleaned, cleaned in part nor unreachable: the cleaned version
+    // changed a number or a speaker label even for the smallest piece, or
+    // was empty.
+    let kept = report
+        .total
+        .saturating_sub(report.cleaned)
+        .saturating_sub(report.partly)
+        .saturating_sub(report.unreachable);
+    let mut notice = format!(
+        "AI cleanup finished: {} of {} sections cleaned.",
+        report.cleaned, report.total
+    );
+    if report.partly > 0 {
+        notice.push_str(&format!(
+            " {} more in part: a piece of each kept the recognised text because the cleaned version changed a number or a speaker label.",
+            report.partly
+        ));
+    }
+    if kept > 0 {
+        notice.push_str(&format!(
+            " {kept} kept the recognised text because the cleaned version changed a number or a speaker label, even in smaller pieces and when asked again; they are not retried."
+        ));
+    }
+    if report.unreachable > 0 {
+        notice.push_str(&format!(
+            " {} could not be sent to the model.",
+            report.unreachable
+        ));
+    }
+    Some(notice)
 }
 
 /// A meeting being recorded: its parts are transcribed as they are cut.
@@ -285,6 +425,10 @@ struct OverlayReducer {
     active_job: Option<u64>,
     notice: Option<OverlayNotice>,
     last_view: OverlayViewState,
+    /// Whether the queued / writing / polishing pill may be shown. It follows
+    /// the recording indicator: hidden there, hidden here. Notices (errors,
+    /// warnings) are not progress and still show.
+    progress_visible: bool,
 }
 
 impl Default for OverlayReducer {
@@ -294,6 +438,7 @@ impl Default for OverlayReducer {
             active_job: None,
             notice: None,
             last_view: OverlayViewState::Hidden,
+            progress_visible: true,
         }
     }
 }
@@ -364,7 +509,7 @@ impl OverlayReducer {
         {
             self.notice = None;
         }
-        if let Some(id) = self.active_job {
+        if let Some(id) = self.active_job.filter(|_| self.progress_visible) {
             if let Some(phase) = self.jobs.get(&id) {
                 let queued = self
                     .jobs
@@ -380,7 +525,7 @@ impl OverlayReducer {
             .filter(|(_, phase)| **phase == ProcessingPhase::Queued)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        if let Some(id) = queued.first() {
+        if let Some(id) = queued.first().filter(|_| self.progress_visible) {
             return OverlayViewState::processing(
                 *id,
                 ProcessingPhase::Queued,
@@ -427,7 +572,6 @@ struct State {
     /// Whether a change notification watches the settings folder.
     settings_watched: bool,
     /// When to unload the speech engine.
-    engine_idle: EngineIdle,
     proxy: EventLoopProxy<UserEvent>,
     diagnostics_exporting: bool,
     meeting: Option<MeetingRecorder>,
@@ -453,6 +597,25 @@ struct State {
     /// Long-form jobs (imported files, meetings) mapped to their output file.
     file_jobs: HashMap<u64, FileJob>,
     file_import_running: bool,
+    /// The Jobs window, while it is open.
+    jobs_window: Option<crate::jobs_window::JobsWindow>,
+    /// Jobs the worker has started, and the latest progress of each.
+    running_jobs: HashSet<u64>,
+    job_progress: HashMap<u64, (JobStage, usize, usize)>,
+    /// Jobs kept on disk until power saving ends.
+    spool: Spool,
+    held: Vec<HeldJob>,
+    /// What Windows said about the power supply at the last check.
+    power: power::PowerStatus,
+    power_checked_at: Instant,
+    /// What the tray's power saving item shows: (on, follows battery saver).
+    power_mode_shown: Option<(bool, bool, bool)>,
+    /// The tray item was clicked while following Windows: power saving is
+    /// this for the rest of the session (never saved), until the item is
+    /// clicked back to what Windows says or following is turned off.
+    power_override: Option<PowerOverride>,
+    /// Fingerprint of the retries last written to disk.
+    repairs_saved: u64,
 }
 
 pub fn run() -> Result<()> {
@@ -548,7 +711,6 @@ pub fn run() -> Result<()> {
         // watcher starting would otherwise go unseen until the next one.
         settings_check_at: Some(Instant::now()),
         settings_watched,
-        engine_idle: EngineIdle::default(),
         proxy,
         diagnostics_exporting: false,
         meeting: None,
@@ -565,6 +727,16 @@ pub fn run() -> Result<()> {
         next_repair_id: 1,
         file_jobs: HashMap::new(),
         file_import_running: false,
+        jobs_window: None,
+        running_jobs: HashSet::new(),
+        job_progress: HashMap::new(),
+        spool: Spool::open(Spool::default_dir()),
+        held: Vec::new(),
+        power: power::status(),
+        power_checked_at: Instant::now(),
+        power_mode_shown: None,
+        power_override: None,
+        repairs_saved: fingerprint(&[]),
     };
 
     // The loop sleeps until a message arrives (menu click, worker event,
@@ -573,6 +745,8 @@ pub fn run() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = AppHandler { state };
+    app.recover_spooled_jobs();
+    app.recover_repairs();
     app.start_engine_load();
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -717,6 +891,7 @@ struct AppHandler {
 
 impl AppHandler {
     fn sync_overlay(&mut self) {
+        self.state.overlay_state.progress_visible = self.meeting_indicator_visible();
         self.state
             .overlay_state
             .sync(&self.state.overlay, Instant::now());
@@ -757,47 +932,32 @@ impl AppHandler {
         }
     }
 
-    /// Whether anything is using the speech engine or is about to.
-    fn engine_needed(&self) -> bool {
-        self.state.pending_jobs > 0
-            || self.state.meeting.is_some()
-            || self.state.pending_meeting.is_some()
-            || self.state.file_import_running
+    /// While a transcript window, the Jobs window or a waiting job could have
+    /// its Stop pressed: Stop is set from threads that do not wake the loop.
+    fn stop_poll_deadline(&self, now: Instant) -> Option<Instant> {
+        let watching = self.state.jobs_window.is_some()
+            || !self.state.held.is_empty()
+            || self
+                .state
+                .file_jobs
+                .values()
+                .any(|job| job.stop.is_some() && !job.stop_sent);
+        watching.then(|| now + STOP_POLL)
     }
 
-    /// Unload the speech engine once nothing has needed it for
-    /// [`ENGINE_IDLE_RELEASE`]. HouWritr sits in the tray all day, and the
-    /// engine is by far the largest thing it holds.
-    fn release_idle_engine(&mut self, now: Instant) {
-        let idle = matches!(self.state.engine_state, EngineState::Ready { .. })
-            && !self.state.shutting_down
-            && !self.engine_needed();
-        if !self.state.engine_idle.release_due(idle, now) {
-            return;
-        }
-        info!(
-            idle_seconds = ENGINE_IDLE_RELEASE.as_secs(),
-            "nothing to do; releasing the speech engine"
-        );
-        if let Err(error) = self.state.worker.release_engine() {
-            warn!(error = %error, "could not release the speech engine");
-        }
-    }
-
-    /// Start loading a released engine ahead of a meeting or a picked file,
-    /// so the first part or the file does not wait for it.
-    fn prepare_engine(&mut self) {
-        if self.state.shutting_down || !self.state.engine_idle.reload_requested() {
-            return;
-        }
-        if let Err(error) = self.state.worker.prepare_engine() {
-            warn!(error = %error, "could not ask for the speech engine to be loaded");
-        }
+    /// When the power supply is next looked at. Only while following Windows'
+    /// power saving mode: that can change without any event reaching us. Every
+    /// other change (the tray toggle, the settings) wakes the loop itself.
+    fn power_check_deadline(&self) -> Option<Instant> {
+        self.state
+            .settings
+            .power_saving_auto
+            .then(|| self.state.power_checked_at + POWER_CHECK_INTERVAL)
     }
 
     /// The earliest moment the tray loop has something to do without being
     /// woken by an event: a notice to take down, the meeting clock, a cleanup
-    /// retry, the engine release or the settings fallback poll. `None` means
+    /// retry, the power supply check or the settings fallback poll. `None` means
     /// it can sleep until the next event.
     fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let notice = self
@@ -821,54 +981,13 @@ impl AppHandler {
             notice,
             meeting_clock,
             repair,
-            self.state.engine_idle.deadline(),
+            self.power_check_deadline(),
+            self.stop_poll_deadline(now),
             self.state.settings_check_at,
         ]
         .into_iter()
         .flatten()
         .min()
-    }
-}
-
-/// When to unload the speech engine: once nothing has needed it for
-/// [`ENGINE_IDLE_RELEASE`].
-#[derive(Debug, Default)]
-struct EngineIdle {
-    /// Since when nothing has needed the engine.
-    since: Option<Instant>,
-    /// The worker was told to unload it, and nothing has loaded it since.
-    released: bool,
-}
-
-impl EngineIdle {
-    /// Note whether the engine is `idle` at `now`; true once it is time to
-    /// tell the worker to release it (once per idle stretch).
-    fn release_due(&mut self, idle: bool, now: Instant) -> bool {
-        if !idle {
-            self.since = None;
-            return false;
-        }
-        let since = *self.since.get_or_insert(now);
-        if self.released || now.duration_since(since) < ENGINE_IDLE_RELEASE {
-            return false;
-        }
-        self.released = true;
-        true
-    }
-
-    /// When [`EngineIdle::release_due`] says yes if nothing changes before.
-    fn deadline(&self) -> Option<Instant> {
-        if self.released {
-            None
-        } else {
-            self.since.map(|since| since + ENGINE_IDLE_RELEASE)
-        }
-    }
-
-    /// Something will load the engine again (a job, or a prepare). Returns
-    /// whether it had been released.
-    fn reload_requested(&mut self) -> bool {
-        std::mem::take(&mut self.released)
     }
 }
 
@@ -917,16 +1036,19 @@ impl ApplicationHandler<UserEvent> for AppHandler {
                 output,
                 markdown,
                 window,
+                stop,
             } => {
                 self.state.file_import_running = false;
-                self.dispatch_file(path, samples, output, markdown, window);
+                if stop.load(Ordering::Acquire) {
+                    // Stopped while the file was being read.
+                    info!(file = %path.display(), "transcription stopped before it started");
+                    let _ = window.send(WindowMsg::Stopped);
+                } else {
+                    self.dispatch_file(path, samples, output, markdown, window, stop);
+                }
             }
             UserEvent::MeetingNotesChoice(create_notes) => {
                 self.finish_pending_meeting(create_notes);
-            }
-            UserEvent::FileChosen => {
-                // Decoding takes a while; load the engine meanwhile.
-                self.prepare_engine();
             }
             UserEvent::Menu(id) => self.handle_menu(el, id),
             // Drained in `about_to_wait`, which runs after every wake.
@@ -973,7 +1095,42 @@ impl ApplicationHandler<UserEvent> for AppHandler {
 
 impl AppHandler {
     fn tick(&mut self, el: &ActiveEventLoop) {
+        // Stop pressed in a transcript window: tell the worker once.
+        for (id, job) in self.state.file_jobs.iter_mut() {
+            if !job.stop_sent
+                && job
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.load(Ordering::Acquire))
+            {
+                job.stop_sent = true;
+                info!(id, "transcription stop requested");
+                self.state.worker.stop_job(*id);
+            }
+        }
         while let Some(event) = self.state.worker.try_recv() {
+            // What the Jobs window shows.
+            match &event {
+                WorkerEvent::JobStarted { id } => {
+                    self.state.running_jobs.insert(*id);
+                }
+                WorkerEvent::JobProgress {
+                    id,
+                    stage,
+                    done,
+                    total,
+                } => {
+                    self.state.running_jobs.insert(*id);
+                    self.state.job_progress.insert(*id, (*stage, *done, *total));
+                }
+                WorkerEvent::JobCompleted { id, .. }
+                | WorkerEvent::JobFailed { id, .. }
+                | WorkerEvent::JobDiscarded { id } => {
+                    self.state.running_jobs.remove(id);
+                    self.state.job_progress.remove(id);
+                }
+                _ => {}
+            }
             let finished = match &event {
                 WorkerEvent::JobCompleted { id, .. }
                 | WorkerEvent::JobFailed { id, .. }
@@ -988,6 +1145,9 @@ impl AppHandler {
         }
         self.sync_overlay();
         self.sync_meeting_indicator();
+        self.update_jobs_window();
+        self.sync_repairs_to_disk();
+        self.poll_power();
 
         let meeting_status = self
             .state
@@ -1027,7 +1187,6 @@ impl AppHandler {
                 (!self.state.settings_watched).then(|| now + SETTINGS_POLL_FALLBACK);
             self.check_settings();
         }
-        self.release_idle_engine(now);
     }
 
     /// One click on a tray menu item.
@@ -1112,6 +1271,27 @@ impl AppHandler {
             }
             return;
         }
+        if id == self.state.tray.menu_jobs_id {
+            if self
+                .state
+                .jobs_window
+                .as_ref()
+                .is_some_and(|window| window.is_open())
+            {
+                info!("jobs window already open");
+            } else {
+                match crate::jobs_window::JobsWindow::open() {
+                    Ok(window) => self.state.jobs_window = Some(window),
+                    Err(error) => warn!(error = %error, "could not open the jobs window"),
+                }
+                self.update_jobs_window();
+            }
+            return;
+        }
+        if id == self.state.tray.menu_power_saving_id {
+            self.toggle_power_saving();
+            return;
+        }
         if id == self.state.tray.menu_meeting_pause_id {
             self.toggle_meeting_pause();
             return;
@@ -1183,6 +1363,7 @@ impl AppHandler {
                             if self.state.settings.show_meeting_indicator != old_indicator {
                                 // A saved change replaces any tray toggle.
                                 self.state.meeting_indicator_override = None;
+                                self.sync_overlay();
                                 self.sync_meeting_indicator();
                             }
                             if self.state.settings.overlay != old_overlay {
@@ -1263,7 +1444,6 @@ impl AppHandler {
                     let _ = proxy.send_event(UserEvent::FileImportEnded(None));
                     return;
                 };
-                let _ = proxy.send_event(UserEvent::FileChosen);
                 let event = import_file(path, markdown, cleanup, cleanup_engine, engine);
                 let _ = proxy.send_event(event);
             });
@@ -1280,6 +1460,7 @@ impl AppHandler {
         output: PathBuf,
         markdown: bool,
         window: mpsc::Sender<WindowMsg>,
+        stop: Arc<AtomicBool>,
     ) {
         let name = source
             .file_name()
@@ -1301,9 +1482,12 @@ impl AppHandler {
                 format_duration(seconds)
             ),
             window: Some(window),
+            stop: Some(stop),
+            stop_sent: false,
             background: false,
             session: None,
             partial: None,
+            spool: None,
         };
         self.dispatch_long_form(samples, job, "file");
     }
@@ -1315,6 +1499,357 @@ impl AppHandler {
             });
             return;
         }
+        self.state.power = power::status();
+        // Jobs go to the worker in the order they came: when power saving has
+        // just ended, the waiting ones start before this one.
+        if !self.hold_for_power() && self.engine_ready() {
+            self.release_held_jobs();
+        }
+        let job = if self.hold_for_power() || !self.state.held.is_empty() {
+            match self.hold_job(&samples, job, kind) {
+                Ok(()) => return,
+                Err(job) => job,
+            }
+        } else {
+            job
+        };
+        self.enqueue_long_form(samples, job, kind);
+    }
+
+    fn engine_ready(&self) -> bool {
+        matches!(self.state.engine_state, EngineState::Ready { .. })
+    }
+
+    /// Power saving is on: the saved toggle, or Windows' battery saver when
+    /// the setting says to follow it, unless the tray overrode that.
+    fn power_saving_on(&self) -> bool {
+        let following = self.state.settings.power_saving_auto;
+        match &self.state.power_override {
+            Some(over) if following => over.on,
+            _ => power::saving_on(
+                self.state.settings.power_saving,
+                following,
+                self.state.power,
+            ),
+        }
+    }
+
+    /// Work waits: power saving is on.
+    fn hold_for_power(&self) -> bool {
+        self.power_saving_on()
+    }
+
+    /// Keep the job and its audio on disk until power saving ends. The job
+    /// comes back when it could not be saved: it is then done at once rather
+    /// than lost.
+    fn hold_job(
+        &mut self,
+        samples: &[f32],
+        mut job: FileJob,
+        kind: &str,
+    ) -> std::result::Result<(), FileJob> {
+        let spooled = SpooledJob {
+            id: 0,
+            kind: kind.into(),
+            output: job.output.clone(),
+            markdown: job.markdown,
+            notes: job.notes,
+            notes_output: job.notes_output.clone(),
+            title: job.title.clone(),
+            details: job.details.clone(),
+            background: job.background,
+            session: job.session.clone(),
+            partial: job.partial.clone(),
+        };
+        match self.state.spool.save(&spooled, samples) {
+            Ok(id) => {
+                let first = self.state.held.is_empty();
+                job.spool = Some(id);
+                job.tell_window(WindowMsg::Stage {
+                    stage: transcript_window::Stage::Queued,
+                    done: 0,
+                    total: 0,
+                });
+                info!(id, kind, "job kept on disk until power saving ends");
+                self.state.held.push(HeldJob {
+                    spool_id: id,
+                    job,
+                    kind: kind.to_string(),
+                });
+                if first {
+                    let message = if self.state.settings.power_saving_auto {
+                        "Windows power saving is on: transcription waits until it is off"
+                    } else {
+                        "Power saving is on: transcription waits until you turn it off"
+                    };
+                    self.show_overlay_notice(NoticeKind::Info, message);
+                }
+                self.update_job_status();
+                Ok(())
+            }
+            Err(error) => {
+                warn!(error = %error, kind, "could not keep the job on disk; doing it now");
+                Err(job)
+            }
+        }
+    }
+
+    /// Give the held jobs to the worker, oldest first. Their files stay on
+    /// disk until each job is done.
+    fn release_held_jobs(&mut self) {
+        let held = std::mem::take(&mut self.state.held);
+        if held.is_empty() {
+            return;
+        }
+        info!(
+            count = held.len(),
+            "power saving ended: starting the waiting jobs"
+        );
+        for HeldJob {
+            spool_id,
+            job,
+            kind,
+        } in held
+        {
+            match self.state.spool.load_samples(spool_id) {
+                Ok(samples) => self.enqueue_long_form(samples, job, &kind),
+                Err(error) => {
+                    warn!(error = %error, id = spool_id, "the audio of a waiting job could not be read");
+                    job.tell_window(WindowMsg::Failed {
+                        error: "the saved audio could not be read".into(),
+                    });
+                }
+            }
+        }
+        self.update_job_status();
+    }
+
+    /// Delete the files of a finished job.
+    fn forget_spooled(&self, job: &Option<FileJob>) {
+        if let Some(id) = job.as_ref().and_then(|job| job.spool) {
+            self.state.spool.remove(id);
+        }
+    }
+
+    /// Pick up the jobs an earlier run left on disk (the battery ran out,
+    /// HouWritr was closed, or the PC restarted before they were done).
+    fn recover_spooled_jobs(&mut self) {
+        self.state.spool.sweep();
+        let (jobs, unreadable) = self.state.spool.list();
+        for path in unreadable {
+            warn!(file = %path.display(), "a waiting job on disk could not be read; leaving it");
+        }
+        for spooled in jobs {
+            if let Some((part, _)) = &spooled.session {
+                self.state.next_meeting_session = self.state.next_meeting_session.max(part.id + 1);
+            }
+            info!(id = spooled.id, kind = %spooled.kind, "picked up a job left on disk");
+            self.state.held.push(HeldJob {
+                spool_id: spooled.id,
+                kind: spooled.kind,
+                job: FileJob {
+                    output: spooled.output,
+                    markdown: spooled.markdown,
+                    notes: spooled.notes,
+                    notes_output: spooled.notes_output,
+                    title: spooled.title,
+                    details: spooled.details,
+                    window: None,
+                    stop: None,
+                    stop_sent: false,
+                    background: spooled.background,
+                    session: spooled.session,
+                    partial: spooled.partial,
+                    spool: Some(spooled.id),
+                },
+            });
+        }
+    }
+
+    /// Pick up the cleanup retries an earlier run had not finished.
+    fn recover_repairs(&mut self) {
+        let Some(bytes) = self.state.spool.load_repairs() else {
+            return;
+        };
+        let records: Vec<RepairRecord> = match serde_json::from_slice(&bytes) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(error = %error, "the saved cleanup retries could not be read; leaving them");
+                return;
+            }
+        };
+        for record in records {
+            info!(file = %record.output.display(), "picked up an unfinished cleanup retry");
+            self.state.next_repair_id = self.state.next_repair_id.max(record.id + 1);
+            self.state.repairs.push(Repair {
+                id: record.id,
+                name: record.name,
+                plan: record.plan,
+                output: record.output,
+                notes_output: record.notes_output,
+                markdown: record.markdown,
+                title: record.title,
+                details: record.details,
+                last_written: record.last_written,
+                best_cleaned: record.best_cleaned,
+                failed_rounds: record.failed_rounds,
+                next_attempt: Instant::now() + Duration::from_secs(30),
+                in_flight: None,
+                window: None,
+            });
+        }
+        self.sync_repairs_to_disk();
+    }
+
+    /// Keep the unfinished cleanup retries on disk: written when they change,
+    /// deleted when none are left.
+    fn sync_repairs_to_disk(&mut self) {
+        let bytes = if self.state.repairs.is_empty() {
+            Vec::new()
+        } else {
+            let records: Vec<RepairRecord> = self
+                .state
+                .repairs
+                .iter()
+                .map(|repair| RepairRecord {
+                    id: repair.id,
+                    name: repair.name.clone(),
+                    plan: repair.plan.clone(),
+                    output: repair.output.clone(),
+                    notes_output: repair.notes_output.clone(),
+                    markdown: repair.markdown,
+                    title: repair.title.clone(),
+                    details: repair.details.clone(),
+                    last_written: repair.last_written.clone(),
+                    best_cleaned: repair.best_cleaned.clone(),
+                    failed_rounds: repair.failed_rounds,
+                })
+                .collect();
+            serde_json::to_vec(&records).unwrap_or_default()
+        };
+        let print = fingerprint(&bytes);
+        if print == self.state.repairs_saved {
+            return;
+        }
+        // Whatever happens, do not try again until something changes.
+        self.state.repairs_saved = print;
+        if bytes.is_empty() {
+            self.state.spool.clear_repairs();
+        } else if let Err(error) = self.state.spool.save_repairs(&bytes) {
+            warn!(error = %error, "could not keep the cleanup retries on disk");
+        }
+    }
+
+    /// Every couple of seconds: look at the power supply, show the power
+    /// saving mode in the tray, and start the waiting jobs once power saving
+    /// is off and the engine is ready.
+    fn poll_power(&mut self) {
+        if self.state.power_checked_at.elapsed() < POWER_CHECK_INTERVAL {
+            return;
+        }
+        self.state.power_checked_at = Instant::now();
+        let held_before = self.hold_for_power();
+        self.state.power = power::status();
+        // The override ends when the setting no longer follows Windows.
+        if self.state.power_override.is_some() && !self.state.settings.power_saving_auto {
+            self.state.power_override = None;
+            info!("power saving follows Windows again");
+        }
+        let shown = (
+            self.power_saving_on(),
+            self.state.settings.power_saving_auto,
+            self.state.power_override.is_some(),
+        );
+        if self.state.power_mode_shown != Some(shown) {
+            self.state.power_mode_shown = Some(shown);
+            self.state.tray.set_power_saving(shown.0, shown.1, shown.2);
+        }
+        let holding = self.hold_for_power();
+        if holding != held_before {
+            info!(
+                holding,
+                battery_saver = self.state.power.battery_saver,
+                "power state changed"
+            );
+        }
+        self.drop_stopped_held_jobs();
+        if !holding
+            && !self.state.held.is_empty()
+            && !self.state.shutting_down
+            && self.engine_ready()
+        {
+            if held_before {
+                let count = self.state.held.len();
+                self.show_overlay_notice(
+                    NoticeKind::Info,
+                    format!(
+                        "Power saving ended: starting {count} waiting job{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                );
+            }
+            self.release_held_jobs();
+        }
+    }
+
+    /// Stop pressed in the window of a job that is still waiting for power:
+    /// it is dropped, and its files deleted.
+    fn drop_stopped_held_jobs(&mut self) {
+        let (stopped, waiting): (Vec<HeldJob>, Vec<HeldJob>) = std::mem::take(&mut self.state.held)
+            .into_iter()
+            .partition(|held| {
+                held.job
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.load(Ordering::Acquire))
+            });
+        self.state.held = waiting;
+        for held in stopped {
+            info!(id = held.spool_id, "waiting job stopped by the user");
+            self.state.spool.remove(held.spool_id);
+            held.job.tell_window(WindowMsg::Stopped);
+        }
+    }
+
+    /// The tray toggle was clicked. Normally the choice is kept in
+    /// settings.json. While following Windows it only overrides Windows'
+    /// power saving mode, until that changes.
+    fn toggle_power_saving(&mut self) {
+        let on = self.state.tray.power_saving_checked();
+        if self.state.settings.power_saving_auto {
+            self.state.power = power::status();
+            // Clicking it back to what Windows says is following Windows.
+            self.state.power_override =
+                (on != self.state.power.battery_saver).then_some(PowerOverride { on });
+            info!(on, "power saving overridden from the tray");
+        } else {
+            match Settings::load().and_then(|mut saved| {
+                saved.power_saving = on;
+                saved.save().map(|()| saved)
+            }) {
+                Ok(_) => info!(on, "power saving changed from the tray"),
+                Err(error) => warn!(error = %error, "could not save the power saving choice"),
+            }
+            self.state.settings.power_saving = on;
+        }
+        self.state.power_mode_shown = None;
+        self.state.power_checked_at = Instant::now()
+            .checked_sub(POWER_CHECK_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        self.show_overlay_notice(
+            NoticeKind::Info,
+            match (on, self.state.settings.power_saving_auto) {
+                (true, true) => "Power saving on for this session, whatever Windows says",
+                (false, true) => "Power saving off for this session, whatever Windows says",
+                (true, false) => {
+                    "Power saving on: recordings wait before transcription until you turn it off"
+                }
+                (false, false) => "Power saving off",
+            },
+        );
+    }
+
+    fn enqueue_long_form(&mut self, samples: Vec<f32>, job: FileJob, kind: &str) {
         let config = match &job.session {
             Some((part, settings)) => JobConfig::meeting_part(settings.clone(), *part, job.notes),
             None if job.notes => JobConfig::meeting_notes(self.state.settings.clone()),
@@ -1326,8 +1861,6 @@ impl AppHandler {
             .enqueue(samples, media::TARGET_RATE, config)
         {
             Ok(id) => {
-                // The worker loads a released engine again for this job.
-                self.state.engine_idle.reload_requested();
                 let windowed = job.overlay_free();
                 job.tell_window(WindowMsg::Stage {
                     stage: transcript_window::Stage::Queued,
@@ -1403,6 +1936,7 @@ impl AppHandler {
         let show = !self.meeting_indicator_visible();
         self.state.meeting_indicator_override = Some(show);
         self.state.tray.set_meeting_indicator_visible(show);
+        self.sync_overlay();
         self.sync_meeting_indicator();
         if self.state.meeting.is_some() {
             // Hiding must never be silent while a recording is running.
@@ -1439,9 +1973,6 @@ impl AppHandler {
                     settings: self.state.settings.clone(),
                 });
                 self.state.meeting = Some(recorder);
-                // The first part is due in five minutes; load the engine now
-                // so a problem with it shows up while the meeting starts.
-                self.prepare_engine();
                 self.state
                     .tray
                     .set_meeting_state(tray::MeetingMenuState::Recording);
@@ -1557,9 +2088,12 @@ impl AppHandler {
                 title: String::new(),
                 details: String::new(),
                 window: None,
+                stop: None,
+                stop_sent: false,
                 background: true,
                 session: Some((part, settings.clone())),
                 partial: None,
+                spool: None,
             };
             self.dispatch_long_form(segment.samples[range].to_vec(), job, "meeting part");
         }
@@ -1657,8 +2191,11 @@ impl AppHandler {
             notes: create_notes,
             notes_output,
             window: None,
+            stop: None,
+            stop_sent: false,
             background: false,
             partial: Some(pending.session.partial),
+            spool: None,
             session: Some((part, pending.session.settings)),
             title: format!(
                 "Meeting {:04}-{:02}-{:02} {:02}:{:02}",
@@ -1789,9 +2326,12 @@ impl AppHandler {
                 "Saved without {missing}: {}.",
                 cleanup_failure_text(reason)
             ));
-        } else if let Some(summary) = &summary {
-            warnings.push(format!("AI cleanup incomplete: {summary}."));
         }
+        let notice = if cleanup_warning.is_none() {
+            cleanup.as_ref().and_then(cleanup_notice)
+        } else {
+            None
+        };
         if retrying {
             warnings.push("HouWritr will retry automatically and update the file.".into());
         }
@@ -1811,6 +2351,7 @@ impl AppHandler {
             chars,
             preview,
             warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+            notice,
             speakers,
         });
         // The popup has "Show in folder"; only pop Explorer open ourselves
@@ -1911,12 +2452,24 @@ impl AppHandler {
             failed_rounds: 0,
             next_attempt: Instant::now() + Duration::from_secs(REPAIR_BACKOFF_SECONDS[0]),
             in_flight: None,
+            window: job.window.clone(),
         });
+        if let Some(repair) = self.state.repairs.last() {
+            repair.tell(
+                format!(
+                    "Saved, but {} is unfinished; trying again in the background in about {}.",
+                    repair.what(),
+                    minutes(REPAIR_BACKOFF_SECONDS[0])
+                ),
+                false,
+                false,
+            );
+        }
     }
 
     /// Start the next retry of every delivered transcript that is due.
     fn run_due_repairs(&mut self) {
-        if self.state.shutting_down || self.state.repairs.is_empty() {
+        if self.state.shutting_down || self.state.repairs.is_empty() || self.hold_for_power() {
             return;
         }
         let now = Instant::now();
@@ -1944,7 +2497,17 @@ impl AppHandler {
                 .enqueue(Vec::new(), media::TARGET_RATE, config)
             {
                 Ok(job_id) => {
-                    self.state.repairs[index].in_flight = Some(job_id);
+                    let repair = &mut self.state.repairs[index];
+                    repair.in_flight = Some(job_id);
+                    let attempt = repair.failed_rounds + 1;
+                    repair.tell(
+                        format!(
+                            "Retrying {} in the background (try {attempt})…",
+                            repair.what()
+                        ),
+                        true,
+                        false,
+                    );
                     self.state.repair_jobs.insert(job_id, (repair_id, step));
                 }
                 Err(error) => {
@@ -2025,6 +2588,11 @@ impl AppHandler {
             if let Err(reason) = self.rewrite_repaired_transcript(index) {
                 // Most likely the file was edited or moved: leave it alone.
                 let repair = self.state.repairs.remove(index);
+                repair.tell(
+                    format!("Left the file as it is ({reason}); retries stopped."),
+                    false,
+                    true,
+                );
                 warn!(file = %repair.output.display(), reason, "stopping cleanup retries");
                 self.show_job_warning(&format!(
                     "Left {} as it is ({reason}); automatic cleanup stopped",
@@ -2037,10 +2605,23 @@ impl AppHandler {
         let repair = &mut self.state.repairs[index];
         if repair.plan.is_complete() {
             let repair = self.state.repairs.remove(index);
+            repair.tell(
+                format!(
+                    "{} finished in the background; the file was updated.",
+                    repair.what()
+                ),
+                false,
+                true,
+            );
             info!(file = %repair.output.display(), "transcript cleanup finished in the background");
             self.show_job_success(&format!("Finished cleaning up {}", repair.name));
         } else if progressed {
             repair.next_attempt = Instant::now() + REPAIR_STEP_PAUSE;
+            repair.tell(
+                format!("Part of {} done; continuing in a moment…", repair.what()),
+                false,
+                false,
+            );
         } else {
             self.schedule_repair_retry(index);
         }
@@ -2062,6 +2643,11 @@ impl AppHandler {
             return;
         };
         let repair = self.state.repairs.remove(index);
+        repair.tell(
+            format!("Stopped retrying: the provider rejected the request (HTTP {status})."),
+            false,
+            true,
+        );
         warn!(
             file = %repair.output.display(),
             status,
@@ -2094,9 +2680,28 @@ impl AppHandler {
         let repair = &mut self.state.repairs[index];
         repair.failed_rounds += 1;
         match repair_delay(repair.failed_rounds) {
-            Some(delay) => repair.next_attempt = Instant::now() + delay,
+            Some(delay) => {
+                repair.next_attempt = Instant::now() + delay;
+                repair.tell(
+                    format!(
+                        "{} did not finish this time; trying again in about {}.",
+                        repair.what(),
+                        minutes(delay.as_secs())
+                    ),
+                    false,
+                    false,
+                );
+            }
             None => {
                 let repair = self.state.repairs.remove(index);
+                repair.tell(
+                    format!(
+                        "Could not finish {}; the file keeps the recognised text.",
+                        repair.what()
+                    ),
+                    false,
+                    true,
+                );
                 warn!(file = %repair.output.display(), "giving up on background cleanup");
                 self.show_job_warning(&format!(
                     "Could not finish cleaning up {}; it stays as recognised",
@@ -2130,9 +2735,26 @@ impl AppHandler {
         match event {
             // Background retries of AI cleanup / notes never touch the
             // overlay, the job counters or the tray.
-            WorkerEvent::JobStarted { id }
-            | WorkerEvent::EnhancementStarted { id }
-            | WorkerEvent::JobProgress { id, .. }
+            WorkerEvent::JobProgress {
+                id, done, total, ..
+            } if self.state.repair_jobs.contains_key(&id) => {
+                // Only the popup of the retried transcript hears of it.
+                let repair_id = self.state.repair_jobs[&id].0;
+                if let Some(window) = self
+                    .state
+                    .repairs
+                    .iter()
+                    .find(|repair| repair.id == repair_id)
+                    .and_then(|repair| repair.window.as_ref())
+                {
+                    let _ = window.send(WindowMsg::Stage {
+                        stage: transcript_window::Stage::CleaningUp,
+                        done,
+                        total,
+                    });
+                }
+            }
+            WorkerEvent::JobStarted { id } | WorkerEvent::EnhancementStarted { id }
                 if self.state.repair_jobs.contains_key(&id) => {}
             WorkerEvent::JobCompleted {
                 id,
@@ -2200,8 +2822,6 @@ impl AppHandler {
                     label: label.clone(),
                 };
                 self.state.model_state = Some(ModelState::Ready);
-                // Loaded now; released again once idle for long enough.
-                self.state.engine_idle = EngineIdle::default();
                 if self.state.pending_jobs == 0 {
                     self.update_job_status();
                 }
@@ -2295,6 +2915,7 @@ impl AppHandler {
                 enhancement_warning,
             } => {
                 let file_output = self.state.file_jobs.remove(&id);
+                self.forget_spooled(&file_output);
                 let windowed = file_output.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
@@ -2338,6 +2959,9 @@ impl AppHandler {
             }
             WorkerEvent::JobFailed { id, error } => {
                 let file_job = self.state.file_jobs.remove(&id);
+                if !self.state.shutting_down {
+                    self.forget_spooled(&file_job);
+                }
                 let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
@@ -2370,6 +2994,11 @@ impl AppHandler {
             }
             WorkerEvent::JobDiscarded { id } => {
                 let file_job = self.state.file_jobs.remove(&id);
+                // Dropped because the app is closing: the job is not done, so
+                // its files stay for the next start.
+                if !self.state.shutting_down && !self.state.discarding_jobs {
+                    self.forget_spooled(&file_job);
+                }
                 let windowed = file_job.as_ref().is_some_and(FileJob::overlay_free);
                 let finished = if windowed {
                     self.finish_windowed_job(id)
@@ -2380,30 +3009,18 @@ impl AppHandler {
                     return;
                 }
                 if let Some(job) = file_job {
-                    job.tell_window(WindowMsg::Failed {
-                        error: "Cancelled because HouWritr is quitting".into(),
-                    });
+                    if job.stop_sent {
+                        job.tell_window(WindowMsg::Stopped);
+                        info!(id, "transcription job stopped by the user");
+                    } else {
+                        job.tell_window(WindowMsg::Failed {
+                            error: "Cancelled because HouWritr is quitting".into(),
+                        });
+                    }
                 }
                 info!(id, "transcription job discarded");
                 self.update_job_status();
                 self.sync_overlay();
-            }
-            WorkerEvent::EngineReloadFailed {
-                generation,
-                engine,
-                error,
-            } => {
-                if generation != self.state.load_generation || engine != self.state.settings.engine
-                {
-                    return;
-                }
-                // The job that follows tries again and reports its own
-                // outcome; say now that it may not work.
-                warn!(engine, error = %error, "the speech engine could not be loaded ahead of a job");
-                self.show_job_warning(&format!(
-                    "Could not load the speech engine: {}",
-                    short_error(&error)
-                ));
             }
             WorkerEvent::ShutdownComplete => {
                 info!("worker shutdown complete");
@@ -2419,6 +3036,157 @@ impl AppHandler {
             .file_jobs
             .get(&id)
             .is_some_and(FileJob::overlay_free)
+    }
+
+    /// Act on Stop presses in the Jobs window and show it the current list.
+    fn update_jobs_window(&mut self) {
+        let Some(window) = &self.state.jobs_window else {
+            return;
+        };
+        if !window.is_open() {
+            self.state.jobs_window = None;
+            return;
+        }
+        for key in window.take_stops() {
+            self.stop_from_jobs_window(&key);
+        }
+        let rows = self.job_rows();
+        if let Some(window) = self.state.jobs_window.as_mut() {
+            window.show(rows);
+        }
+    }
+
+    fn stop_from_jobs_window(&mut self, key: &str) {
+        if let Some(id) = key
+            .strip_prefix("job:")
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            // The same path as Stop in the job's own window (see `tick`).
+            if let Some(stop) = self
+                .state
+                .file_jobs
+                .get(&id)
+                .and_then(|job| job.stop.as_ref())
+            {
+                stop.store(true, Ordering::Release);
+            }
+        } else if let Some(repair_id) = key
+            .strip_prefix("retry:")
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            let Some(index) = self
+                .state
+                .repairs
+                .iter()
+                .position(|repair| repair.id == repair_id)
+            else {
+                return;
+            };
+            let repair = self.state.repairs.remove(index);
+            if let Some(job_id) = repair.in_flight {
+                self.state.worker.stop_job(job_id);
+            }
+            info!(file = %repair.output.display(), "background cleanup cancelled from the jobs window");
+            repair.tell(
+                "Retry cancelled; the file keeps the recognised text.".into(),
+                false,
+                true,
+            );
+        }
+    }
+
+    /// Everything running or waiting, for the Jobs window.
+    fn job_rows(&self) -> Vec<crate::jobs_window::JobRow> {
+        use crate::jobs_window::JobRow;
+        let mut rows = Vec::new();
+        if let Some(meeting) = &self.state.meeting {
+            rows.push(JobRow {
+                key: "meeting".into(),
+                kind: "Meeting".into(),
+                name: "Recording".into(),
+                state: format!(
+                    "Recording for {} · stop it from the tray menu",
+                    transcript_window::format_clock(meeting.elapsed().as_secs())
+                ),
+                fraction: None,
+                stop_label: None,
+            });
+        }
+        for held in &self.state.held {
+            let kind = match &held.job.session {
+                Some((part, _)) if part.last => "Meeting (last part)",
+                Some(_) => "Meeting part",
+                None => "File",
+            };
+            let name = if held.job.title.is_empty() {
+                held.job
+                    .output
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                held.job.title.clone()
+            };
+            rows.push(JobRow {
+                key: format!("held:{}", held.spool_id),
+                kind: kind.into(),
+                name,
+                state: if self.state.settings.power_saving_auto {
+                    "Waiting for Windows power saving to end (saved on disk)".into()
+                } else {
+                    "Waiting for power saving to be turned off (saved on disk)".into()
+                },
+                fraction: None,
+                stop_label: None,
+            });
+        }
+        let mut ids: Vec<u64> = self.state.file_jobs.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let job = &self.state.file_jobs[&id];
+            let kind = match &job.session {
+                Some((part, _)) if part.last => "Meeting (last part)",
+                Some(_) => "Meeting part",
+                None => "File",
+            };
+            let (state, fraction) = if job.stop_sent {
+                ("Stopping…".to_string(), None)
+            } else if self.state.running_jobs.contains(&id) {
+                progress_text(self.state.job_progress.get(&id))
+            } else {
+                ("Queued".to_string(), None)
+            };
+            rows.push(JobRow {
+                key: format!("job:{id}"),
+                kind: kind.into(),
+                name: job.title.clone(),
+                state,
+                fraction,
+                stop_label: (job.stop.is_some() && !job.stop_sent).then(|| "Stop".into()),
+            });
+        }
+        let now = Instant::now();
+        for repair in &self.state.repairs {
+            let (state, fraction) = match repair.in_flight {
+                Some(job_id) => progress_text(self.state.job_progress.get(&job_id)),
+                None => (
+                    format!(
+                        "Next try in about {}",
+                        minutes(repair.next_attempt.saturating_duration_since(now).as_secs())
+                    ),
+                    None,
+                ),
+            };
+            rows.push(JobRow {
+                key: format!("retry:{}", repair.id),
+                kind: format!("{} retry", repair.what()),
+                name: repair.name.clone(),
+                state,
+                fraction,
+                stop_label: Some("Cancel".into()),
+            });
+        }
+        rows
     }
 
     fn tell_job_window(&self, id: u64, message: WindowMsg) {
@@ -2464,6 +3232,12 @@ impl AppHandler {
                     " · transcribing earlier parts ({} queued)",
                     self.state.pending_jobs
                 )
+            } else if !self.state.held.is_empty() {
+                format!(
+                    " · {} part{} waiting for power",
+                    self.state.held.len(),
+                    if self.state.held.len() == 1 { "" } else { "s" }
+                )
             } else {
                 String::new()
             };
@@ -2484,6 +3258,15 @@ impl AppHandler {
                 &format!(
                     "HouWritr — transcribing; {} {noun} remaining",
                     self.state.pending_jobs
+                ),
+            );
+        } else if !self.state.held.is_empty() && !self.state.shutting_down {
+            let count = self.state.held.len();
+            self.state.tray.set_status(
+                tray::IconColor::Transcribing,
+                &format!(
+                    "HouWritr — {count} job{} waiting for power (saved on disk)",
+                    if count == 1 { "" } else { "s" }
                 ),
             );
         } else if !self.state.shutting_down {
@@ -2580,6 +3363,7 @@ impl AppHandler {
         if self.state.shutting_down {
             return;
         }
+        self.sync_repairs_to_disk();
         // Queue the meeting recorded so far so quitting never loses it; the
         // existing "finish queued jobs?" prompt then covers it.
         self.stop_meeting(false);
@@ -2635,7 +3419,8 @@ fn import_file(
     engine: String,
 ) -> UserEvent {
     let (window, messages) = mpsc::channel();
-    if let Err(error) = transcript_window::spawn_window_thread(messages) {
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Err(error) = transcript_window::spawn_window_thread(messages, stop.clone()) {
         // The job still runs; the result is saved and revealed as usual.
         warn!(error = %error, "could not open the transcript window");
     }
@@ -2671,6 +3456,7 @@ fn import_file(
                 output,
                 markdown,
                 window,
+                stop,
             }
         }
         Err(error) => {
@@ -2747,10 +3533,42 @@ mod tests {
             title: String::new(),
             details: String::new(),
             window: window.then(|| std::sync::mpsc::channel().0),
+            stop: None,
+            stop_sent: false,
             background,
             session: None,
             partial: None,
+            spool: None,
         }
+    }
+
+    #[test]
+    fn partly_cleaned_text_gets_a_calm_notice_that_counts_what_was_kept() {
+        let report = |total, cleaned, unreachable| crate::enhance::CleanupReport {
+            partly: 0,
+            total,
+            cleaned,
+            unreachable,
+        };
+        assert_eq!(super::cleanup_notice(&report(48, 48, 0)), None);
+        assert_eq!(super::cleanup_notice(&report(0, 0, 0)), None);
+        let notice = super::cleanup_notice(&report(48, 39, 0)).unwrap();
+        assert!(notice.starts_with("AI cleanup finished: 39 of 48 sections cleaned."));
+        assert!(notice.contains("9 kept the recognised text"));
+        let notice = super::cleanup_notice(&crate::enhance::CleanupReport {
+            total: 48,
+            cleaned: 40,
+            partly: 5,
+            unreachable: 0,
+        })
+        .unwrap();
+        assert!(notice.contains("40 of 48 sections cleaned."));
+        assert!(notice.contains("5 more in part"));
+        assert!(notice.contains("3 kept the recognised text"));
+        assert!(!notice.contains("could not be sent"));
+        let notice = super::cleanup_notice(&report(48, 30, 8)).unwrap();
+        assert!(notice.contains("10 kept"));
+        assert!(notice.contains("8 could not be sent"));
     }
 
     #[test]
@@ -2775,55 +3593,7 @@ mod tests {
 
     // --- sleeping until there is something to do -------------------------
 
-    use super::{EngineIdle, ENGINE_IDLE_RELEASE};
     use std::time::Duration;
-
-    #[test]
-    fn the_engine_is_released_once_after_a_minute_with_nothing_to_do() {
-        let start = Instant::now();
-        let mut idle = EngineIdle::default();
-        assert!(!idle.release_due(true, start));
-        assert_eq!(idle.deadline(), Some(start + ENGINE_IDLE_RELEASE));
-        let almost = start + ENGINE_IDLE_RELEASE - Duration::from_millis(1);
-        assert!(!idle.release_due(true, almost));
-        assert!(idle.release_due(true, start + ENGINE_IDLE_RELEASE));
-        // Released: no more deadlines and no second release.
-        assert_eq!(idle.deadline(), None);
-        assert!(!idle.release_due(true, start + ENGINE_IDLE_RELEASE * 5));
-    }
-
-    #[test]
-    fn any_work_starts_the_idle_minute_again() {
-        let start = Instant::now();
-        let mut idle = EngineIdle::default();
-        assert!(!idle.release_due(true, start));
-        // A job runs for a while.
-        let busy = start + Duration::from_secs(50);
-        assert!(!idle.release_due(false, busy));
-        assert_eq!(idle.deadline(), None, "no release while busy");
-        let done = start + Duration::from_secs(80);
-        assert!(!idle.release_due(true, done));
-        assert!(!idle.release_due(true, done + ENGINE_IDLE_RELEASE - Duration::from_secs(1)));
-        assert_eq!(idle.deadline(), Some(done + ENGINE_IDLE_RELEASE));
-    }
-
-    #[test]
-    fn a_released_engine_is_prepared_once_and_released_again_after_more_work() {
-        let start = Instant::now();
-        let mut idle = EngineIdle::default();
-        assert!(!idle.reload_requested(), "loaded: nothing to prepare");
-        idle.release_due(true, start);
-        assert!(idle.release_due(true, start + ENGINE_IDLE_RELEASE));
-        assert!(idle.reload_requested(), "released: prepare it");
-        assert!(!idle.reload_requested(), "already being loaded");
-
-        // A job, then another idle minute, releases it again.
-        let busy = start + ENGINE_IDLE_RELEASE * 2;
-        idle.release_due(false, busy);
-        let done = busy + Duration::from_secs(10);
-        idle.release_due(true, done);
-        assert!(idle.release_due(true, done + ENGINE_IDLE_RELEASE));
-    }
 
     #[test]
     fn the_meeting_clock_wakes_just_after_each_second() {
@@ -2859,6 +3629,7 @@ mod tests {
             failed_rounds: 0,
             next_attempt,
             in_flight,
+            window: None,
         }
     }
 
@@ -2947,6 +3718,7 @@ mod tests {
         use super::cleanup_summary;
         use crate::enhance::CleanupReport;
         let report = |total, cleaned| CleanupReport {
+            partly: 0,
             total,
             cleaned,
             unreachable: 0,
@@ -3023,6 +3795,28 @@ mod tests {
         assert_eq!(
             reducer.desired_view(now),
             OverlayViewState::notice(NoticeKind::Warning, "old notice")
+        );
+    }
+
+    #[test]
+    fn progress_follows_the_recording_indicator_but_notices_still_show() {
+        let now = Instant::now();
+        let mut reducer = OverlayReducer::default();
+        reducer.job_queued(1);
+        assert!(reducer.job_started(1));
+        assert!(reducer.enhancement_started(1));
+        reducer.job_queued(2);
+        reducer.progress_visible = false;
+        assert_eq!(reducer.desired_view(now), OverlayViewState::Hidden);
+        reducer.show_notice(NoticeKind::Error, "something failed", now);
+        assert_eq!(
+            reducer.desired_view(now),
+            OverlayViewState::notice(NoticeKind::Error, "something failed")
+        );
+        reducer.progress_visible = true;
+        assert_eq!(
+            reducer.desired_view(now),
+            OverlayViewState::processing(1, ProcessingPhase::Enhancing, 1)
         );
     }
 

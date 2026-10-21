@@ -22,7 +22,7 @@ servers operated by us.
 - HouWritr never pastes text or puts it on the Windows clipboard.
 - **Files you transcribe and meetings you record are saved as transcript
   files**: next to the imported file, and meetings under
-  `Documents\OpenWritr\Meetings`. A transcript that cannot be saved there
+  `Documents\HouWritr\Meetings`. A transcript that cannot be saved there
   goes to `Documents\HouWritr`. They stay on your PC until you delete them.
 
 ## Network access
@@ -55,11 +55,24 @@ HouWritr connects to the internet only for:
    the model from Qualcomm AI Hub (several GB). Only loopback addresses are
    accepted for a local model.
 
+## Audio kept on disk while work waits
+
+Normally audio is only held in memory while it is transcribed. With **power
+saving** turned on (tray menu or Settings), HouWritr only records, and the
+audio that is waiting for power saving to be turned off is saved as files under `%LOCALAPPDATA%\HouWritr\pending\` (raw 16 kHz
+audio, uncompressed, not encrypted), together with a small file saying where
+the transcript goes. Each job's files are deleted when its transcript is
+done. Jobs that were not finished when HouWritr was closed, or the battery ran
+out, stay there and are picked up the next time the app starts. Unfinished
+AI cleanup retries (the text of the transcript) are kept in the same folder in
+`repairs.json` until they finish. Nothing in this folder is sent anywhere. You
+can delete the folder to discard everything that is waiting.
+
 ## Data stored on your device
 
 Settings, downloaded models, and a local diagnostic log are stored under
-`%LOCALAPPDATA%\OpenWritr\` on your machine (the folder keeps the name of
-the project HouWritr started from, so existing installs keep their models).
+`%LOCALAPPDATA%\HouWritr\` on your machine (an older OpenWritr folder is moved
+there the first time the app starts, so existing installs keep their models).
 They never leave it unless you choose to share a diagnostics export, which
 removes API keys and prompt text first. API keys you enter are kept in Windows
 Credential Manager, not in the settings file. Deleting that folder (or

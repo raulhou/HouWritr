@@ -1,7 +1,7 @@
 use crate::settings::Settings;
 use anyhow::Result;
 use image::{ImageBuffer, Rgba};
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub struct Tray {
@@ -17,10 +17,15 @@ pub struct Tray {
     pub menu_meeting_id: MenuId,
     pub menu_meeting_pause_id: MenuId,
     pub menu_meeting_indicator_id: MenuId,
+    pub menu_jobs_id: MenuId,
+    pub menu_power_saving_id: MenuId,
+    power_saving_item: CheckMenuItem,
     meeting_item: MenuItem,
     meeting_pause_item: MenuItem,
     meeting_indicator_item: MenuItem,
 }
+
+const POWER_SAVING_TEXT: &str = "Power saving: only record, transcribe later";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeetingMenuState {
@@ -38,7 +43,7 @@ pub enum IconColor {
 }
 
 impl Tray {
-    pub fn new(_s: &Settings) -> Result<Self> {
+    pub fn new(s: &Settings) -> Result<Self> {
         let menu = Menu::new();
         let info = MenuItem::new(
             "HouWritr — meetings and audio/video transcription",
@@ -52,6 +57,8 @@ impl Tray {
         let meeting = MenuItem::new("Start meeting recording", true, None);
         let meeting_pause = MenuItem::new("Pause meeting recording", false, None);
         let meeting_indicator = MenuItem::new("Hide recording indicator", true, None);
+        let jobs = MenuItem::new("Jobs…", true, None);
+        let power_saving = CheckMenuItem::new(POWER_SAVING_TEXT, true, s.power_saving, None);
         let transcribe_sep = PredefinedMenuItem::separator();
         let open_logs = MenuItem::new("Open logs", true, None);
         let export_diagnostics = MenuItem::new("Export diagnostics…", true, None);
@@ -69,6 +76,8 @@ impl Tray {
         menu.append(&meeting)?;
         menu.append(&meeting_pause)?;
         menu.append(&meeting_indicator)?;
+        menu.append(&jobs)?;
+        menu.append(&power_saving)?;
         menu.append(&transcribe_sep)?;
         menu.append(&open_logs)?;
         menu.append(&export_diagnostics)?;
@@ -87,6 +96,9 @@ impl Tray {
         Ok(Self {
             _icon: tray,
             menu_quit_id: quit.id().clone(),
+            menu_jobs_id: jobs.id().clone(),
+            menu_power_saving_id: power_saving.id().clone(),
+            power_saving_item: power_saving,
             menu_settings_id: settings.id().clone(),
             menu_about_id: about.id().clone(),
             menu_open_logs_id: open_logs.id().clone(),
@@ -130,6 +142,25 @@ impl Tray {
                 "Pause meeting recording"
             });
         self.meeting_pause_item.set_enabled(running);
+    }
+
+    /// Whether the power saving item is ticked (it flips itself on a click).
+    pub fn power_saving_checked(&self) -> bool {
+        self.power_saving_item.is_checked()
+    }
+
+    /// Show the power saving mode: ticked or not. When Windows' power saving
+    /// mode decides (`automatic`) the item still works: a click overrides
+    /// Windows for the session (`overridden`).
+    pub fn set_power_saving(&self, on: bool, automatic: bool, overridden: bool) {
+        self.power_saving_item.set_checked(on);
+        self.power_saving_item.set_enabled(true);
+        self.power_saving_item
+            .set_text(match (automatic, overridden) {
+                (false, _) => POWER_SAVING_TEXT,
+                (true, false) => "Power saving (following Windows, click to override)",
+                (true, true) => "Power saving (overriding Windows, this session)",
+            });
     }
 
     /// Menu text for the meeting recording indicator toggle.

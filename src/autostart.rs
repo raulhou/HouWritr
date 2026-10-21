@@ -1,4 +1,4 @@
-//! "Run at startup" backend — manages the OS autostart entry for OpenWritr.
+//! "Run at startup" backend — manages the OS autostart entry for HouWritr.
 //!
 //! This deliberately mirrors the `CredentialStore` trait shape in
 //! `src/credentials.rs`: a small backend trait, a concrete Windows
@@ -8,13 +8,13 @@
 //!
 //! Two mutually exclusive backends exist, picked at runtime by [`backend`]:
 //!
-//! * **Unpackaged** (installer + portable): a value named `OpenWritr` under
+//! * **Unpackaged** (installer + portable): a value named `HouWritr` under
 //!   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` pointing at the
 //!   current executable. Task Manager / Settings → Apps → Startup can disable
 //!   it; that disabled state is recorded under `...\Explorer\StartupApproved\Run`
 //!   and reported as [`AutostartState::DisabledByOs`].
 //! * **Packaged** (MSIX / Store): the `Windows.ApplicationModel.StartupTask`
-//!   WinRT API against the `OpenWritrStartup` task declared in the manifest.
+//!   WinRT API against the `HouWritrStartup` task declared in the manifest.
 //!
 //! A login start passes no arguments, and an argless launch already lands in
 //! tray mode (see `src/main.rs`), so autostart is silent by construction — no
@@ -26,7 +26,11 @@ use tracing::{info, warn};
 
 /// Registry value / manifest task id. Both backends use the same name so the
 /// installer, the in-app toggle, and the MSIX manifest all agree.
-pub const AUTOSTART_ENTRY_NAME: &str = "OpenWritr";
+pub const AUTOSTART_ENTRY_NAME: &str = "HouWritr";
+
+/// The name the Run value had before the app was renamed.
+#[cfg(windows)]
+const LEGACY_AUTOSTART_ENTRY_NAME: &str = "OpenWritr";
 
 #[derive(Debug, Error)]
 pub enum AutostartError {
@@ -168,6 +172,12 @@ pub trait RunRegistry {
     fn delete_run_value(&self) -> Result<(), AutostartError>;
     /// The raw `StartupApproved\Run` blob for our entry, if present.
     fn startup_approved(&self) -> Result<Option<Vec<u8>>, AutostartError>;
+    /// Remove the `Run` value the app had under its old name, if there is
+    /// one. `Some(true)` means it was there and still switched on,
+    /// `Some(false)` that it was there but turned off in Windows.
+    fn take_legacy_run_value(&self) -> Result<Option<bool>, AutostartError> {
+        Ok(None)
+    }
 }
 
 /// Task Manager records a disabled startup entry as a 12-byte blob whose first
@@ -215,7 +225,7 @@ impl<R: RunRegistry> RegistryRunBackend<R> {
         }
     }
 
-    /// Migrate a legacy `{userstartup}\OpenWritr.lnk` to the registry once: if
+    /// Migrate a legacy `{userstartup}\HouWritr.lnk` to the registry once: if
     /// the shortcut exists, treat autostart as enabled, write the Run value,
     /// delete the shortcut, and log it. Returns true if a migration happened.
     fn migrate_legacy_shortcut(&self) -> Result<bool, AutostartError> {
@@ -245,6 +255,22 @@ impl<R: RunRegistry> RegistryRunBackend<R> {
     }
 }
 
+impl<R: RunRegistry> RegistryRunBackend<R> {
+    /// Carry a startup entry saved under the old app name over to the new
+    /// one (a user who had switched it off in Windows stays switched off).
+    fn migrate_legacy_run_value(&self) -> Result<(), AutostartError> {
+        let Some(was_enabled) = self.registry.take_legacy_run_value()? else {
+            return Ok(());
+        };
+        if was_enabled && self.registry.run_value()?.is_none() {
+            let desired = self.desired()?.to_string();
+            self.registry.set_run_value(&desired)?;
+        }
+        info!(was_enabled, "moved the startup entry to the new app name");
+        Ok(())
+    }
+}
+
 impl<R: RunRegistry> AutostartBackend for RegistryRunBackend<R> {
     fn kind(&self) -> &'static str {
         "registry_run"
@@ -254,6 +280,7 @@ impl<R: RunRegistry> AutostartBackend for RegistryRunBackend<R> {
         // Legacy migration happens first so a fresh install that used the old
         // shortcut mechanism reports enabled and converges on the registry.
         self.migrate_legacy_shortcut()?;
+        self.migrate_legacy_run_value()?;
 
         let Some(current) = self.registry.run_value()? else {
             return Ok(AutostartState::Disabled);
@@ -298,7 +325,7 @@ impl<R: RunRegistry> AutostartBackend for RegistryRunBackend<R> {
     }
 }
 
-/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\OpenWritr.lnk`.
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\HouWritr.lnk`.
 fn legacy_startup_shortcut() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(
@@ -308,7 +335,7 @@ fn legacy_startup_shortcut() -> Option<PathBuf> {
             .join("Start Menu")
             .join("Programs")
             .join("Startup")
-            .join("OpenWritr.lnk"),
+            .join("HouWritr.lnk"),
     )
 }
 
@@ -501,6 +528,46 @@ mod win_registry {
             buffer.truncate(size_out as usize);
             Ok(Some(buffer))
         }
+
+        fn take_legacy_run_value(&self) -> Result<Option<bool>, AutostartError> {
+            take_legacy_run_value()
+        }
+    }
+
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const APPROVED_KEY: &str =
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+    fn reg(arguments: &[&str]) -> Option<String> {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("reg")
+            .args(arguments)
+            .creation_flags(0x0800_0000)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The first byte of the `REG_BINARY` data `reg query` printed.
+    fn first_byte(output: &str) -> Option<u8> {
+        let data = output.split("REG_BINARY").nth(1)?.trim();
+        u8::from_str_radix(data.get(..2)?, 16).ok()
+    }
+
+    pub fn take_legacy_run_value() -> Result<Option<bool>, AutostartError> {
+        let name = super::LEGACY_AUTOSTART_ENTRY_NAME;
+        if reg(&["query", RUN_KEY, "/v", name]).is_none() {
+            return Ok(None);
+        }
+        let disabled = reg(&["query", APPROVED_KEY, "/v", name])
+            .and_then(|output| first_byte(&output))
+            .is_some_and(|byte| byte != 2);
+        reg(&["delete", RUN_KEY, "/v", name, "/f"]);
+        reg(&["delete", APPROVED_KEY, "/v", name, "/f"]);
+        Ok(Some(!disabled))
     }
 
     fn decode_wide_sz(bytes: &[u8]) -> String {
@@ -648,6 +715,7 @@ mod tests {
     struct FakeRegistry {
         run: Mutex<Option<String>>,
         approved: Mutex<Option<Vec<u8>>>,
+        legacy: Mutex<Option<bool>>,
     }
 
     impl RunRegistry for FakeRegistry {
@@ -665,6 +733,9 @@ mod tests {
         fn startup_approved(&self) -> Result<Option<Vec<u8>>, AutostartError> {
             Ok(self.approved.lock().clone())
         }
+        fn take_legacy_run_value(&self) -> Result<Option<bool>, AutostartError> {
+            Ok(self.legacy.lock().take())
+        }
     }
 
     fn backend_with(registry: FakeRegistry, command: &str) -> RegistryRunBackend<FakeRegistry> {
@@ -672,15 +743,37 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_under_the_old_name_moves_to_the_new_one() {
+        let registry = FakeRegistry::default();
+        *registry.legacy.lock() = Some(true);
+        let backend = backend_with(registry, "\"C:\\app\\houwritr.exe\"");
+        assert_eq!(backend.state().unwrap(), AutostartState::Enabled);
+        assert_eq!(
+            backend.registry.run.lock().as_deref(),
+            Some("\"C:\\app\\houwritr.exe\"")
+        );
+        assert!(backend.registry.legacy.lock().is_none());
+    }
+
+    #[test]
+    fn an_old_entry_switched_off_in_windows_stays_off() {
+        let registry = FakeRegistry::default();
+        *registry.legacy.lock() = Some(false);
+        let backend = backend_with(registry, "\"C:\\app\\houwritr.exe\"");
+        assert_eq!(backend.state().unwrap(), AutostartState::Disabled);
+        assert!(backend.registry.run.lock().is_none());
+    }
+
+    #[test]
     fn enable_disable_read_round_trip() {
-        let backend = backend_with(FakeRegistry::default(), "\"C:\\app\\openwritr.exe\"");
+        let backend = backend_with(FakeRegistry::default(), "\"C:\\app\\houwritr.exe\"");
         assert_eq!(backend.state().unwrap(), AutostartState::Disabled);
 
         enable_verified(&backend).unwrap();
         assert_eq!(backend.state().unwrap(), AutostartState::Enabled);
         assert_eq!(
             backend.registry.run.lock().as_deref(),
-            Some("\"C:\\app\\openwritr.exe\"")
+            Some("\"C:\\app\\houwritr.exe\"")
         );
 
         disable_verified(&backend).unwrap();
@@ -691,24 +784,24 @@ mod tests {
     #[test]
     fn stale_path_is_repaired_on_read() {
         let registry = FakeRegistry::default();
-        *registry.run.lock() = Some("\"C:\\old\\location\\openwritr.exe\"".to_string());
-        let backend = backend_with(registry, "\"C:\\new\\location\\openwritr.exe\"");
+        *registry.run.lock() = Some("\"C:\\old\\location\\houwritr.exe\"".to_string());
+        let backend = backend_with(registry, "\"C:\\new\\location\\houwritr.exe\"");
 
         // Reading reports enabled and rewrites the drifted path in place.
         assert_eq!(backend.state().unwrap(), AutostartState::Enabled);
         assert_eq!(
             backend.registry.run.lock().as_deref(),
-            Some("\"C:\\new\\location\\openwritr.exe\"")
+            Some("\"C:\\new\\location\\houwritr.exe\"")
         );
     }
 
     #[test]
     fn startup_approved_disabled_blob_is_reported() {
         let registry = FakeRegistry::default();
-        *registry.run.lock() = Some("\"C:\\app\\openwritr.exe\"".to_string());
+        *registry.run.lock() = Some("\"C:\\app\\houwritr.exe\"".to_string());
         // Task Manager "disabled" blob: first byte 3.
         *registry.approved.lock() = Some(vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let backend = backend_with(registry, "\"C:\\app\\openwritr.exe\"");
+        let backend = backend_with(registry, "\"C:\\app\\houwritr.exe\"");
 
         match backend.state().unwrap() {
             AutostartState::DisabledByOs { reason } => assert!(!reason.is_empty()),
@@ -719,10 +812,10 @@ mod tests {
     #[test]
     fn startup_approved_enabled_blob_reports_enabled() {
         let registry = FakeRegistry::default();
-        *registry.run.lock() = Some("\"C:\\app\\openwritr.exe\"".to_string());
+        *registry.run.lock() = Some("\"C:\\app\\houwritr.exe\"".to_string());
         // Enabled blob: first byte 2.
         *registry.approved.lock() = Some(vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let backend = backend_with(registry, "\"C:\\app\\openwritr.exe\"");
+        let backend = backend_with(registry, "\"C:\\app\\houwritr.exe\"");
 
         assert_eq!(backend.state().unwrap(), AutostartState::Enabled);
     }
@@ -738,12 +831,12 @@ mod tests {
     #[test]
     fn legacy_shortcut_migration_writes_registry_and_deletes_shortcut() {
         let temp = tempfile::tempdir().unwrap();
-        let shortcut = temp.path().join("OpenWritr.lnk");
+        let shortcut = temp.path().join("HouWritr.lnk");
         std::fs::write(&shortcut, b"legacy").unwrap();
 
         let backend = RegistryRunBackend::with_parts(
             FakeRegistry::default(),
-            "\"C:\\app\\openwritr.exe\"".to_string(),
+            "\"C:\\app\\houwritr.exe\"".to_string(),
             Some(shortcut.clone()),
         );
 
@@ -751,7 +844,7 @@ mod tests {
         assert_eq!(backend.state().unwrap(), AutostartState::Enabled);
         assert_eq!(
             backend.registry.run.lock().as_deref(),
-            Some("\"C:\\app\\openwritr.exe\"")
+            Some("\"C:\\app\\houwritr.exe\"")
         );
         assert!(!shortcut.exists());
     }
@@ -759,11 +852,11 @@ mod tests {
     #[test]
     fn no_legacy_shortcut_leaves_state_disabled() {
         let temp = tempfile::tempdir().unwrap();
-        let shortcut = temp.path().join("OpenWritr.lnk");
+        let shortcut = temp.path().join("HouWritr.lnk");
         // Do not create the file.
         let backend = RegistryRunBackend::with_parts(
             FakeRegistry::default(),
-            "\"C:\\app\\openwritr.exe\"".to_string(),
+            "\"C:\\app\\houwritr.exe\"".to_string(),
             Some(shortcut),
         );
         assert_eq!(backend.state().unwrap(), AutostartState::Disabled);

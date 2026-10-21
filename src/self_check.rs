@@ -44,7 +44,7 @@ fn verify_writable_data_directory() -> Result<std::path::PathBuf> {
             .create_new(true)
             .open(&probe)
             .with_context(|| format!("create writable-data probe {}", probe.display()))?;
-        file.write_all(b"openwritr self-check\n")?;
+        file.write_all(b"houwritr self-check\n")?;
         file.sync_all()?;
         Ok(())
     })();

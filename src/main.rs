@@ -11,6 +11,7 @@ mod copilot_auth;
 mod credentials;
 mod diagnostics;
 mod enhance;
+mod jobs_window;
 mod local_llm;
 mod log_files;
 mod media;
@@ -24,6 +25,7 @@ mod self_check;
 mod settings;
 mod settings_ui;
 mod single_instance;
+mod spool;
 mod transcript_window;
 mod tray;
 mod worker;
@@ -37,6 +39,20 @@ fn main() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if is_self_check_mode(arguments.iter()) {
         return self_check::run();
+    }
+    if arguments
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(OsStr::new("--jobs-window")))
+    {
+        let _log_guard = init_tracing("jobs-window", false)?;
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            mode = "jobs-window",
+            build = build_id(),
+            "process starting"
+        );
+        return jobs_window::run_window();
     }
     if is_transcript_window_mode(arguments.iter()) {
         let _log_guard = init_tracing("transcript-window", false)?;
@@ -155,6 +171,7 @@ fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blockin
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
+        .with_timer(log_files::LocalTime)
         .with_ansi(false)
         .with_thread_ids(true)
         .with_thread_names(true);
@@ -163,15 +180,19 @@ fn init_tracing(mode: &str, owner: bool) -> Result<tracing_appender::non_blockin
     let recording_layer = owner.then(|| {
         tracing_subscriber::fmt::layer()
             .with_writer(log_files::RecordingWriter)
+            .with_timer(log_files::LocalTime)
             .with_ansi(false)
             .with_thread_ids(true)
             .with_thread_names(true)
     });
-    let console_layer =
-        cfg!(debug_assertions).then(|| tracing_subscriber::fmt::layer().with_ansi(false));
+    let console_layer = cfg!(debug_assertions).then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_timer(log_files::LocalTime)
+            .with_ansi(false)
+    });
 
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "openwritr=info".into()))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "houwritr=info".into()))
         .with(file_layer)
         .with(recording_layer)
         .with(console_layer)

@@ -72,6 +72,11 @@ pub enum WindowMsg {
         chars: usize,
         preview: String,
         warning: Option<String>,
+        /// How AI cleanup went when it is not a failure but not complete
+        /// either (some sections kept their recognised text); shown calmly,
+        /// not as an error.
+        #[serde(default)]
+        notice: Option<String>,
         /// Number of labelled speakers; `None` when not labelled.
         #[serde(default)]
         speakers: Option<usize>,
@@ -79,6 +84,24 @@ pub enum WindowMsg {
     Failed {
         error: String,
     },
+    /// The job was stopped from this window; nothing was saved.
+    Stopped,
+    /// AI cleanup of the saved transcript is being retried in the
+    /// background: `text` says where it stands. `active` while a retry runs;
+    /// `settled` once nothing is left to retry (finished or given up).
+    Retry {
+        text: String,
+        active: bool,
+        settled: bool,
+    },
+}
+
+/// Where a background retry of AI cleanup stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryStatus {
+    pub text: String,
+    pub active: bool,
+    pub settled: bool,
 }
 
 /// Everything the window shows, as plain data so it is testable without egui.
@@ -97,6 +120,12 @@ pub struct WindowState {
     pub total: usize,
     pub finished: Option<Finished>,
     pub error: Option<String>,
+    /// The user stopped the job (`Stop` was pressed, the app confirmed).
+    pub stopped: bool,
+    /// `Stop` was pressed; waiting for the app to confirm.
+    pub stop_requested: bool,
+    /// A background retry of AI cleanup, after the transcript was saved.
+    pub retry: Option<RetryStatus>,
     /// The tray process went away (stdin closed) before the job finished.
     pub parent_gone: bool,
     started: Instant,
@@ -109,6 +138,7 @@ pub struct Finished {
     pub chars: usize,
     pub preview: String,
     pub warning: Option<String>,
+    pub notice: Option<String>,
     pub speakers: Option<usize>,
 }
 
@@ -128,6 +158,9 @@ impl WindowState {
             total: 0,
             finished: None,
             error: None,
+            stopped: false,
+            stop_requested: false,
+            retry: None,
             parent_gone: false,
             started: now,
             stage_started: now,
@@ -169,6 +202,7 @@ impl WindowState {
                 chars,
                 preview,
                 warning,
+                notice,
                 speakers,
             } => {
                 self.output_path = output_path;
@@ -177,6 +211,7 @@ impl WindowState {
                     chars,
                     preview,
                     warning,
+                    notice,
                     speakers,
                 });
                 self.error = None;
@@ -184,11 +219,36 @@ impl WindowState {
             WindowMsg::Failed { error } => {
                 self.error = Some(error);
             }
+            WindowMsg::Stopped => {
+                self.stopped = true;
+            }
+            WindowMsg::Retry {
+                text,
+                active,
+                settled,
+            } => {
+                if active && !self.retry.as_ref().is_some_and(|retry| retry.active) {
+                    // A new round: its progress starts from nothing.
+                    self.done = 0;
+                    self.total = 0;
+                    self.stage_started = now;
+                }
+                self.retry = Some(RetryStatus {
+                    text,
+                    active,
+                    settled,
+                });
+            }
         }
     }
 
+    /// The transcript is saved but AI cleanup is still being retried.
+    pub fn retry_pending(&self) -> bool {
+        self.retry.as_ref().is_some_and(|retry| !retry.settled)
+    }
+
     pub fn is_running(&self) -> bool {
-        self.finished.is_none() && self.error.is_none()
+        self.finished.is_none() && self.error.is_none() && !self.stopped
     }
 
     /// Progress of the current stage in `0.0..=1.0`, when it is measurable.
@@ -261,32 +321,58 @@ fn word_count(text: &str) -> usize {
 // Tray side: spawn the child and stream messages to it.
 // ---------------------------------------------------------------------------
 
+/// What the window prints when the user presses `Stop`.
+const STOP_LINE: &str = "stop";
+
 /// Launch the popup and forward everything received on `messages` to it.
 ///
 /// Runs on its own thread because `CreateProcess` can block for seconds on
 /// ARM64 with real-time scanning. The thread ends when the sender is dropped
 /// or the window is closed (write fails); it never kills the child.
-pub fn spawn_window_thread(messages: Receiver<WindowMsg>) -> std::io::Result<()> {
+/// `stop` is set when the user presses `Stop` in the window.
+pub fn spawn_window_thread(
+    messages: Receiver<WindowMsg>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("transcript-window".into())
         .spawn(move || {
-            if let Err(error) = pump_messages(messages) {
+            if let Err(error) = pump_messages(messages, stop) {
                 warn!(error = %error, "transcript window ended early");
             }
         })
         .map(|_| ())
 }
 
-fn pump_messages(messages: Receiver<WindowMsg>) -> Result<()> {
+fn pump_messages(
+    messages: Receiver<WindowMsg>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut child = Command::new(exe)
         .arg("--transcript-window")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .context("start transcript window")?;
+    if let Some(output) = child.stdout.take() {
+        // The window's only message back: the user pressed Stop.
+        let _ = std::thread::Builder::new()
+            .name("transcript-window-out".into())
+            .spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    match line {
+                        Ok(line) if line.trim() == STOP_LINE => {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+    }
     let mut stdin = child.stdin.take().context("transcript window stdin")?;
     for message in messages {
         let mut line = serde_json::to_string(&message).context("encode window message")?;
@@ -311,8 +397,8 @@ enum Incoming {
 pub fn run_window() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 360.0])
-            .with_min_inner_size([380.0, 280.0])
+            .with_inner_size(settings_ui::scaled_size([460.0, 360.0]))
+            .with_min_inner_size(settings_ui::scaled_size([380.0, 280.0]))
             .with_resizable(true)
             .with_title("HouWritr — Transcribe file"),
         ..Default::default()
@@ -402,7 +488,7 @@ impl eframe::App for TranscriptWindow {
             self.title_applied = true;
         }
         let now = Instant::now();
-        if self.state.is_running() && !self.state.parent_gone {
+        if (self.state.is_running() || self.state.retry_pending()) && !self.state.parent_gone {
             // Keep the elapsed clock ticking while idle between messages.
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -411,10 +497,42 @@ impl eframe::App for TranscriptWindow {
             ui.heading(&self.state.title);
             ui.add_space(6.0);
 
-            if let Some(error) = &self.state.error {
+            if self.state.stopped {
+                ui.label("Stopped. Nothing was saved.");
+            } else if let Some(error) = &self.state.error {
                 settings_ui::inline_error(ui, format!("Transcription failed: {error}"));
             } else if self.state.finished.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                match self.state.retry.clone() {
+                    Some(retry) if !retry.settled && self.state.parent_gone => {
+                        settings_ui::inline_error(
+                            ui,
+                            "Saved. HouWritr was closed before AI cleanup could be retried.",
+                        );
+                    }
+                    Some(retry) if retry.active => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spinner();
+                            ui.label(&retry.text);
+                        });
+                        if let Some(fraction) = self.state.fraction() {
+                            let mut text = format!("{}/{}", self.state.done, self.state.total);
+                            if let Some(eta) = self.state.eta_secs(now) {
+                                text.push_str(&format!(" · about {} left", format_clock(eta)));
+                            }
+                            ui.add(egui::ProgressBar::new(fraction).text(text));
+                        }
+                    }
+                    Some(retry) if !retry.settled => {
+                        ui.colored_label(egui::Color32::from_rgb(235, 190, 90), &retry.text);
+                    }
+                    Some(retry) => {
+                        ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                        ui.weak(&retry.text);
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::from_rgb(110, 200, 140), "Done");
+                    }
+                }
             } else if self.state.parent_gone {
                 settings_ui::inline_error(ui, "HouWritr was closed before this finished.");
             } else {
@@ -439,6 +557,21 @@ impl eframe::App for TranscriptWindow {
                     timing.push_str(&format!(" · about {} left", format_clock(eta)));
                 }
                 ui.weak(timing);
+                ui.add_space(4.0);
+                if self.state.stop_requested {
+                    ui.weak("Stopping… (the current step finishes first)");
+                } else if ui
+                    .button("Stop")
+                    .on_hover_text("Stop this transcription. Nothing is saved.")
+                    .clicked()
+                {
+                    // The tray reads this window's output.
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(STOP_LINE.as_bytes());
+                    let _ = out.write_all(b"\n");
+                    let _ = out.flush();
+                    self.state.stop_requested = true;
+                }
             }
 
             ui.add_space(8.0);
@@ -485,6 +618,16 @@ impl eframe::App for TranscriptWindow {
                     }
                 });
 
+            if let Some(notice) = self
+                .state
+                .finished
+                .as_ref()
+                .and_then(|done| done.notice.clone())
+            {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(235, 190, 90), notice);
+            }
+
             if let Some(warning) = self
                 .state
                 .finished
@@ -493,6 +636,13 @@ impl eframe::App for TranscriptWindow {
             {
                 ui.add_space(6.0);
                 settings_ui::inline_error(ui, warning);
+            }
+
+            if self.state.stopped {
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
 
             if self.state.finished.is_some() {
@@ -533,6 +683,62 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_keeps_the_window_from_saying_done() {
+        let now = Instant::now();
+        let mut state = WindowState::new(now);
+        state.apply(
+            WindowMsg::Retry {
+                text: "AI cleanup unfinished; trying again in 2 min".into(),
+                active: false,
+                settled: false,
+            },
+            now,
+        );
+        state.apply(
+            WindowMsg::Done {
+                output_path: "a.md".into(),
+                words: 1,
+                chars: 1,
+                preview: String::new(),
+                warning: None,
+                notice: None,
+                speakers: None,
+            },
+            now,
+        );
+        assert!(state.retry_pending());
+        state.apply(
+            WindowMsg::Retry {
+                text: "Retrying AI cleanup".into(),
+                active: true,
+                settled: false,
+            },
+            now,
+        );
+        assert_eq!((state.done, state.total), (0, 0));
+        state.apply(
+            WindowMsg::Retry {
+                text: "AI cleanup finished".into(),
+                active: false,
+                settled: true,
+            },
+            now,
+        );
+        assert!(!state.retry_pending());
+        // The message survives the trip through JSON.
+        let line = serde_json::to_string(&WindowMsg::Retry {
+            text: "x".into(),
+            active: true,
+            settled: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<WindowMsg>(&line).unwrap(),
+            WindowMsg::Retry { active: true, .. }
+        ));
+    }
+
+    #[test]
     fn messages_round_trip_as_single_json_lines() {
         let messages = vec![
             WindowMsg::Init {
@@ -556,6 +762,7 @@ mod tests {
                 chars: 55,
                 preview: "line\nbreak".into(),
                 warning: Some("no cleanup".into()),
+                notice: None,
                 speakers: Some(2),
             },
             WindowMsg::Failed {
@@ -622,6 +829,7 @@ mod tests {
                 chars: 11,
                 preview: "a b c".into(),
                 warning: None,
+                notice: None,
                 speakers: None,
             },
             base,

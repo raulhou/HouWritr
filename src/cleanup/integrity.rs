@@ -11,6 +11,8 @@
 //!
 //! Error-level violations (candidate should be rejected):
 //!   * a factual explicit-digit value changed or disappeared,
+//!   * the `Speaker N:` labels changed (a block was merged, dropped or
+//!     relabelled),
 //!   * a negation was added, removed, or changed,
 //!   * a protected token (URL/email/inline code/acronym) was dropped,
 //!   * confident German/English language drift,
@@ -41,7 +43,7 @@ pub const MAX_INPUT_CHARS: usize = 100_000;
 /// decision on existing input, so consumers pinned to a version (e.g. the
 /// opt-in `cleanup_eval` evaluator's fixture corpus) can detect drift instead
 /// of silently comparing against a moved target.
-pub const VALIDATOR_VERSION: &str = "integrity-v2";
+pub const VALIDATOR_VERSION: &str = "integrity-v3";
 
 /// Severity of an integrity violation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub enum Severity {
 pub enum ViolationKind {
     /// An explicit-digit factual value changed or disappeared.
     FactualDigitChanged,
+    /// The `Speaker N:` labels of a speaker-labelled transcript changed.
+    SpeakerLabelsChanged,
     /// A negation was added, removed, or changed.
     NegationChanged,
     /// A protected token (URL/email/inline code/acronym) was dropped.
@@ -78,6 +82,9 @@ pub enum ViolationKind {
     RetainedFiller,
     /// Adjacent word repetition remained in the candidate.
     AdjacentRepetition,
+    /// Not a check: marks a slice of a long cleanup of which only some pieces
+    /// passed the checks (the others kept their recognised text).
+    PartlyCleaned,
 }
 
 /// A single integrity violation.
@@ -157,7 +164,14 @@ pub fn validate(source: &str, candidate: &str) -> Result<IntegrityReport, Valida
         violations.push(Violation::error(ViolationKind::SourceBecameEmpty));
     }
 
-    check_numeric_integrity(source, candidate, &mut violations);
+    // Speaker labels are structure, not facts: they are compared on their
+    // own, and their numbers are left out of the digit check.
+    let (source_labels, source_text) = split_speaker_labels(source);
+    let (candidate_labels, candidate_text) = split_speaker_labels(candidate);
+    if source_labels != candidate_labels {
+        violations.push(Violation::error(ViolationKind::SpeakerLabelsChanged));
+    }
+    check_numeric_integrity(&source_text, &candidate_text, &mut violations);
 
     if negation_count(source) != negation_count(candidate) {
         violations.push(Violation::error(ViolationKind::NegationChanged));
@@ -235,6 +249,101 @@ pub(crate) fn is_meaningful(text: &str) -> bool {
 // --------------------------------------------------------------------------
 // Numeric integrity
 // --------------------------------------------------------------------------
+
+/// The numbers of the `Speaker N:` labels in `text`, in order, and the text
+/// with those numbers taken out.
+fn split_speaker_labels(text: &str) -> (Vec<u32>, String) {
+    const LABEL: &str = "Speaker ";
+    let mut labels = Vec::new();
+    let mut rest = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(at) = remaining.find(LABEL) {
+        let after = &remaining[at + LABEL.len()..];
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let colon = after[digits..].starts_with(':') || after[digits..].starts_with('：');
+        if digits > 0 && digits <= 3 && colon {
+            labels.push(after[..digits].parse().unwrap_or(0));
+            rest.push_str(&remaining[..at + LABEL.len()]);
+            remaining = &after[digits..];
+        } else {
+            rest.push_str(&remaining[..at + LABEL.len()]);
+            remaining = after;
+        }
+    }
+    rest.push_str(remaining);
+    (labels, rest)
+}
+
+/// How many numbers of each kind [`NumberChanges`] lists at most.
+const LISTED_NUMBERS: usize = 6;
+
+/// What changed in the numbers of a rejected cleanup: counts, and the first
+/// few numbers themselves, so a log shows whether the model dropped a figure
+/// or only wrote it another way (those are transcript content, but only
+/// digits, never words).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NumberChanges {
+    /// Digit numbers of the source missing from the candidate.
+    pub lost: usize,
+    /// Digit numbers in the candidate that the source did not have.
+    pub gained: usize,
+    pub speaker_labels_source: usize,
+    pub speaker_labels_candidate: usize,
+    /// Chinese numeral characters (一 二 … 万 两), which a model may write in
+    /// place of digits.
+    pub chinese_numerals_source: usize,
+    pub chinese_numerals_candidate: usize,
+    /// The first of the numbers counted in `lost`, and in `gained`.
+    pub lost_numbers: Vec<String>,
+    pub gained_numbers: Vec<String>,
+}
+
+/// The digit numbers written in `text` (not those of speaker labels), in
+/// order of first appearance, each once.
+pub fn numbers_in(text: &str) -> Vec<String> {
+    let (_, without_labels) = split_speaker_labels(text);
+    let mut numbers: Vec<String> = Vec::new();
+    for number in numeric_tokens(&without_labels) {
+        if !numbers.contains(&number) {
+            numbers.push(number);
+        }
+    }
+    numbers
+}
+
+/// Count how the numbers differ between `source` and `candidate`, for the
+/// log of a rejected cleanup.
+pub fn number_changes(source: &str, candidate: &str) -> NumberChanges {
+    let (source_labels, source_text) = split_speaker_labels(source);
+    let (candidate_labels, candidate_text) = split_speaker_labels(candidate);
+    let source_counts = multiset(numeric_tokens(&source_text));
+    let candidate_counts = multiset(numeric_tokens(&candidate_text));
+    let missing = |from: &BTreeMap<String, usize>, to: &BTreeMap<String, usize>| -> Vec<String> {
+        from.iter()
+            .flat_map(|(token, count)| {
+                let short = count.saturating_sub(to.get(token).copied().unwrap_or(0));
+                std::iter::repeat(token.clone()).take(short)
+            })
+            .collect()
+    };
+    let lost = missing(&source_counts, &candidate_counts);
+    let gained = missing(&candidate_counts, &source_counts);
+    let chinese = |text: &str| {
+        text.chars()
+            .filter(|c| "零一二三四五六七八九十百千万亿两".contains(*c))
+            .count()
+    };
+    NumberChanges {
+        lost: lost.len(),
+        gained: gained.len(),
+        lost_numbers: lost.into_iter().take(LISTED_NUMBERS).collect(),
+        gained_numbers: gained.into_iter().take(LISTED_NUMBERS).collect(),
+        speaker_labels_source: source_labels.len(),
+        speaker_labels_candidate: candidate_labels.len(),
+        chinese_numerals_source: chinese(source),
+        chinese_numerals_candidate: chinese(candidate),
+    }
+}
 
 fn check_numeric_integrity(source: &str, candidate: &str, out: &mut Vec<Violation>) {
     let source_counts = multiset(numeric_tokens(source));
@@ -624,6 +733,43 @@ mod tests {
         assert!(report
             .error_kinds()
             .contains(&ViolationKind::FactualDigitChanged));
+    }
+
+    #[test]
+    fn speaker_labels_are_checked_apart_from_numbers() {
+        let source = "Speaker 1: 我们有3个人。\n\nSpeaker 2: 好的。";
+        // Same labels, same numbers: accepted.
+        let kept = validate(source, "Speaker 1: 我们有3个人。\n\nSpeaker 2: 好。").unwrap();
+        assert!(!kept.is_rejected());
+        // Two blocks merged: the labels changed, not a fact.
+        let merged = validate(source, "Speaker 1: 我们有3个人。好的。").unwrap();
+        assert!(merged
+            .error_kinds()
+            .contains(&ViolationKind::SpeakerLabelsChanged));
+        assert!(!merged
+            .error_kinds()
+            .contains(&ViolationKind::FactualDigitChanged));
+        // A number in the text changed: still a fact.
+        let changed = validate(source, "Speaker 1: 我们有三个人。\n\nSpeaker 2: 好的。").unwrap();
+        assert!(changed
+            .error_kinds()
+            .contains(&ViolationKind::FactualDigitChanged));
+        assert!(!changed
+            .error_kinds()
+            .contains(&ViolationKind::SpeakerLabelsChanged));
+        assert_eq!(
+            number_changes(source, "Speaker 1: 我们有三个人。\n\nSpeaker 2: 好的。"),
+            NumberChanges {
+                lost: 1,
+                gained: 0,
+                speaker_labels_source: 2,
+                speaker_labels_candidate: 2,
+                chinese_numerals_source: 0,
+                chinese_numerals_candidate: 1,
+                lost_numbers: vec!["3".to_string()],
+                gained_numbers: Vec::new(),
+            }
+        );
     }
 
     #[test]

@@ -20,9 +20,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// Delete daily logs beyond the newest [`MAX_LOG_FILES`]. Only files named
-/// exactly like the logger names them (`openwritr.YYYY-MM-DD.log`) count and
+/// exactly like the logger names them (`houwritr.YYYY-MM-DD.log`) count and
 /// are ever deleted, newest by the date in the name. Copies such as
-/// `openwritr.2026-10-17 - Copy.log` are left alone and can no longer push
+/// `houwritr.2026-10-17 - Copy.log` are left alone and can no longer push
 /// today's log out: that used to delete the log the tray process was still
 /// writing, so everything it logged was lost.
 pub fn prune_logs() -> Result<()> {
@@ -32,7 +32,10 @@ pub fn prune_logs() -> Result<()> {
 
 /// The date in a log file name made by the daily logger, if it is one.
 fn daily_log_date(name: &str) -> Option<&str> {
-    let date = name.strip_prefix("openwritr.")?.strip_suffix(".log")?;
+    let date = name
+        .strip_prefix("houwritr.")
+        .or_else(|| name.strip_prefix("openwritr."))?
+        .strip_suffix(".log")?;
     let bytes = date.as_bytes();
     let well_formed = bytes.len() == 10
         && bytes.iter().enumerate().all(|(index, byte)| match index {
@@ -123,7 +126,7 @@ fn export_bundle_from(
         .context("system clock before Unix epoch")?;
     let timestamp = elapsed.as_secs();
     let destination = destination_dir.join(format!(
-        "openwritr-diagnostics-{}-{}.zip",
+        "houwritr-diagnostics-{}-{}.zip",
         elapsed.as_millis(),
         std::process::id()
     ));
@@ -169,7 +172,7 @@ fn export_bundle_from(
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("openwritr.log")
+                .unwrap_or("houwritr.log")
                 .to_string();
             included_logs.push((format!("logs/{name}"), path));
         }
@@ -507,14 +510,21 @@ fn recent_files(directory: &Path, predicate: fn(&Path) -> bool) -> Result<Vec<Pa
 fn is_log_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.starts_with("openwritr") && name.ends_with(".log"))
+        .map(|name| {
+            (name.starts_with("houwritr") || name.starts_with("openwritr"))
+                && name.ends_with(".log")
+        })
         .unwrap_or(false)
 }
 
 fn is_diagnostic_bundle(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.starts_with("openwritr-diagnostics-") && name.ends_with(".zip"))
+        .map(|name| {
+            (name.starts_with("houwritr-diagnostics-")
+                || name.starts_with("openwritr-diagnostics-"))
+                && name.ends_with(".zip")
+        })
         .unwrap_or(false)
 }
 
@@ -614,7 +624,7 @@ mod tests {
     #[test]
     fn bounded_log_tail_drops_a_partial_private_line() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("openwritr.log");
+        let path = temp.path().join("houwritr.log");
         fs::write(
             &path,
             b"INFO transcribed -> \"private words that must not escape\"\nINFO recent safe line\n",
@@ -633,16 +643,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         for day in 1..=10 {
             fs::write(
-                temp.path().join(format!("openwritr.2026-10-{day:02}.log")),
+                temp.path().join(format!("houwritr.2026-10-{day:02}.log")),
                 b"log",
             )
             .unwrap();
         }
         // Copies made later (newer files) must not count.
         for copy in [
-            "openwritr.2026-10-10 - Copy.log",
-            "openwritr.2026-10-10 (2).log",
-            "openwritr-test.log",
+            "houwritr.2026-10-10 - Copy.log",
+            "houwritr.2026-10-10 (2).log",
+            "houwritr-test.log",
         ] {
             fs::write(temp.path().join(copy), b"copy").unwrap();
         }
@@ -653,30 +663,30 @@ mod tests {
             .collect();
         left.sort();
         assert!(
-            left.contains(&"openwritr.2026-10-10.log".to_string()),
+            left.contains(&"houwritr.2026-10-10.log".to_string()),
             "today stays"
         );
-        assert!(left.contains(&"openwritr.2026-10-04.log".to_string()));
-        assert!(!left.contains(&"openwritr.2026-10-03.log".to_string()));
-        assert!(left.contains(&"openwritr.2026-10-10 - Copy.log".to_string()));
+        assert!(left.contains(&"houwritr.2026-10-04.log".to_string()));
+        assert!(!left.contains(&"houwritr.2026-10-03.log".to_string()));
+        assert!(left.contains(&"houwritr.2026-10-10 - Copy.log".to_string()));
         assert_eq!(left.len(), 7 + 3);
+        assert_eq!(
+            daily_log_date("houwritr.2026-10-17.log"),
+            Some("2026-10-17")
+        );
+        assert_eq!(daily_log_date("houwritr.2026-10-17 - Copy.log"), None);
+        assert_eq!(daily_log_date("houwritr.log"), None);
         assert_eq!(
             daily_log_date("openwritr.2026-10-17.log"),
             Some("2026-10-17")
         );
-        assert_eq!(daily_log_date("openwritr.2026-10-17 - Copy.log"), None);
-        assert_eq!(daily_log_date("openwritr.log"), None);
     }
 
     #[test]
     fn prunes_logs_to_the_retention_limit() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..10 {
-            fs::write(
-                temp.path().join(format!("openwritr-{index:02}.log")),
-                b"log",
-            )
-            .unwrap();
+            fs::write(temp.path().join(format!("houwritr-{index:02}.log")), b"log").unwrap();
         }
         prune_matching(temp.path(), 7, is_log_file).unwrap();
         assert_eq!(recent_files(temp.path(), is_log_file).unwrap().len(), 7);
@@ -705,7 +715,7 @@ mod tests {
         fs::create_dir_all(models.join("parakeet")).unwrap();
         fs::create_dir_all(&runtime).unwrap();
         fs::write(
-            logs.join("openwritr-test.log"),
+            logs.join("houwritr-test.log"),
             b"safe\ntranscribed -> \"private transcript\"\n",
         )
         .unwrap();
@@ -737,7 +747,7 @@ mod tests {
 
         let mut log = String::new();
         archive
-            .by_name("logs/openwritr-test.log")
+            .by_name("logs/houwritr-test.log")
             .unwrap()
             .read_to_string(&mut log)
             .unwrap();

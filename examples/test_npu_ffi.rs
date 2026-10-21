@@ -57,17 +57,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let model = std::env::var_os("OPENWRITR_NPU_MODEL")
+    let model = std::env::var_os("HOUWRITR_NPU_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let mut path =
                 PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is set"));
-            path.push("OpenWritr/models/parakeet-tdt-0.6b-v3-htp-int8-8s/encoder-model.onnx");
+            path.push("HouWritr/models/parakeet-tdt-0.6b-v3-htp-int8-8s/encoder-model.onnx");
             path
         });
     if !model.is_file() {
         bail!(
-            "missing model wrapper {}; set OPENWRITR_NPU_MODEL to override",
+            "missing model wrapper {}; set HOUWRITR_NPU_MODEL to override",
             model.display()
         );
     }
